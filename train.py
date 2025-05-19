@@ -297,7 +297,7 @@ def val_epoch(dataloader, model, criterion_MSE, criterion_Dice, epoch, writer, s
                         mask_tensor=vis_pred_mask_sigmoid,
                         bbox_tensor=prompt_info_for_vis if not item_is_point_prompt else None,
                         points_tensor=prompt_info_for_vis if item_is_point_prompt else None,
-                        gt_mask_tensor=mask_batch[0].cpu(),
+                        # gt_mask_tensor=mask_batch[0].cpu(), # <<-- REMOVE THIS LINE
                         threshold=args.visual.IOU_threshold,
                         save_dir=vis_save_dir,
                         filename_info=f"val_batch_{batch_idx}_item_0_prompt_{'point' if item_is_point_prompt else 'box'}"
@@ -307,6 +307,7 @@ def val_epoch(dataloader, model, criterion_MSE, criterion_Dice, epoch, writer, s
                 except Exception as e:
                     logger.error(f"Error during visualization: {e}")
                     first_batch_visualized = True
+                    
     average_loss = total_loss / num_batches
     writer.add_scalar('Loss/Validation', average_loss, epoch)
     return average_loss

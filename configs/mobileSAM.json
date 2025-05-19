@@ -4,7 +4,7 @@
         "val_dataset":"./datasets/val",
         "max_bbox_shift": 20,
         "num_workers": 4,
-        "prompt_mode": "mixed",
+        "prompt_mode": "box",
         "min_points": 1,
         "max_points": 3
     },
@@ -15,16 +15,16 @@
         "save_path":"./logs"
     },
     "train": {
-        "epochs": 10000, // 最大 epoch 數
+        "epochs": 10000,
         "learning_rate": 1e-5,
         "batch_size": 4,
-        "val_freq": 5,      // 每隔多少 epoch 進行一次驗證
+        "val_freq": 5,
         "gradient_accumulation": 1,
         "bf16": false,
         "warmup_step": 250,
         "resume": false
     },
-    "loss": { // 假設您已加入此區塊
+    "loss": {
         "focal_weight": 20.0,
         "dice_weight": 1.0,
         "iou_weight": 1.0
@@ -39,10 +39,10 @@
         "freeze_prompt_encoder": true,
         "freeze_mask_decoder": false
     },
-    "early_stopping": { // << 新增 Early Stopping 設定區塊
-        "enabled": true,          // 是否啟用 Early Stopping
-        "patience": 20,           // 在驗證損失沒有改善的情況下，要等待多少個驗證週期 (非 epoch 總數)
-        "min_delta": 0.0001,      // 驗證損失改善的最小變化量，小於此變化視為沒有改善
-        "monitor_metric": "val_loss" // 要監控的指標 (目前固定為 val_loss)
+    "early_stopping": {
+        "enabled": true,
+        "patience": 20,
+        "min_delta": 0.0001,
+        "monitor_metric": "val_loss"
     }
 }
