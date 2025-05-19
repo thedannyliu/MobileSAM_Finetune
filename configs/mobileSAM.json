@@ -1,9 +1,12 @@
 {
     "dataset":{
-        "train_dataset":"./datasets/train" ,
-        "val_dataset":"./datasets/val" ,
+        "train_dataset":"./datasets/train",
+        "val_dataset":"./datasets/val",
         "max_bbox_shift": 20,
-        "num_workers":4
+        "num_workers": 4,
+        "prompt_mode": "mixed",
+        "min_points": 1,
+        "max_points": 3
     },
     "model":{
         "checkpoint_path":"./weights/mobile_sam.pt",
@@ -12,14 +15,19 @@
         "save_path":"./logs"
     },
     "train": {
-        "epochs": 10000,
+        "epochs": 10000, // 最大 epoch 數
         "learning_rate": 1e-5,
         "batch_size": 4,
-        "val_freq": 5,
+        "val_freq": 5,      // 每隔多少 epoch 進行一次驗證
         "gradient_accumulation": 1,
         "bf16": false,
         "warmup_step": 250,
         "resume": false
+    },
+    "loss": { // 假設您已加入此區塊
+        "focal_weight": 20.0,
+        "dice_weight": 1.0,
+        "iou_weight": 1.0
     },
     "visual":{
         "status": true,
@@ -30,5 +38,11 @@
         "freeze_image_encoder": true,
         "freeze_prompt_encoder": true,
         "freeze_mask_decoder": false
+    },
+    "early_stopping": { // << 新增 Early Stopping 設定區塊
+        "enabled": true,          // 是否啟用 Early Stopping
+        "patience": 20,           // 在驗證損失沒有改善的情況下，要等待多少個驗證週期 (非 epoch 總數)
+        "min_delta": 0.0001,      // 驗證損失改善的最小變化量，小於此變化視為沒有改善
+        "monitor_metric": "val_loss" // 要監控的指標 (目前固定為 val_loss)
     }
 }
