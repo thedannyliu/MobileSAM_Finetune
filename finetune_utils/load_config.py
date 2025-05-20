@@ -6,6 +6,18 @@ from pathlib import Path
 
 DEFAULT_CONFIG_PATH = './configs/mobileSAM.json'
 
+_C.DISTILLATION = CN()
+_C.DISTILLATION.PRECOMPUTED_FEAT_DIR_MOBILESAM = ""
+_C.DISTILLATION.PRECOMPUTED_FEAT_DIR_SAM_H = ""
+_C.DISTILLATION.WEIGHT_MOBILESAM = 0.0
+_C.DISTILLATION.WEIGHT_SAM_H = 0.0
+_C.DISTILLATION.LOSS_TYPE = "mse"
+_C.DISTILLATION.KL_TEMP = 1.0
+# ...
+_C.TRAIN.LOG_FREQ = 50 # Tensorboard step-wise log frequency
+_C.TRAIN.AMP = False   # Mixed precision training
+_C.TRAIN.DEVICE = "cuda" # Training device
+
 class Args:
     """
     A simple utility class to convert dictionary to an object.

@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-
+import torch.nn.functional as F
 import warnings
 from collections.abc import Callable
 
@@ -262,4 +262,57 @@ def batch_iou(preds: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5
     return iou
 
     
-    
+class FeatureDistillationLoss(nn.Module):
+    """
+    計算學生模型和教師模型特徵圖之間的蒸餾損失。
+    支援 MSE 和 KLDiv 損失。
+    """
+    def __init__(self, loss_type='mse', kl_temp=1.0):
+        super().__init__()
+        self.loss_type = loss_type.lower()
+        self.kl_temp = kl_temp # 用於 KLDiv 的溫度參數
+
+        if self.loss_type == 'mse':
+            self.criterion = nn.MSELoss()
+        elif self.loss_type == 'kldiv':
+            # KLDivLoss 期望 (N, C) log-probabilities for input, (N, C) probabilities for target
+            # reduction='batchmean' averages over the batch and spatial dimensions if any remain
+            self.criterion = nn.KLDivLoss(reduction='batchmean', log_target=False)
+        else:
+            raise ValueError(f"不支援的蒸餾損失類型: {loss_type}. 請選擇 'mse' 或 'kldiv'.")
+
+    def forward(self, student_features, teacher_features):
+        """
+        student_features: 學生模型的特徵圖 (B, C, H, W)
+        teacher_features: 教師模型的特徵圖 (B, C, H, W)
+        """
+        if student_features.shape != teacher_features.shape:
+            # 如果形狀不匹配，嘗試通過插值來對齊教師特徵的空間維度
+            # 這是一個基本的方法，更複雜的對齊可能需要適配器層 (adapter layers)
+            print(f"警告：學生特徵圖形狀 {student_features.shape} 与教師特徵圖形狀 {teacher_features.shape} 不匹配。"
+                  f"將嘗試使用雙線性插值對齊教師特徵的空間維度。")
+            teacher_features = F.interpolate(teacher_features, 
+                                             size=student_features.shape[2:], 
+                                             mode='bilinear', 
+                                             align_corners=False)
+
+        if self.loss_type == 'mse':
+            return self.criterion(student_features, teacher_features)
+        elif self.loss_type == 'kldiv':
+            # 為了 KL 散度，我們通常將特徵圖視為在空間位置上的通道分佈
+            # 或者將通道視為類別，在每個像素上計算分佈
+            # 這裡我們將 BxCxHxW 展平為 Bx(C*H*W) 或 BxCx(H*W) 再應用 Softmax
+            # 一個常見做法是在通道維度上應用 Softmax，然後計算 KL 散度
+            # (B, C, H, W) -> (B, H*W, C) after permute, then apply softmax over C
+            
+            # student_features_flat = student_features.flatten(2).transpose(1, 2) # (B, H*W, C)
+            # teacher_features_flat = teacher_features.flatten(2).transpose(1, 2) # (B, H*W, C)
+
+            # log_student_p = F.log_softmax(student_features_flat / self.kl_temp, dim=-1)
+            # teacher_p = F.softmax(teacher_features_flat / self.kl_temp, dim=-1)
+            
+            # 或者，更簡單地，在整個特徵向量上 (C*H*W)
+            log_student_p = F.log_softmax(student_features.view(student_features.size(0), -1) / self.kl_temp, dim=1)
+            teacher_p = F.softmax(teacher_features.view(teacher_features.size(0), -1) / self.kl_temp, dim=1)
+
+            return self.criterion(log_student_p, teacher_p) * (self.kl_temp ** 2) # 乘以 T^2 是常見做法

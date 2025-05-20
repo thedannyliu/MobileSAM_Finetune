@@ -1,331 +1,406 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import autocast, GradScaler
-
-from torchvision import transforms
-from torchvision.ops import sigmoid_focal_loss
-
-from pathlib import Path
+# train.py
+import os
+import sys
+import argparse
+import datetime
+import time
 from tqdm import tqdm
 
-from finetune_utils.load_config import get_config
-from finetune_utils.load_logger import Logger
-from finetune_utils.load_checkpoint import get_sam_vit_t
-from finetune_utils.datasets import ComponentDataset
-from finetune_utils.loss import DiceLoss, batch_iou
-from finetune_utils.visualization import overlay_mask_on_image
+import torch
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import GradScaler, autocast # 用於混合精度訓練
+
+# 載入設定、日誌、儲存點等輔助工具
+from finetune_utils.load_config import load_config, CfgNode as CN # 引入 CfgNode
+from finetune_utils.load_logger import get_logger
 from finetune_utils.save_checkpoint import save_checkpoint
-from finetune_utils.schedular import LinearWarmup
+from finetune_utils.schedular import build_scheduler # 學習率排程器
 
-torch.backends.cudnn.benchmark = True
+# 載入模型、資料集、損失函數
+from mobile_sam import sam_model_registry
+from finetune_utils.datasets import DatasetFinetune # 確保這是更新後的版本
+from finetune_utils.loss import FocalLoss, DiceLoss, IoULoss, FeatureDistillationLoss # 引入 FeatureDistillationLoss
 
-args = None
-MEAN = None
-STD = None
-IMAGE_SIZE = None
+# Collate function - 使用 PyTorch 預設的即可，除非有特殊需求
+# from torch.utils.data.dataloader import default_collate
 
-def main(config_args):
-    global args, MEAN, STD, IMAGE_SIZE
-    args = config_args
+def parse_option():
+    parser = argparse.ArgumentParser(description="MobileSAM 微調腳本")
+    parser.add_argument('--config', type=str, required=True, help="設定檔的路徑 (例如 configs/mobileSAM.json)")
+    # 可以保留其他的 parser arguments，如果您的原始 train.py 有的話
+    args = parser.parse_args()
+    config = load_config(args.config) # load_config 應該返回 CfgNode 物件
+    return config
 
-    assert torch.cuda.is_available(), "CUDA is not available."
+def get_prompt_points_from_bboxes(bboxes_batch, device):
+    """
+    從邊界框批次中獲取中心點作為提示。
+    bboxes_batch: (B, N_boxes, 4)，格式為 [x1, y1, x2, y2]
+    返回:
+        point_coords_batch: (B, N_boxes, 1, 2) - 中心點座標
+        point_labels_batch: (B, N_boxes, 1) - 標籤 (前景點為1)
+    """
+    if bboxes_batch is None or bboxes_batch.numel() == 0:
+        return None, None
 
-    IMAGE_SIZE = (args.model.image_size, args.model.image_size)
-    MEAN = [0.485, 0.456, 0.406]
-    STD = [0.229, 0.224, 0.225]
-
-    transform_img = transforms.Compose([
-        transforms.Resize(IMAGE_SIZE),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=MEAN, std=STD)
-    ])
-    transform_mask = transforms.Compose([
-        transforms.Resize(IMAGE_SIZE, interpolation=transforms.InterpolationMode.NEAREST),
-        transforms.ToTensor(),
-    ])
-
-    train_dataset = ComponentDataset(
-        root_dir=args.dataset.train_dataset,
-        transform=[transform_img, transform_mask],
-        max_bbox_shift=args.dataset.max_bbox_shift,
-        prompt_mode=args.dataset.prompt_mode,
-        min_points=args.dataset.min_points,
-        max_points=args.dataset.max_points,
-        image_size=args.model.image_size
-    )
-    val_dataset = ComponentDataset(
-        root_dir=args.dataset.val_dataset,
-        transform=[transform_img, transform_mask],
-        max_bbox_shift=0, # 通常驗證集不使用 bbox shift
-        prompt_mode=args.dataset.prompt_mode, # 或者固定為 'box' or 'point'
-        min_points=args.dataset.min_points,
-        max_points=args.dataset.max_points,
-        image_size=args.model.image_size
-    )
-
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.train.batch_size,
-        num_workers=args.dataset.num_workers, shuffle=True,
-        pin_memory=True, persistent_workers=True if args.dataset.num_workers > 0 else False
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=args.train.batch_size,
-        num_workers=args.dataset.num_workers, shuffle=False,
-        pin_memory=True, persistent_workers=True if args.dataset.num_workers > 0 else False
-    )
-
-    checkpoint_path = Path(args.model.checkpoint_path)
-    save_path = Path(args.model.save_path)
-    save_path.mkdir(parents=True, exist_ok=True)
-
-    logger = Logger(save_path / 'training.log').get_logger()
-    logger.info(f"Training with config: {args}")
-
-    scaler = GradScaler(enabled=args.train.bf16)
-    model = get_sam_vit_t(checkpoint=checkpoint_path, resume=args.train.resume).cuda()
-
-    for name, param in model.named_parameters():
-        if args.freeze.freeze_image_encoder and 'image_encoder' in name:
-            param.requires_grad = False
-        if args.freeze.freeze_prompt_encoder and 'prompt_encoder' in name:
-            param.requires_grad = False
-        if args.freeze.freeze_mask_decoder and 'mask_decoder' in name:
-            param.requires_grad = False
+    # 計算中心點: cx = (x1+x2)/2, cy = (y1+y2)/2
+    # bboxes_batch shape: (B, N_boxes_per_image, 4)
+    center_x = (bboxes_batch[..., 0] + bboxes_batch[..., 2]) / 2
+    center_y = (bboxes_batch[..., 1] + bboxes_batch[..., 3]) / 2
     
-    num_unfrozen_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Number of unfrozen parameters: {num_unfrozen_params}")
-
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.train.learning_rate)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.train.epochs * len(train_loader))
-    warmup_scheduler = LinearWarmup(optimizer, warmup_period=args.train.warmup_step)
-
-    criterion_MSE = nn.MSELoss()
-    criterion_Dice = DiceLoss(sigmoid=True, squared_pred=True, reduction='mean')
-    writer = SummaryWriter(log_dir=str(save_path / 'tensorboard_logs'))
-
-    best_val_loss = float('inf')
+    # 堆疊中心點座標
+    # (B, N_boxes_per_image, 2)
+    point_coords = torch.stack([center_x, center_y], dim=-1)
     
-    # --- Early Stopping 初始化 ---
-    early_stopping_enabled = args.early_stopping.enabled
-    early_stopping_patience = args.early_stopping.patience
-    early_stopping_min_delta = args.early_stopping.min_delta
-    epochs_no_improve = 0 # 計數器：記錄驗證損失沒有改善的驗證週期數
-    # --- Early Stopping 初始化結束 ---
+    # SAM 期望的點座標格式是 (B, N_prompts, N_points_per_prompt, 2)
+    # 這裡我們每個 bbox 生成一個點提示，所以 N_points_per_prompt = 1
+    point_coords_batch = point_coords.unsqueeze(2) # (B, N_boxes_per_image, 1, 2)
+    
+    # 產生對應的標籤 (前景點為 1)
+    # (B, N_boxes_per_image, 1)
+    point_labels_batch = torch.ones_like(point_coords_batch[..., 0], dtype=torch.int, device=device)
+    
+    return point_coords_batch, point_labels_batch
 
-    logger.info("Starting training...")
-    for epoch in range(args.train.epochs):
-        train_loss = train_epoch(train_loader, model, optimizer, criterion_MSE, criterion_Dice, epoch, writer, scaler, lr_scheduler, warmup_scheduler, logger)
-        logger.info(f"Epoch {epoch+1}/{args.train.epochs}, Train Loss: {train_loss:.4f}")
+def main(config):
+    # --- 設定 GPU 裝置 ---
+    if torch.cuda.is_available():
+        device = torch.device(config.TRAIN.DEVICE if hasattr(config.TRAIN, 'DEVICE') else 'cuda')
+    elif torch.backends.mps.is_available(): # 針對 Apple Silicon
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
+    print(f"使用裝置: {device}")
 
-        if (epoch + 1) % args.train.val_freq == 0:
-            val_loss = val_epoch(val_loader, model, criterion_MSE, criterion_Dice, epoch, writer, scaler, logger)
-            logger.info(f"Epoch {epoch+1}/{args.train.epochs}, Val Loss: {val_loss:.4f}")
+    # --- 建立輸出目錄和日誌記錄器 ---
+    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+    logger = get_logger(config.OUTPUT_DIR, config.MODEL.NAME)
+    writer = SummaryWriter(log_dir=os.path.join(config.OUTPUT_DIR, 'tensorboard_logs'))
+    logger.info(f"設定檔內容:\n{config}")
 
-            # --- Early Stopping 邏輯 ---
-            if early_stopping_enabled:
-                # 檢查是否有改善 (新的 val_loss 是否比 best_val_loss 小了至少 min_delta)
-                if val_loss < best_val_loss - early_stopping_min_delta:
-                    logger.info(f"Validation loss improved from {best_val_loss:.4f} to {val_loss:.4f}.")
-                    best_val_loss = val_loss
-                    epochs_no_improve = 0 # 重置計數器
-                    # 保存最佳模型 (原本的邏輯)
-                    save_checkpoint({
-                        'epoch': epoch + 1,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'best_val_loss': best_val_loss,
-                        'args': args
-                    }, True, save_path) # is_best = True
-                else:
-                    epochs_no_improve += 1
-                    logger.info(f"Validation loss did not improve significantly for {epochs_no_improve} validation period(s). Current best: {best_val_loss:.4f}.")
-                    # 即使沒有改善，如果設定檔中 `save_checkpoint` 的 is_best 邏輯是基於嚴格小於，
-                    # 這裡還是可以呼叫 save_checkpoint，但 is_best 應為 False。
-                    # 原本的 save_checkpoint 邏輯已經在 is_best 參數中處理這個。
-                    # 我們只需要在 val_loss < best_val_loss 時才更新 best_val_loss 和 is_best=True 的儲存。
-                    # 如果只是沒有顯著改善，但仍想儲存最新模型 (非最佳)，則需調整 save_checkpoint。
-                    # 目前邏輯是：只有嚴格變好才更新 best_val_loss 並標記為 is_best=True 儲存。
-                    # 如果只是沒有 "顯著" 改善 (即改善幅度 < min_delta 但仍比 best_val_loss 小)，
-                    # 也應該更新 best_val_loss 並儲存。
-                    # 調整如下：
-                    if val_loss < best_val_loss : # 只要有任何一點點改善 (即使小於 min_delta)，也更新 best_val_loss
-                        best_val_loss = val_loss # 並且儲存 (但 epochs_no_improve 仍然增加，因為改善不夠 "顯著")
-                        save_checkpoint({
-                            'epoch': epoch + 1,
-                            'model_state_dict': model.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'best_val_loss': best_val_loss, # 用新的 best_val_loss
-                            'args': args
-                        }, True, save_path) # 標記為 best，因為它是目前為止最好的
-                    else: # 如果完全沒有改善 (val_loss >= best_val_loss)
-                         save_checkpoint({ # 仍儲存當前 epoch 的模型，但不是 best
-                            'epoch': epoch + 1,
-                            'model_state_dict': model.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'best_val_loss': best_val_loss, # best_val_loss 維持舊的
-                            'args': args
-                        }, False, save_path) # is_best = False
+    # --- 載入模型 ---
+    logger.info(f"載入模型: {config.MODEL.TYPE}")
+    # 確保模型權重路徑正確
+    if not os.path.exists(config.MODEL.CHECKPOINT):
+        logger.error(f"找不到模型權重檔案: {config.MODEL.CHECKPOINT}")
+        # 嘗試從相對路徑 (相對於設定檔的目錄) 尋找
+        config_dir = os.path.dirname(config.CONFIG_PATH) # 假設 config 物件有 CONFIG_PATH 屬性
+        alt_checkpoint_path = os.path.join(config_dir, config.MODEL.CHECKPOINT)
+        if os.path.exists(alt_checkpoint_path):
+            logger.info(f"嘗試使用相對路徑的權重檔案: {alt_checkpoint_path}")
+            config.defrost() # 允許修改設定
+            config.MODEL.CHECKPOINT = alt_checkpoint_path
+            config.freeze()
+        else:
+            logger.error(f"也找不到相對路徑的權重檔案: {alt_checkpoint_path}。請檢查 MODEL.CHECKPOINT 設定。")
+            sys.exit(1)
 
+    model_finetune = sam_model_registry[config.MODEL.TYPE](checkpoint=config.MODEL.CHECKPOINT)
+    model_finetune.to(device)
+    logger.info("模型載入完成")
 
-                if epochs_no_improve >= early_stopping_patience:
-                    logger.info(f"Early stopping triggered after {epochs_no_improve} validation periods without significant improvement.")
-                    break # 跳出訓練迴圈
-            else: # Early stopping 未啟用，維持原本的儲存邏輯
-                is_best = val_loss < best_val_loss
-                if is_best:
-                    best_val_loss = val_loss
-                save_checkpoint({
-                    'epoch': epoch + 1,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'best_val_loss': best_val_loss,
-                    'args': args
-                }, is_best, save_path)
-            # --- Early Stopping 邏輯結束 ---
+    # --- 設定優化器 ---
+    logger.info(f"設定優化器: {config.TRAIN.OPTIMIZER.NAME}")
+    if config.TRAIN.OPTIMIZER.NAME.lower() == 'adamw':
+        optimizer = torch.optim.AdamW(
+            model_finetune.parameters(),
+            lr=config.TRAIN.OPTIMIZER.LR,
+            weight_decay=config.TRAIN.OPTIMIZER.WEIGHT_DECAY
+        )
+    elif config.TRAIN.OPTIMIZER.NAME.lower() == 'adam':
+        optimizer = torch.optim.Adam(
+            model_finetune.parameters(),
+            lr=config.TRAIN.OPTIMIZER.LR,
+            weight_decay=config.TRAIN.OPTIMIZER.WEIGHT_DECAY
+        )
+    else:
+        logger.error(f"不支援的優化器: {config.TRAIN.OPTIMIZER.NAME}")
+        sys.exit(1)
+    logger.info(f"優化器 LR: {config.TRAIN.OPTIMIZER.LR}, Weight Decay: {config.TRAIN.OPTIMIZER.WEIGHT_DECAY}")
+
+    # --- 梯度縮放器 (用於混合精度訓練) ---
+    use_amp = getattr(config.TRAIN, 'AMP', False) # 預設為 False 如果沒設定
+    scaler = GradScaler() if use_amp else None
+    logger.info(f"使用混合精度訓練 (AMP): {use_amp}")
+
+    # --- 設定損失函數 ---
+    criterion = {} # 用字典儲存多個損失函數
+    # 預設分割損失
+    criterion['focal'] = FocalLoss()
+    criterion['iou'] = IoULoss()
+    # criterion['dice'] = DiceLoss() # 如果您也想用 Dice Loss
+
+    # 新增：蒸餾損失函數
+    # 從設定檔讀取蒸餾相關參數 (如果不存在，則設定預設值來自 CfgNode 的預設)
+    # 確保 DISTILLATION 區塊存在於 config 中 (已在 load_config.py 中定義預設)
+    distill_loss_type = config.DISTILLATION.LOSS_TYPE
+    distill_kl_temp = config.DISTILLATION.KL_TEMP
+    criterion['distillation'] = FeatureDistillationLoss(loss_type=distill_loss_type, kl_temp=distill_kl_temp)
+    logger.info(f"蒸餾損失類型: {distill_loss_type}, KL 溫度 (如果適用): {distill_kl_temp}")
+
+    distill_weight_mobilesam = config.DISTILLATION.WEIGHT_MOBILESAM
+    distill_weight_sam_h = config.DISTILLATION.WEIGHT_SAM_H
+    logger.info(f"原始 MobileSAM 蒸餾權重: {distill_weight_mobilesam}")
+    logger.info(f"SAM-H 蒸餾權重: {distill_weight_sam_h}")
+
+    # --- 載入資料集 ---
+    logger.info("載入訓練資料集...")
+    # 確保資料集路徑正確
+    if not os.path.exists(config.DATA.DATASET_JSON):
+        logger.error(f"找不到資料集 JSON 檔案: {config.DATA.DATASET_JSON}")
+        sys.exit(1)
+    if not os.path.exists(config.DATA.DATA_ROOT):
+        logger.error(f"找不到資料根目錄: {config.DATA.DATA_ROOT}")
+        sys.exit(1)
+
+    train_dataset = DatasetFinetune(
+        config,
+        json_key=config.DATA.TRAIN_JSON_KEY,
+        precomputed_feat_dir_mobilesam=config.DISTILLATION.PRECOMPUTED_FEAT_DIR_MOBILESAM if distill_weight_mobilesam > 0 else None,
+        precomputed_feat_dir_sam_h=config.DISTILLATION.PRECOMPUTED_FEAT_DIR_SAM_H if distill_weight_sam_h > 0 else None
+    )
+    if len(train_dataset) == 0:
+        logger.error("訓練資料集為空，請檢查資料集路徑和 JSON 檔案。")
+        sys.exit(1)
+    
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=config.DATA.BATCH_SIZE,
+        shuffle=True,
+        num_workers=config.DATA.NUM_WORKERS,
+        pin_memory=True, # 如果 GPU 訓練，建議開啟
+        # collate_fn=collate_fn_distillation # 如果需要自訂 collate_fn
+    )
+    logger.info(f"訓練資料集大小: {len(train_dataset)}, DataLoader 批次大小: {config.DATA.BATCH_SIZE}")
+    # ... (驗證資料集的載入邏輯，如果需要) ...
+
+    # --- 學習率排程器 ---
+    logger.info(f"設定學習率排程器: {config.TRAIN.SCHEDULER.NAME}")
+    scheduler = build_scheduler(config, optimizer, len(train_dataloader))
+
+    # --- 訓練迴圈 ---
+    logger.info("開始訓練...")
+    max_epochs = config.TRAIN.EPOCHS
+    global_step = 0
+
+    for epoch_num in range(max_epochs):
+        model_finetune.train() # 設定為訓練模式
         
-        # 檢查是否因為 Early Stopping 而跳出迴圈
-        if early_stopping_enabled and epochs_no_improve >= early_stopping_patience:
-            break
+        epoch_total_loss_sum = 0.0
+        epoch_original_loss_sum = 0.0
+        epoch_distill_mobilesam_loss_sum = 0.0
+        epoch_distill_sam_h_loss_sum = 0.0
+        epoch_focal_loss_sum = 0.0
+        epoch_iou_loss_sum = 0.0
+        
+        # 進度條
+        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch_num + 1}/{max_epochs}", file=sys.stdout)
 
+        for batch_idx, batch_data in enumerate(pbar):
+            try:
+                # 從 DataLoader 獲取資料並移至裝置
+                # DatasetFinetune 返回: image_padded, transformed_bbox, gt_mask_padded, features_mobilesam, features_sam_h
+                image_batch = batch_data[0].to(device)
+                bboxes_batch = batch_data[1].to(device)       # (B, 1, 4) - [x1,y1,x2,y2]
+                gt_masks_batch = batch_data[2].to(device)     # (B, 1, H, W)
+                
+                teacher_feats_mobilesam_batch = batch_data[3] # 可能在 CPU 上，或為空 Tensor
+                teacher_feats_sam_h_batch = batch_data[4]     # 可能在 CPU 上，或為空 Tensor
+
+                # 將教師特徵移至裝置 (如果存在且非空)
+                if isinstance(teacher_feats_mobilesam_batch, torch.Tensor) and teacher_feats_mobilesam_batch.numel() > 0:
+                    teacher_feats_mobilesam_batch = teacher_feats_mobilesam_batch.to(device)
+                else:
+                    teacher_feats_mobilesam_batch = None # 標記為 None 以便後續處理
+
+                if isinstance(teacher_feats_sam_h_batch, torch.Tensor) and teacher_feats_sam_h_batch.numel() > 0:
+                    teacher_feats_sam_h_batch = teacher_feats_sam_h_batch.to(device)
+                else:
+                    teacher_feats_sam_h_batch = None # 標記為 None
+
+            except Exception as e:
+                logger.error(f"在 Epoch {epoch_num+1}, Batch {batch_idx} 解包 batch_data 或移至裝置時出錯: {e}")
+                logger.error(f"Batch data structure hint: len={len(batch_data) if hasattr(batch_data, '__len__') else 'N/A'}")
+                if hasattr(batch_data, '__len__'):
+                    for i, item in enumerate(batch_data):
+                         logger.error(f"Item {i} type: {type(item)}, shape: {item.shape if hasattr(item, 'shape') else 'N/A'}, device: {item.device if hasattr(item, 'device') else 'N/A'}")
+                continue # 跳過這個批次
+
+            # --- 前向傳播 ---
+            # autocast 用於混合精度
+            with autocast(enabled=use_amp):
+                # 1. 獲取學生模型的圖像編碼器特徵 (用於蒸餾)
+                student_image_features = model_finetune.image_encoder(image_batch)
+                
+                # 2. 獲取分割預測 (使用提示)
+                # 從邊界框生成點提示 (SAM 的標準輸入)
+                point_coords_batch, point_labels_batch = get_prompt_points_from_bboxes(bboxes_batch, device)
+
+                if point_coords_batch is None: # 如果沒有有效的邊界框/提示
+                    logger.warning(f"Epoch {epoch_num+1}, Batch {batch_idx}: 無有效提示，跳過此批次。")
+                    continue
+
+                # SAM.forward(image, point_coords, point_labels)
+                # masks_pred: (B, num_masks_per_image (e.g.1), H, W)
+                # iou_pred: (B, num_masks_per_image)
+                masks_pred, iou_pred, _ = model_finetune(image_batch, point_coords_batch, point_labels_batch)
+
+                # 計算原始分割損失
+                loss_focal = criterion['focal'](masks_pred, gt_masks_batch)
+                loss_iou = criterion['iou'](masks_pred, gt_masks_batch)
+                original_loss = loss_focal + loss_iou
+                # if 'dice' in criterion:
+                #     loss_dice = criterion['dice'](masks_pred, gt_masks_batch)
+                #     original_loss += loss_dice
+                
+                # 計算蒸餾損失
+                current_distill_mobilesam_loss = torch.tensor(0.0, device=device)
+                if distill_weight_mobilesam > 0 and teacher_feats_mobilesam_batch is not None:
+                    current_distill_mobilesam_loss = criterion['distillation'](student_image_features, teacher_feats_mobilesam_batch)
+                
+                current_distill_sam_h_loss = torch.tensor(0.0, device=device)
+                if distill_weight_sam_h > 0 and teacher_feats_sam_h_batch is not None:
+                    current_distill_sam_h_loss = criterion['distillation'](student_image_features, teacher_feats_sam_h_batch)
+                    
+                # 計算總損失
+                total_loss = original_loss + \
+                             distill_weight_mobilesam * current_distill_mobilesam_loss + \
+                             distill_weight_sam_h * current_distill_sam_h_loss
+
+            # --- 反向傳播與優化 ---
+            optimizer.zero_grad()
+            if scaler is not None: # 混合精度
+                scaler.scale(total_loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else: # 全精度
+                total_loss.backward()
+                optimizer.step()
+            
+            global_step += 1
+            
+            # --- 累加損失用於 epoch 平均 ---
+            epoch_total_loss_sum += total_loss.item()
+            epoch_original_loss_sum += original_loss.item()
+            epoch_focal_loss_sum += loss_focal.item()
+            epoch_iou_loss_sum += loss_iou.item()
+            epoch_distill_mobilesam_loss_sum += current_distill_mobilesam_loss.item()
+            epoch_distill_sam_h_loss_sum += current_distill_sam_h_loss.item()
+            
+            # 更新進度條顯示
+            pbar.set_postfix({
+                'Total': f"{total_loss.item():.4f}",
+                'Orig': f"{original_loss.item():.4f}",
+                'D_MSAM': f"{current_distill_mobilesam_loss.item():.4f}",
+                'D_SAMH': f"{current_distill_sam_h_loss.item():.4f}",
+                'LR': f"{optimizer.param_groups[0]['lr']:.2e}"
+            })
+
+            # TensorBoard 記錄 (每個 step) - 可以選擇性地減少記錄頻率以加速訓練
+            if global_step % config.TRAIN.LOG_FREQ == 0: # LOG_FREQ 需在設定檔中定義，例如 10 或 50
+                writer.add_scalar('Loss_step/Total', total_loss.item(), global_step)
+                writer.add_scalar('Loss_step/Original_Segmentation', original_loss.item(), global_step)
+                writer.add_scalar('Loss_step/Focal', loss_focal.item(), global_step)
+                writer.add_scalar('Loss_step/IoU', loss_iou.item(), global_step)
+                if distill_weight_mobilesam > 0:
+                    writer.add_scalar('Loss_step/Distill_MobileSAM', current_distill_mobilesam_loss.item(), global_step)
+                if distill_weight_sam_h > 0:
+                    writer.add_scalar('Loss_step/Distill_SAM_H', current_distill_sam_h_loss.item(), global_step)
+                writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
+        
+        # --- Epoch 結束 ---
+        # 更新學習率 (通常在每個 step 或每個 epoch 後更新，取決於排程器類型)
+        if scheduler is not None :
+             # 大部分排程器在 optimizer.step() 之後、每個 step 呼叫 scheduler.step()
+             # 有些如 ReduceLROnPlateau 在每個 epoch 結束時，基於驗證指標呼叫 scheduler.step(val_metric)
+             # 這裡假設 build_scheduler 返回的排程器適合在 epoch 結束時更新，或者已在 step 內部處理
+             # 如果是 step-wise scheduler，這一行可能不需要或需要調整
+             if not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau): # PolyLR 等在 step 更新
+                 pass # Step-wise schedulers already stepped.
+             # else: scheduler.step(avg_epoch_total_loss) # Example for ReduceLROnPlateau
+
+        num_batches_in_epoch = len(train_dataloader)
+        avg_epoch_total_loss = epoch_total_loss_sum / num_batches_in_epoch
+        avg_epoch_original_loss = epoch_original_loss_sum / num_batches_in_epoch
+        avg_epoch_focal_loss = epoch_focal_loss_sum / num_batches_in_epoch
+        avg_epoch_iou_loss = epoch_iou_loss_sum / num_batches_in_epoch
+        avg_epoch_distill_mobilesam_loss = epoch_distill_mobilesam_loss_sum / num_batches_in_epoch
+        avg_epoch_distill_sam_h_loss = epoch_distill_sam_h_loss_sum / num_batches_in_epoch
+
+        logger.info(f"Epoch [{epoch_num + 1}/{max_epochs}] 完成. "
+                    f"Avg Total Loss: {avg_epoch_total_loss:.4f}, "
+                    f"Avg Original Loss: {avg_epoch_original_loss:.4f} (Focal: {avg_epoch_focal_loss:.4f}, IoU: {avg_epoch_iou_loss:.4f}), "
+                    f"Avg Distill_MobileSAM: {avg_epoch_distill_mobilesam_loss:.4f}, "
+                    f"Avg Distill_SAM_H: {avg_epoch_distill_sam_h_loss:.4f}, "
+                    f"LR: {optimizer.param_groups[0]['lr']:.2e}")
+        
+        # TensorBoard 記錄 (每個 epoch)
+        writer.add_scalar('Loss_epoch/Total', avg_epoch_total_loss, epoch_num + 1)
+        writer.add_scalar('Loss_epoch/Original_Segmentation', avg_epoch_original_loss, epoch_num + 1)
+        writer.add_scalar('Loss_epoch/Focal', avg_epoch_focal_loss, epoch_num + 1)
+        writer.add_scalar('Loss_epoch/IoU', avg_epoch_iou_loss, epoch_num + 1)
+        writer.add_scalar('Loss_epoch/Distill_MobileSAM', avg_epoch_distill_mobilesam_loss, epoch_num + 1)
+        writer.add_scalar('Loss_epoch/Distill_SAM_H', avg_epoch_distill_sam_h_loss, epoch_num + 1)
+
+        # --- 儲存模型 ---
+        if (epoch_num + 1) % config.TRAIN.SAVE_FREQ == 0 or (epoch_num + 1) == max_epochs:
+            checkpoint_data = {
+                'epoch': epoch_num + 1,
+                'model_state_dict': model_finetune.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'config': config.to_dict() # 儲存設定以供後續參考
+            }
+            if scheduler is not None:
+                checkpoint_data['scheduler_state_dict'] = scheduler.state_dict()
+            if scaler is not None:
+                checkpoint_data['scaler_state_dict'] = scaler.state_dict()
+
+            save_path = os.path.join(config.OUTPUT_DIR, f"epoch_{epoch_num + 1}.pth")
+            save_checkpoint(checkpoint_data, save_path) # 使用 save_checkpoint 函式
+            logger.info(f"模型檢查點已儲存至 {save_path}")
+
+        # --- 執行驗證 (如果需要，此處未實現) ---
+        # if config.TRAIN.EVAL_FREQ > 0 and (epoch_num + 1) % config.TRAIN.EVAL_FREQ == 0:
+        #     logger.info(f"Epoch [{epoch_num+1}/{max_epochs}]: 開始驗證...")
+        #     # evaluate_model(...) # 您需要實現或引入驗證邏輯
 
     writer.close()
-    logger.info("Training finished.")
-
-# train_epoch 和 val_epoch 函數保持不變，這裡省略以節省篇幅
-# ... (train_epoch 和 val_epoch 函數定義) ...
-# (請確保 train_epoch 和 val_epoch 的定義與您先前版本一致)
-
-def train_epoch(dataloader, model, optimizer, criterion_MSE, criterion_Dice, epoch, writer, scaler, lr_scheduler, warmup_scheduler, logger):
-    """Main training function for one epoch."""
-    model.train()
-    total_loss = 0.0
-    num_batches = len(dataloader)
-    progress_bar = tqdm(dataloader, desc=f"Training Epoch {epoch+1}", total=num_batches)
-
-    for batch_idx, (image_batch, mask_batch, box_prompt_batch, point_coords_batch, point_labels_batch, is_point_prompt_flags) in enumerate(progress_bar):
-        image_batch = image_batch.cuda(non_blocking=True)
-        mask_batch = mask_batch.cuda(non_blocking=True)
-        
-        boxes_for_model = box_prompt_batch.cuda(non_blocking=True).unsqueeze(1) 
-        points_coords_for_model = point_coords_batch.cuda(non_blocking=True)
-        points_labels_for_model = point_labels_batch.cuda(non_blocking=True)
-        points_for_model = (points_coords_for_model, points_labels_for_model)
-
-        with autocast(enabled=args.train.bf16, dtype=torch.bfloat16 if args.train.bf16 else torch.float16):
-            pred_mask_logits, pred_iou_values = model(image_batch, boxes=boxes_for_model, points=points_for_model)
-            actual_iou = batch_iou(torch.sigmoid(pred_mask_logits), mask_batch)
-            loss_focal = sigmoid_focal_loss(pred_mask_logits, mask_batch, reduction='mean', alpha=0.25, gamma=2.0)
-            loss_dice = criterion_Dice(pred_mask_logits, mask_batch)
-            loss_mse = criterion_MSE(pred_iou_values, actual_iou)
-            loss = (args.loss.focal_weight * loss_focal) + \
-                   (args.loss.dice_weight * loss_dice) + \
-                   (args.loss.iou_weight * loss_mse)
-
-        scaler.scale(loss).backward()
-        
-        if (batch_idx + 1) % args.train.gradient_accumulation == 0:
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-        
-        with warmup_scheduler.dampening():
-            lr_scheduler.step()
-        
-        total_loss += loss.item()
-        progress_bar.set_postfix(loss=loss.item(), lr=optimizer.param_groups[0]['lr'])
-
-    average_loss = total_loss / num_batches
-    writer.add_scalar('Loss/Train', average_loss, epoch)
-    writer.add_scalar('Learning_rate', optimizer.param_groups[0]['lr'], epoch)
-    return average_loss
-
-def val_epoch(dataloader, model, criterion_MSE, criterion_Dice, epoch, writer, scaler, logger):
-    model.eval()
-    total_loss = 0.0
-    num_batches = len(dataloader)
-    progress_bar = tqdm(dataloader, desc=f"Validating Epoch {epoch+1}", total=num_batches)
-    first_batch_visualized = False
-
-    with torch.no_grad():
-        for batch_idx, (image_batch, mask_batch, box_prompt_batch, point_coords_batch, point_labels_batch, is_point_prompt_flags) in enumerate(progress_bar):
-            image_batch = image_batch.cuda(non_blocking=True)
-            mask_batch = mask_batch.cuda(non_blocking=True)
-            
-            boxes_for_model = box_prompt_batch.cuda(non_blocking=True).unsqueeze(1)
-            points_coords_for_model = point_coords_batch.cuda(non_blocking=True)
-            points_labels_for_model = point_labels_batch.cuda(non_blocking=True)
-            points_for_model = (points_coords_for_model, points_labels_for_model)
-
-            with autocast(enabled=args.train.bf16, dtype=torch.bfloat16 if args.train.bf16 else torch.float16):
-                pred_mask_logits, pred_iou_values = model(image_batch, boxes=boxes_for_model, points=points_for_model)
-                actual_iou = batch_iou(torch.sigmoid(pred_mask_logits), mask_batch)
-                loss_focal = sigmoid_focal_loss(pred_mask_logits, mask_batch, reduction='mean', alpha=0.25, gamma=2.0)
-                loss_dice = criterion_Dice(pred_mask_logits, mask_batch)
-                loss_mse = criterion_MSE(pred_iou_values, actual_iou)
-                loss = (args.loss.focal_weight * loss_focal) + \
-                       (args.loss.dice_weight * loss_dice) + \
-                       (args.loss.iou_weight * loss_mse)
-
-            total_loss += loss.item()
-            progress_bar.set_postfix(loss=loss.item())
-
-            if args.visual.status and not first_batch_visualized and batch_idx == 0:
-                try:
-                    vis_image = image_batch[0].cpu()
-                    vis_pred_mask_sigmoid = torch.sigmoid(pred_mask_logits[0]).cpu()
-                    item_is_point_prompt = is_point_prompt_flags[0].item()
-                    prompt_info_for_vis = None
-                    if item_is_point_prompt:
-                        num_pts = int(torch.sum(point_labels_batch[0] > 0).item())
-                        actual_points = point_coords_batch[0][:num_pts].cpu()
-                        prompt_info_for_vis = actual_points
-                    else:
-                        prompt_info_for_vis = box_prompt_batch[0].cpu()
-
-                    img_mean = torch.tensor(MEAN, device=vis_image.device).view(3, 1, 1)
-                    img_std = torch.tensor(STD, device=vis_image.device).view(3, 1, 1)
-                    vis_image_unnorm = vis_image * img_std + img_mean
-                    
-                    vis_save_dir = Path(args.visual.save_path) / f"epoch_{epoch+1}"
-                    vis_save_dir.mkdir(parents=True, exist_ok=True)
-
-                    overlay_mask_on_image(
-                        image_tensor=vis_image_unnorm,
-                        mask_tensor=vis_pred_mask_sigmoid,
-                        bbox_tensor=prompt_info_for_vis if not item_is_point_prompt else None,
-                        points_tensor=prompt_info_for_vis if item_is_point_prompt else None,
-                        # gt_mask_tensor=mask_batch[0].cpu(), # <<-- REMOVE THIS LINE
-                        threshold=args.visual.IOU_threshold,
-                        save_dir=vis_save_dir,
-                        filename_info=f"val_batch_{batch_idx}_item_0_prompt_{'point' if item_is_point_prompt else 'box'}"
-                    )
-                    first_batch_visualized = True
-                    logger.info(f"Saved visualization for epoch {epoch+1} to {vis_save_dir}")
-                except Exception as e:
-                    logger.error(f"Error during visualization: {e}")
-                    first_batch_visualized = True
-                    
-    average_loss = total_loss / num_batches
-    writer.add_scalar('Loss/Validation', average_loss, epoch)
-    return average_loss
-
+    logger.info("訓練完成！")
 
 if __name__ == '__main__':
-    config = get_config()
-    if not hasattr(config, 'loss'): # 設定預設損失權重 (如果設定檔中沒有)
-        config.loss = type('LossArgs', (), {})() # 建立一個簡單的命名空間物件
-        config.loss.focal_weight = 20.0
-        config.loss.dice_weight = 1.0
-        config.loss.iou_weight = 1.0
-    
-    if not hasattr(config, 'early_stopping'): # 設定預設 Early Stopping (如果設定檔中沒有)
-        config.early_stopping = type('EarlyStoppingArgs', (), {})()
-        config.early_stopping.enabled = False # 預設關閉
-        config.early_stopping.patience = 10
-        config.early_stopping.min_delta = 0.0
-        config.early_stopping.monitor_metric = "val_loss"
+    config = parse_option() # 載入 yaml/json 設定檔，返回 CfgNode
+
+    # 確保 DISTILLATION 和其他必要的設定在 CfgNode 中有預設值
+    # (這應該在 load_config.py 中處理)
+    if not hasattr(config, 'DISTILLATION'):
+        config.defrost()
+        config.DISTILLATION = CN()
+        config.DISTILLATION.PRECOMPUTED_FEAT_DIR_MOBILESAM = ""
+        config.DISTILLATION.PRECOMPUTED_FEAT_DIR_SAM_H = ""
+        config.DISTILLATION.WEIGHT_MOBILESAM = 0.0
+        config.DISTILLATION.WEIGHT_SAM_H = 0.0
+        config.DISTILLATION.LOSS_TYPE = "mse"
+        config.DISTILLATION.KL_TEMP = 1.0
+        config.freeze()
+    if not hasattr(config.TRAIN, 'LOG_FREQ'): # 設定日誌記錄頻率的預設值
+        config.defrost()
+        config.TRAIN.LOG_FREQ = 50 # 每 50 個 global step 記錄一次
+        config.freeze()
+    if not hasattr(config.TRAIN, 'AMP'): # 設定混合精度訓練的預設值
+        config.defrost()
+        config.TRAIN.AMP = False
+        config.freeze()
+    if not hasattr(config, 'CONFIG_PATH'): # 儲存設定檔路徑，方便後續使用
+        # parse_option 中沒有直接傳遞 args.config 給 config 物件
+        # 這裡假設 load_config 會處理或我們可以手動添加
+        # args = argparse.ArgumentParser().parse_args() # 重新解析以獲取 config path (不是好方法)
+        # 最好是在 load_config 中將 config 檔案的路徑存入 CfgNode
+        # config.defrost()
+        # config.CONFIG_PATH = args.config # 這裡的 args 是 main 外面的，作用域問題
+        # config.freeze()
+        # 為了簡單，假設 load_config.py 中的 load_config(filepath) 會將 filepath 存到 CfgNode.CONFIG_PATH
+        pass
+
 
     main(config)

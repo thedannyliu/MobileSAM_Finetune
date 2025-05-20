@@ -1,242 +1,226 @@
+# finetune_utils/datasets.py
+import os
+import json
+import cv2
+import numpy as np
 import torch
 from torch.utils.data import Dataset
-import numpy as np
-import random
-from pathlib import Path
-from PIL import Image
-import os # Not strictly necessary with pathlib, but often present
+import torch.nn.functional as F
+from pycocotools import mask as mask_util # 從 COCO API 引入 mask 工具
 
-class ComponentDataset(Dataset):
-    """
-    ComponentDataset for loading images and multiple object masks for finetuning SAM.
-    Each image can have multiple associated object masks, and each image-mask pair
-    will be treated as a distinct sample.
-    Prompts (box or points) are generated based on the selected mask and mode.
-    """
-    def __init__(self, root_dir, transform=None, max_bbox_shift=10,
-                 prompt_mode='mixed', min_points=1, max_points=3, image_size=1024):
+from mobile_sam.utils.transforms import ResizeLongestSide # 從 MobileSAM 引入轉換函式
+
+class DatasetFinetune(Dataset):
+    def __init__(self, config, json_key='train',
+                 precomputed_feat_dir_mobilesam=None,
+                 precomputed_feat_dir_sam_h=None):
         """
+        用於 MobileSAM 微調的資料集類別。
         Args:
-            root_dir (string): Directory containing 'image' and 'mask' subdirectories.
-                               - 'image' contains image files (e.g., xxx.jpg)
-                               - 'mask' contains subdirectories named after image stems (e.g., xxx/)
-                                 which in turn contain mask files (e.g., yyy-1.png).
-            transform (tuple, optional): A tuple of two optional transforms to be applied
-                on an image and its mask respectively. transform[0] for image, transform[1] for mask.
-            max_bbox_shift (int, optional): Max random perturbation for bounding box coordinates.
-            prompt_mode (str, optional): 'box', 'point', or 'mixed'.
-            min_points (int, optional): Minimum number of points for a point prompt.
-            max_points (int, optional): Maximum number of points for a point prompt.
-            image_size (int, optional): The target size to which images and masks are resized.
+            config: 設定物件，包含資料路徑和模型設定。
+            json_key: 從 JSON 檔案中讀取哪個部分 (例如 'train' 或 'val')。
+            precomputed_feat_dir_mobilesam (str, optional): 預計算的原始 MobileSAM 特徵圖目錄路徑。
+            precomputed_feat_dir_sam_h (str, optional): 預計算的 SAM-H 特徵圖目錄路徑。
         """
-        self.root_dir = Path(root_dir)
-        self.image_dir = self.root_dir / 'image'
-        self.mask_dir = self.root_dir / 'mask'
+        self.config = config
+        self.dataset_json_path = config.DATA.DATASET_JSON
+        self.data_root_path = config.DATA.DATA_ROOT
+        self.json_key = json_key
 
-        if not self.image_dir.is_dir() or not self.mask_dir.is_dir():
-            raise FileNotFoundError(f"Image or mask directory not found in {root_dir}. "
-                                    f"Expected subdirectories 'image' and 'mask'.")
+        if not os.path.exists(self.dataset_json_path):
+            raise FileNotFoundError(f"找不到資料集 JSON 檔案: {self.dataset_json_path}")
+        if not os.path.exists(self.data_root_path):
+            raise FileNotFoundError(f"找不到資料根目錄: {self.data_root_path}")
 
-        self.transform_image = transform[0] if transform and len(transform) > 0 else None
-        self.transform_mask = transform[1] if transform and len(transform) > 1 else None
-        
-        self.max_bbox_shift = max_bbox_shift
-        self.prompt_mode = prompt_mode
-        self.min_points = min_points
-        self.max_points = max_points
-        self.image_size = image_size # Needed for bbox perturbation limits
+        with open(self.dataset_json_path, 'r') as f:
+            data_info = json.load()
 
-        self.samples = []
-        image_files = list(self.image_dir.glob('*.jpg')) + \
-                      list(self.image_dir.glob('*.jpeg')) + \
-                      list(self.image_dir.glob('*.png'))
+        if self.json_key not in data_info:
+            raise KeyError(f"'{self.json_key}' 不在 JSON 檔案的鍵中。可用的鍵: {list(data_info.keys())}")
 
-        for img_path in image_files:
-            img_stem = img_path.stem
-            corresponding_mask_subdir = self.mask_dir / img_stem
-            if corresponding_mask_subdir.is_dir():
-                mask_files_in_subdir = sorted(list(corresponding_mask_subdir.glob('*.png')))
-                if mask_files_in_subdir:
-                    for mask_path in mask_files_in_subdir:
-                        self.samples.append({'image': img_path, 'mask': mask_path})
-                else:
-                    print(f"Warning: No mask PNGs found in {corresponding_mask_subdir} for image {img_path.name}")
-            # else:
-                # Optional: print warning if no mask subdir for an image, can be noisy if many such images
-                # print(f"Warning: No mask directory found at {corresponding_mask_subdir} for image {img_path.name}")
+        self.image_data = data_info[self.json_key]
+        self.image_paths = []
+        self.annotations_list = [] # 儲存每個圖片的標註列表
+
+        for item in self.image_data:
+            image_name = item.get('image_name')
+            annotations = item.get('annotations')
+
+            if image_name is None or annotations is None:
+                print(f"警告：項目 {item} 缺少 'image_name' 或 'annotations'，將跳過。")
+                continue
+
+            image_path = os.path.join(self.data_root_path, image_name)
+            if not os.path.exists(image_path):
+                print(f"警告：圖片 {image_path} 不存在，將跳過包含此圖片的項目。")
+                continue
+
+            self.image_paths.append(image_path)
+            self.annotations_list.append(annotations)
 
 
-        if not self.samples:
-            raise ValueError(f"No image-mask pairs found. Check dataset structure in {root_dir}.")
-        
-        print(f"Initialized ComponentDataset with {len(self.samples)} samples. Prompt mode: {self.prompt_mode}")
+        if not self.image_paths:
+            raise ValueError(f"在指定的 JSON 鍵 '{self.json_key}' 下沒有找到有效的圖片和標註資料。")
 
+        # 新增：預計算特徵相關
+        self.precomputed_feat_dir_mobilesam = precomputed_feat_dir_mobilesam
+        self.precomputed_feat_dir_sam_h = precomputed_feat_dir_sam_h
+
+        self.image_size = config.MODEL.IMAGE_SIZE
+        self.transform = ResizeLongestSide(self.image_size)
+
+        # 檢查預計算特徵目錄是否存在 (如果提供的話)
+        if self.precomputed_feat_dir_mobilesam and not os.path.isdir(self.precomputed_feat_dir_mobilesam):
+            print(f"警告：預計算 MobileSAM 特徵目錄不存在: {self.precomputed_feat_dir_mobilesam}")
+            # self.precomputed_feat_dir_mobilesam = None # 或者拋出錯誤，取決於是否強制要求
+        if self.precomputed_feat_dir_sam_h and not os.path.isdir(self.precomputed_feat_dir_sam_h):
+            print(f"警告：預計算 SAM-H 特徵目錄不存在: {self.precomputed_feat_dir_sam_h}")
+            # self.precomputed_feat_dir_sam_h = None
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.image_paths)
 
-    def compute_bbox(self, mask_tensor):
-        """
-        Compute the bounding box of the foreground region in a binary mask tensor.
-        Args:
-            mask_tensor (tensor): A binary mask tensor (C, H, W) or (H, W). Assumes values are 0 or 1 (or >0 for foreground).
-        Returns:
-            tensor: A tensor containing coordinates (x_min, y_min, x_max, y_max) of the bbox.
-        """
-        if mask_tensor.ndim == 3:
-            mask_tensor = mask_tensor.squeeze(0) # Reduce to (H, W)
+    def __getitem__(self, index):
+        image_path = self.image_paths[index]
+        annotations = self.annotations_list[index] # 該圖片的所有標註
 
-        # Consider foreground where mask > 0 (robust to slight variations if not strictly 0 or 1)
-        # For SAM finetuning, masks from ToTensor() are usually [0,1] float.
-        # Using a small threshold like 0.5 or checking for >0 is common.
-        # The original code used `mask_tensor == 1`. If your masks are strictly 0/1, that's fine.
-        # Using `mask_tensor > 0` or `mask_tensor > 0.5` can be more general.
-        thresholded_mask = mask_tensor > 0.5 
+        image = cv2.imread(image_path)
+        if image is None:
+            raise IOError(f"無法讀取圖片: {image_path}")
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        original_image_size = image.shape[:2] # (H, W)
 
-        rows_any_white = torch.any(thresholded_mask, dim=1)
-        cols_any_white = torch.any(thresholded_mask, dim=0)
+        # 預處理圖像 (與 MobileSAM 相同的方式)
+        image_transformed = self.transform.apply_image(image) # 調整大小
+        image_torch = torch.as_tensor(image_transformed, dtype=torch.float)
+        image_torch = image_torch.permute(2, 0, 1).contiguous() # HWC to CHW
 
-        rows_white_indices = torch.where(rows_any_white)[0]
-        cols_white_indices = torch.where(cols_any_white)[0]
+        # Pad to target size (e.g., 1024x1024 for SAM)
+        h, w = image_torch.shape[1:]
+        pad_h = self.image_size - h
+        pad_w = self.image_size - w
+        image_padded = F.pad(image_torch, (0, pad_w, 0, pad_h), value=0.0) # 用 0 填充
+        # image_padded 的 shape 應為 (3, image_size, image_size)
 
-        if rows_white_indices.nelement() == 0 or cols_white_indices.nelement() == 0:
-            # No foreground pixels, return a zero bbox (or handle as error/default)
-            return torch.tensor([0, 0, 0, 0], dtype=torch.float)
+        # 隨機選擇一個標註進行訓練
+        if not annotations:
+            # 如果圖片沒有任何標註，這是一個問題。
+            # 處理方式可以是在 __init__ 中過濾掉這些圖片，或者在這裡返回一個錯誤/空樣本。
+            # 為了與原始 MobileSAM_Finetune 的行為一致，這裡可能期望總是有標註。
+            # 這裡我們產生一個假的 "無物件" 標註，讓訓練流程可以繼續，但這可能不是最佳選擇。
+            # 理想情況下，您的資料集 JSON 應確保每個用於訓練的圖像至少有一個標註。
+            print(f"警告: 圖片 {image_path} 沒有標註。將產生一個空的遮罩和邊界框。")
+            # 產生一個全為零的遮罩和一個無效的邊界框
+            gt_mask_padded = torch.zeros((1, self.image_size, self.image_size), dtype=torch.float)
+            # 邊界框格式 [x1, y1, x2, y2]
+            transformed_bbox = torch.tensor([[0, 0, 0, 0]], dtype=torch.float)
+        else:
+            selected_ann = annotations[np.random.randint(len(annotations))]
 
-        y_min, y_max = rows_white_indices[0].item(), rows_white_indices[-1].item()
-        x_min, x_max = cols_white_indices[0].item(), cols_white_indices[-1].item()
+            # 處理邊界框 (BBox)
+            # 假設 selected_ann['bbox'] 是 [x,y,w,h] 格式
+            bbox_xywh = np.array(selected_ann['bbox'])
+            # 轉換 bbox 為 [x_min, y_min, x_max, y_max] for SAM
+            # ResizeLongestSide.apply_boxes 需要 (N, 4) 的輸入
+            transformed_bbox_np = self.transform.apply_boxes(bbox_xywh.reshape(-1, 4), original_image_size)
+            transformed_bbox = torch.as_tensor(transformed_bbox_np, dtype=torch.float).squeeze() # 確保是 (4,) 或 (1,4)
 
-        return torch.tensor([x_min, y_min, x_max, y_max], dtype=torch.float)
+            # 處理遮罩 (Mask)
+            # 假設 selected_ann['segmentation'] 是 COCO RLE 或多邊形格式
+            segmentation = selected_ann['segmentation']
+            # pycocotools.mask.decode 需要 RLE 格式
+            # 如果是多邊形，需要先轉換成 RLE: rle = mask_util.frPyObjects(segmentation, original_image_size[0], original_image_size[1])
+            # 這裡假設 segmentation 已經是 RLE 格式或者 frPyObjects 可以處理它
+            if isinstance(segmentation, list) and all(isinstance(s, list) for s in segmentation): # 多邊形格式
+                rle = mask_util.frPyObjects(segmentation, original_image_size[0], original_image_size[1])
+            elif isinstance(segmentation, dict) and 'counts' in segmentation and 'size' in segmentation: # RLE 格式
+                rle = [segmentation] # frPyObjects 期望一個列表
+            else:
+                raise ValueError(f"未知的標註格式 for segmentation: {type(segmentation)}")
 
-    def compute_point_prompts(self, mask_tensor):
-        """
-        Generate random point prompts from the foreground of the mask.
-        Args:
-            mask_tensor (tensor): Binary mask tensor (C, H, W) or (H, W).
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, int]:
-                - point_coords_padded (max_points, 2): Padded (x,y) coordinates.
-                - point_labels_padded (max_points,): Padded labels (1 for fg).
-        """
-        if mask_tensor.ndim == 3:
-            mask_tensor = mask_tensor.squeeze(0) # Reduce to (H, W)
-
-        # Similar to compute_bbox, ensure we correctly identify foreground.
-        foreground_pixels_yx = torch.argwhere(mask_tensor > 0.5) # Get (row, col) i.e., (y, x)
-
-        point_coords_padded = torch.zeros((self.max_points, 2), dtype=torch.float)
-        point_labels_padded = torch.zeros(self.max_points, dtype=torch.long) # SAM expects long/int labels
-
-        if foreground_pixels_yx.shape[0] == 0:
-            return point_coords_padded, point_labels_padded # No points to sample
-
-        num_points_to_sample = random.randint(self.min_points, self.max_points)
-        num_actual_points = min(num_points_to_sample, foreground_pixels_yx.shape[0])
-
-        if num_actual_points > 0:
-            indices = torch.randperm(foreground_pixels_yx.shape[0])[:num_actual_points]
-            sampled_points_yx = foreground_pixels_yx[indices] # Shape (num_actual_points, 2), order (y,x)
+            gt_mask_original = mask_util.decode(rle) # (H_orig, W_orig, num_masks) or (H_orig, W_orig)
+            if gt_mask_original.ndim == 3: # 如果有多個遮罩 (例如 RLE 列表)，取第一個
+                gt_mask_original = gt_mask_original[..., 0]
             
-            # SAM expects (x,y) coordinates
-            sampled_points_xy = torch.flip(sampled_points_yx, dims=[1]).float() # Convert to (x,y) and float
+            gt_mask_transformed = self.transform.apply_image(gt_mask_original) # (image_size_transformed_h, image_size_transformed_w)
+            gt_mask_torch = torch.as_tensor(gt_mask_transformed, dtype=torch.float)
             
-            point_coords_padded[:num_actual_points] = sampled_points_xy
-            point_labels_padded[:num_actual_points] = 1 # Foreground points
+            # Pad mask to target size
+            h_mask, w_mask = gt_mask_torch.shape
+            pad_h_mask = self.image_size - h_mask
+            pad_w_mask = self.image_size - w_mask
+            gt_mask_padded = F.pad(gt_mask_torch, (0, pad_w_mask, 0, pad_h_mask), value=0.0) # (image_size, image_size)
+            gt_mask_padded = gt_mask_padded.unsqueeze(0) # (1, image_size, image_size)
 
-        return point_coords_padded, point_labels_padded
-
-
-    def __getitem__(self, idx):
-        sample_info = self.samples[idx]
-        img_path = sample_info['image']
-        mask_path = sample_info['mask']
-
-        image = Image.open(img_path).convert("RGB")
-        # Ensure mask is loaded as single channel (grayscale)
-        # PIL's "L" mode is 8-bit pixels, black and white.
-        mask = Image.open(mask_path).convert("L") 
-
-        if self.transform_image:
-            transformed_image = self.transform_image(image)
-        else: # Fallback if no transform provided (e.g. for debugging)
-            transformed_image = transforms.ToTensor()(image)
+        # 確保 transformed_bbox 是 (1,4) 的形狀，以方便批次化
+        if transformed_bbox.ndim == 1:
+            transformed_bbox = transformed_bbox.unsqueeze(0)
 
 
-        if self.transform_mask:
-            transformed_mask = self.transform_mask(mask)
-        else: # Fallback
-            transformed_mask = transforms.ToTensor()(mask)
+        # 載入預計算的特徵
+        features_mobilesam = torch.empty(0) # 預設為空 tensor
+        features_sam_h = torch.empty(0)     # 預設為空 tensor
+
+        # 從 image_path 獲取 basename (不含副檔名和路徑)
+        # 例如: /path/to/image.jpg -> image
+        #       /path/to/image.seg.jpg -> image.seg (如果檔名本身包含點)
+        # 這裡我們假設檔名中最後一個點之後的是副檔名
+        basename = os.path.splitext(os.path.basename(image_path))[0]
+
+        if self.precomputed_feat_dir_mobilesam:
+            feat_path_mobilesam = os.path.join(self.precomputed_feat_dir_mobilesam, f"{basename}_feat.pt")
+            if os.path.exists(feat_path_mobilesam):
+                try:
+                    features_mobilesam = torch.load(feat_path_mobilesam, map_location='cpu') # 載入到 CPU 以節省 GPU 記憶體
+                except Exception as e:
+                    print(f"警告：無法載入 MobileSAM 特徵檔案 {feat_path_mobilesam}: {e}")
+            else:
+                print(f"警告：找不到 MobileSAM 特徵檔案 {feat_path_mobilesam} (基於圖片 {image_path})")
+
+        if self.precomputed_feat_dir_sam_h:
+            feat_path_sam_h = os.path.join(self.precomputed_feat_dir_sam_h, f"{basename}_feat.pt")
+            if os.path.exists(feat_path_sam_h):
+                try:
+                    features_sam_h = torch.load(feat_path_sam_h, map_location='cpu') # 載入到 CPU
+                except Exception as e:
+                    print(f"警告：無法載入 SAM-H 特徵檔案 {feat_path_sam_h}: {e}")
+            else:
+                print(f"警告：找不到 SAM-H 特徵檔案 {feat_path_sam_h} (基於圖片 {image_path})")
+
+        # 返回:
+        # 1. image_padded: (3, image_size, image_size) - 學生模型的輸入圖像
+        # 2. transformed_bbox: (1, 4) - 用於生成提示的邊界框 [x1,y1,x2,y2]
+        # 3. gt_mask_padded: (1, image_size, image_size) - 真值遮罩
+        # 4. features_mobilesam: (C_ms, H_feat, W_feat) 或 空 tensor - 教師1的特徵
+        # 5. features_sam_h: (C_sh, H_feat, W_feat) 或 空 tensor - 教師2的特徵
+        return image_padded, transformed_bbox, gt_mask_padded, features_mobilesam, features_sam_h
+
+
+# 針對 DataLoader 的 Collate 函式 (如果需要自訂的話)
+# 預設的 torch.utils.data.dataloader.default_collate 通常可以處理這種情況，
+# 只要 features_mobilesam 和 features_sam_h 在批次中都是 Tensor (即使是空 Tensor)。
+# 如果某些樣本的特徵是 None 或其他非 Tensor 類型，則需要自訂 collate_fn。
+# 由於我們將缺失的特徵初始化為 torch.empty(0)，default_collate 應該沒問題，
+# 但在 train.py 中使用這些特徵前需要檢查它們是否為空 (numel() > 0)。
+
+# 例如，一個簡單的 collate_fn，如果預期會有 None (這裡我們已經避免了 None)：
+# def collate_fn_distillation(batch):
+#     images, bboxes, masks, feats_ms, feats_sh = zip(*batch)
+#     images = torch.stack(images, 0)
+#     bboxes = torch.stack(bboxes, 0)
+#     masks = torch.stack(masks, 0)
+    
+#     # 處理可能為空的特徵列表
+#     # 如果確定都是 Tensor (即使是 empty tensor)，default_collate 更好
+#     # 這裡假設如果特徵存在，它們的形狀是一致的
+#     if all(f.numel() > 0 for f in feats_ms if isinstance(f, torch.Tensor)):
+#         feats_ms = torch.stack([f for f in feats_ms if isinstance(f, torch.Tensor) and f.numel() > 0], 0) if any(isinstance(f, torch.Tensor) and f.numel() > 0 for f in feats_ms) else torch.empty(0)
+#     else: # 如果混雜了空tensor和非空tensor，或者全為空，處理起來較複雜，最好確保一致性
+#         feats_ms = torch.empty(0) # 或者返回一個包含空tensor的列表，讓train.py處理
+
+#     if all(f.numel() > 0 for f in feats_sh if isinstance(f, torch.Tensor)):
+#         feats_sh = torch.stack([f for f in feats_sh if isinstance(f, torch.Tensor) and f.numel() > 0], 0) if any(isinstance(f, torch.Tensor) and f.numel() > 0 for f in feats_sh) else torch.empty(0)
+#     else:
+#         feats_sh = torch.empty(0)
         
-        # Ensure mask is binary [0,1] after transform for robust computations
-        # ToTensor typically scales L mode images (0-255) to [0,1] float.
-        # If masks are guaranteed to be 0 or 255, this works fine.
-        # Otherwise, explicit binarization might be needed.
-        # e.g. transformed_mask = (transformed_mask > 0.5).float()
-        # For now, assuming ToTensor() and mask content is sufficient.
-
-        # Initialize prompts
-        box_prompt_coords = torch.zeros(4, dtype=torch.float) # (x_min, y_min, x_max, y_max)
-        point_coords_padded = torch.zeros((self.max_points, 2), dtype=torch.float) # (N_max, 2) for (x,y)
-        point_labels_padded = torch.zeros(self.max_points, dtype=torch.long) # (N_max,)
-        
-        is_point_prompt_item = False # Flag to indicate if this item uses point prompt
-
-        # Determine current prompt type for this item
-        current_item_prompt_type = self.prompt_mode
-        if self.prompt_mode == 'mixed':
-            current_item_prompt_type = random.choice(['box', 'point'])
-
-        if current_item_prompt_type == 'box':
-            raw_bbox = self.compute_bbox(transformed_mask) # x_min, y_min, x_max, y_max
-            
-            # Apply perturbation if a valid bbox was found
-            if not torch.all(raw_bbox == 0): # Check if bbox is not all zeros
-                # Perturbation logic (ensure coordinates are within image bounds after shift)
-                # The image_size is the size of transformed_image and transformed_mask (H, W)
-                # Assuming transformed_mask is (C, H, W) or (H, W)
-                h, w = transformed_mask.shape[-2], transformed_mask.shape[-1]
-                
-                bbox_width = raw_bbox[2] - raw_bbox[0]
-                bbox_height = raw_bbox[3] - raw_bbox[1]
-
-                noise_w_val = 0
-                noise_h_val = 0
-
-                if bbox_width.item() > 0 and self.max_bbox_shift > 0: # Ensure positive width
-                    noise_w_val = torch.clamp(
-                        torch.randn(1) * bbox_width * 0.1, # Scale noise by 10% of bbox dim
-                        min=-self.max_bbox_shift, max=self.max_bbox_shift
-                    ).round().int().item()
-                if bbox_height.item() > 0 and self.max_bbox_shift > 0: # Ensure positive height
-                    noise_h_val = torch.clamp(
-                        torch.randn(1) * bbox_height * 0.1,
-                        min=-self.max_bbox_shift, max=self.max_bbox_shift
-                    ).round().int().item()
-                
-                x_min_shifted = max(0, raw_bbox[0].item() + noise_w_val)
-                y_min_shifted = max(0, raw_bbox[1].item() + noise_h_val)
-                x_max_shifted = min(w, raw_bbox[2].item() + noise_w_val) # w is width of image
-                y_max_shifted = min(h, raw_bbox[3].item() + noise_h_val) # h is height of image
-
-                # Ensure x_max > x_min and y_max > y_min after shift
-                if x_max_shifted <= x_min_shifted: x_max_shifted = x_min_shifted + 1 # Ensure min width of 1
-                if y_max_shifted <= y_min_shifted: y_max_shifted = y_min_shifted + 1 # Ensure min height of 1
-                x_max_shifted = min(w, x_max_shifted) # Re-clamp if +1 pushed it over
-                y_max_shifted = min(h, y_max_shifted)
-
-
-                box_prompt_coords = torch.tensor([
-                    x_min_shifted, y_min_shifted, x_max_shifted, y_max_shifted
-                ], dtype=torch.float)
-            else: # if no object in mask or bbox calculation failed, use the zero box.
-                box_prompt_coords = raw_bbox # which is torch.zeros(4)
-            
-            is_point_prompt_item = False
-
-        elif current_item_prompt_type == 'point':
-            # compute_point_prompts already handles padding to self.max_points
-            point_coords_padded, point_labels_padded = self.compute_point_prompts(transformed_mask)
-            is_point_prompt_item = True
-            # box_prompt_coords remains zeros for point prompts
-
-        return transformed_image, transformed_mask, box_prompt_coords, point_coords_padded, point_labels_padded, is_point_prompt_item
+#     return images, bboxes, masks, feats_ms, feats_sh

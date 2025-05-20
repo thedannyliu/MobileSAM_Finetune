@@ -44,5 +44,13 @@
         "patience": 20,
         "min_delta": 0.0001,
         "monitor_metric": "val_loss"
+    },
+    "DISTILLATION": {
+        "PRECOMPUTED_FEAT_DIR_MOBILESAM": "./precomputed_features/original_mobilesam_train",
+        "PRECOMPUTED_FEAT_DIR_SAM_H": "./precomputed_features/sam_h_train",
+        "WEIGHT_MOBILESAM": 0.5,
+        "WEIGHT_SAM_H": 0.5,
+        "LOSS_TYPE": "mse",
+        "KL_TEMP": 1.0
     }
 }
