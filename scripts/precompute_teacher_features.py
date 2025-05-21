@@ -15,7 +15,7 @@ python precompute_teacher_features.py \
     --teacher_checkpoint path/to/sam_vit_h_weights.pth \
     --output_dir ./precomputed_features/sam_h_train
 """
-# precompute_teacher_features.py
+
 import torch
 import os
 import argparse
