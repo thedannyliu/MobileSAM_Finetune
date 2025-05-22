@@ -135,7 +135,7 @@ def process_images_in_dir(model, image_dir_path: pathlib.Path, output_base_dir: 
                 
                 if can_combine_all_specific_blocks and len(collected_block_features_for_stacking) == len(vit_block_keys_to_combine):
                     try:
-                        combined_name = "image_encoder_blocks_9_12_combined"
+                        combined_name = "image_encoder_neck"
                         # 沿著新的第0維堆疊: (4, original_dims...)
                         final_save_items[combined_name] = np.stack(collected_block_features_for_stacking, axis=0)
                         print(f"Info: Combined {len(vit_block_keys_to_combine)} ViT block features into '{combined_name}' for {p.name}.")
