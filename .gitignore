@@ -1,10 +1,12 @@
 *.pyc
 *.pyo
 *.pyd
+*.npy
 __py
 **/__pycache__/
-
+precomputed
 logs
 runs
 images
 weights/sam_vith.pth
+mobile_sam.egg-info
