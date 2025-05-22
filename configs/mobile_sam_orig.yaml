@@ -1,0 +1,13 @@
+# ====================================================
+# Original MobileSAM teacher model configuration
+# 用於原版 MobileSAM（未微調版本）作為第二教師
+# ====================================================
+
+model:
+  name: MobileSAM_orig        # 內部識別名稱
+  type: vit_t                 # backbone 型號（與 fine‐tune 時相同）
+  image_size: 1024            # 輸入影像尺寸
+  checkpoint: weights/mobile_sam_orig.pth
+  # 如有額外 Mask Decoder 或 Prompt Encoder 參數，也可一併在這裡設定
+  # prompt_dim: 256
+  # mask_decoder_layers: 4
