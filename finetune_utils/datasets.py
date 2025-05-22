@@ -1,4 +1,3 @@
-# finetune_utils/datasets.py
 import torch
 from torch.utils.data import Dataset
 import numpy as np
@@ -112,17 +111,20 @@ class ComponentDataset(Dataset):
         image_pil = Image.open(img_path).convert("RGB")
         mask_pil = Image.open(mask_path).convert("L") # 確保以灰階模式載入遮罩
 
-        # --- 新增：在轉換為 Tensor 之前，統一調整大小 ---
+        # --- MODIFICATION START: Get original image size before resizing ---
+        original_w, original_h = image_pil.size 
+        original_size_tuple = (original_h, original_w) # SAM expects (H, W) format
+        # --- MODIFICATION END ---
+
+        # --- 在轉換為 Tensor 之前，統一調整大小 ---
         target_size = (self.image_size, self.image_size) # 例如 (1024, 1024)
         
-        # 確保使用 torchvision.transforms.Resize，因為 PIL 的 resize 質量可能不同
-        # 並且 torchvision 的 resize 更常用於 PyTorch 工作流程
         image_resizer = transforms.Resize(target_size, interpolation=transforms.InterpolationMode.BILINEAR)
         mask_resizer = transforms.Resize(target_size, interpolation=transforms.InterpolationMode.NEAREST) # 遮罩用最近鄰
 
         image_pil_resized = image_resizer(image_pil)
         mask_pil_resized = mask_resizer(mask_pil)
-        # --- 新增結束 ---
+        # --- 修改結束於此 ---
 
         if self.transform_image:
             transformed_image = self.transform_image(image_pil_resized) # 對調整大小後的圖像進行轉換
@@ -182,5 +184,6 @@ class ComponentDataset(Dataset):
             "point_coords": point_coords_padded, # SAM 期望的 point 格式
             "point_labels": point_labels_padded, # SAM 期望的 label 格式
             "is_point_prompt": is_point_prompt_item, # 布林值，指示是否為點提示
-            "id": img_id # 圖像 ID，用於載入教師特徵
+            "id": img_id, # 圖像 ID，用於載入教師特徵
+            "original_size": original_size_tuple # --- MODIFICATION: Added original_size ---
         }
