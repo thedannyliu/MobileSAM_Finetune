@@ -112,29 +112,18 @@ def main():
     student = model_builder_func(checkpoint=student_initial_checkpoint).to(device)
     optimizer = torch.optim.AdamW(student.parameters(), lr=cfg["train"]["lr"], weight_decay=1e-4)
 
-    # ---------- Hooks (REFINED SECTION) ----------
-    # These are the *potential* layers we might want to hook, based on the student model type
-    # and what extract_teacher_features.py typically captures for those types.
     potential_hooks = {
-        "enc": [],
-        "dec": [], # For vit_t, 'mask_decoder.pre_logits' doesn't exist. 'mask_decoder.transformer' is an option if loss handles it.
-        "attn": [],
-        "rkd": ["image_encoder.patch_embed"] # Generally available
+        "enc": [], "dec": [], "attn": [],
+        "rkd": ["image_encoder.patch_embed"] 
     }
-
     if student_model_type == 'vit_t':
         print("Student model is vit_t (MobileSAM/TinyViT), selecting vit_t specific hook names.")
         potential_hooks["enc"] = ["image_encoder.neck"]
-        # For vit_t, 'mask_decoder.pre_logits' is not applicable.
-        # If decoder_matching is desired for vit_t, potential_hooks["dec"] could be set to ["mask_decoder.transformer"],
-        # but the loss function (decoder_matching_loss) must be able to handle the output of a Transformer module.
-        # To avoid the 'mask_decoder.pre_logits' warning, we leave it empty or use a known valid layer for vit_t's decoder.
-        potential_hooks["dec"] = [] # Or specify a valid vit_t decoder layer if known and loss supports it.
-        potential_hooks["attn"] = [] # Needs specific, verified paths for TinyViT attention layers.
+        potential_hooks["dec"] = [] 
     elif student_model_type in ['vit_b', 'vit_l', 'vit_h']:
         print(f"Student model is {student_model_type}, selecting standard ViT hook names (verify indices).")
         potential_hooks["enc"] = [f"image_encoder.blocks.{i}" for i in (9,10,11,12)]
-        potential_hooks["dec"] = ["mask_decoder.pre_logits"] # Assumed for standard SAM
+        potential_hooks["dec"] = ["mask_decoder.pre_logits"] 
         potential_hooks["attn"] = [f"image_encoder.blocks.{i}.attn" for i in range(12)]
     else:
         print(f"Warning: Unknown student_model_type '{student_model_type}'. Using default (likely ViT-H like) hook names which may cause warnings.")
@@ -142,7 +131,6 @@ def main():
         potential_hooks["dec"] = ["mask_decoder.pre_logits"]
         potential_hooks["attn"] = [f"image_encoder.blocks.{i}.attn" for i in range(12)]
 
-    # Construct the final list of hook names to register based on enabled distillation types
     hook_names_to_register = []
     distill_cfg = cfg.get("distillation", {})
     if distill_cfg.get("encoder_matching", {}).get("enable"):
@@ -153,7 +141,6 @@ def main():
         hook_names_to_register.extend(potential_hooks["attn"])
     if distill_cfg.get("relational_KD", {}).get("enable"):
         hook_names_to_register.extend(potential_hooks["rkd"])
-    
     hook_names_to_register = sorted(list(set(h for h in hook_names_to_register if h))) 
 
     hook_handles = []
@@ -162,7 +149,6 @@ def main():
         hook_handles = register_hooks(student, hook_names_to_register)
     elif distill_cfg.get("enable"):
         print("Warning: Distillation is enabled, but no hook names were determined for active distillation types. Hooks not registered.")
-    # ---------- End of Hooks REFINED SECTION ----------
 
     best_metric = -1
     patience = cfg["train"].get("early_stop_patience", 0)
@@ -174,14 +160,13 @@ def main():
         for batch in pbar:
             images = batch["image"].to(device)
             gt_masks = batch["mask"].to(device)
-            ids = batch["id"] # image stems
+            ids = batch["id"] 
             original_sizes_batch_data = batch["original_size"] 
 
             batched_input_list = []
             for i in range(images.shape[0]):
                 h_orig, w_orig = original_sizes_batch_data[i]
                 current_original_size = (int(h_orig), int(w_orig)) 
-
                 input_dict = {"image": images[i], "original_size": current_original_size}
                 if "box_prompt" in batch and batch["box_prompt"][i] is not None:
                     input_dict["boxes"] = batch["box_prompt"][i].to(device)
@@ -231,18 +216,16 @@ def main():
 
                     current_epoch_dist_loss = torch.tensor(0.0, device=device)
                     
-                    # Encoder Matching
                     if distill_cfg.get("encoder_matching", {}).get("enable") and potential_hooks["enc"]:
-                        # Use potential_hooks["enc"] as the list of student layers we expect features for
                         if all(layer in feats_s for layer in potential_hooks["enc"]):
-                            teacher_keys_to_load = potential_hooks["enc"]
+                            teacher_keys = potential_hooks["enc"]
                             is_combined = False
                             if teacher_model_type_cfg in ['vit_h', 'vit_l'] and \
                                set(potential_hooks["enc"]) == {f"image_encoder.blocks.{i}" for i in (9,10,11,12)}:
-                                teacher_keys_to_load = ["image_encoder_blocks_9_12_combined"]
+                                teacher_keys = ["image_encoder_blocks_9_12_combined"]
                                 is_combined = True
                             try:
-                                loaded_te_feats = load_cached_npy_features(base_precomp_dir, te_name, "train", ids, teacher_keys_to_load)
+                                loaded_te_feats = load_cached_npy_features(base_precomp_dir, te_name, "train", ids, teacher_keys)
                                 final_te_for_loss = []
                                 if is_combined:
                                     if loaded_te_feats and loaded_te_feats[0].nelement() > 0:
@@ -258,9 +241,8 @@ def main():
                                         **distill_cfg["encoder_matching"])
                             except (FileNotFoundError, RuntimeError) as e_dist: print(f"Enc distill skip: {e_dist}")
                     
-                    # Decoder Matching
                     if distill_cfg.get("decoder_matching", {}).get("enable") and potential_hooks["dec"]:
-                        if potential_hooks["dec"] and potential_hooks["dec"][0] in feats_s : # Check if list not empty before indexing
+                        if potential_hooks["dec"] and potential_hooks["dec"][0] in feats_s : 
                             try:
                                 te_dec = load_cached_npy_features(base_precomp_dir, te_name, "train", ids, potential_hooks["dec"])[0]
                                 if te_dec.nelement() > 0:
@@ -268,7 +250,6 @@ def main():
                                         feats_s[potential_hooks["dec"][0]], te_dec, **distill_cfg["decoder_matching"])
                             except (FileNotFoundError, RuntimeError, IndexError) as e_dist: print(f"Dec distill skip: {e_dist}")
 
-                    # Attention Matching
                     if distill_cfg.get("attention_matching", {}).get("enable") and potential_hooks["attn"]:
                         if all(layer in feats_s for layer in potential_hooks["attn"]):
                             try:
@@ -278,14 +259,14 @@ def main():
                                         [feats_s[l] for l in potential_hooks["attn"]], te_attn, **distill_cfg["attention_matching"])
                             except (FileNotFoundError, RuntimeError) as e_dist: print(f"Attn distill skip: {e_dist}")
 
-                    # Relational KD
-                    if distill_cfg.get("relational_KD", {}).get("enable") and potential_hooks["rkd"]: # potential_hooks["rkd"] is ["image_encoder.patch_embed"]
+                    if distill_cfg.get("relational_KD", {}).get("enable") and potential_hooks["rkd"]: 
                         if potential_hooks["rkd"][0] in feats_s:
                             try:
                                 te_rkd = load_cached_npy_features(base_precomp_dir, te_name, "train", ids, potential_hooks["rkd"])[0]
                                 if te_rkd.nelement() > 0:
                                     current_epoch_dist_loss += rkd_loss(
-                                        feats_s[potential_hooks["rkd"][0]], te_rkd, **distill_cfg["relational_KD"])
+                                        feats_s[potential_hooks["rkd"][0]], te_rkd, 
+                                        **distill_cfg["relational_KD"]) # TypeError: rkd_loss() got an unexpected keyword argument 'enable'
                             except (FileNotFoundError, RuntimeError, IndexError) as e_dist: print(f"RKD distill skip: {e_dist}")
                     dist_loss = current_epoch_dist_loss
             
@@ -295,7 +276,6 @@ def main():
             dist_loss_item = dist_loss.item() if torch.is_tensor(dist_loss) else float(dist_loss)
             pbar.set_postfix({"task": task_loss.item(), "dist": dist_loss_item, "tot": total_loss.item()})
 
-        # Validation loop
         student.eval(); dices = []
         with torch.no_grad():
             for batch_val in val_loader: 

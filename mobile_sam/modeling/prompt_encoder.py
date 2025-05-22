@@ -17,7 +17,7 @@ class PromptEncoder(nn.Module):
     def __init__(
         self,
         embed_dim: int,
-        image_embedding_size: Tuple[int, int],
+        image_embedding_size: Tuple[int, int], # <--- 注意這裡
         input_image_size: Tuple[int, int],
         mask_in_chans: int,
         activation: Type[nn.Module] = nn.GELU,
@@ -230,7 +230,10 @@ class PromptEncoder(nn.Module):
             dense_embeddings = self._embed_masks(masks)
         else:
             dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
-                current_bs, -1, self.image_embedding_size, self.image_embedding_size # image_embedding_size usually 64
+                current_bs, 
+                -1, 
+                self.image_embedding_size[0], # 使用元組的第一個元素 (高度)
+                self.image_embedding_size[1]  # 使用元組的第二個元素 (寬度)
             )
         
         return sparse_embeddings, dense_embeddings
