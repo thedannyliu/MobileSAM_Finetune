@@ -1,14 +1,11 @@
-"""MobileSAM fine‑tune training with multi‑teacher distillation + EarlyStopping.
-依 repo 原生 dataset.py 取資料。"""
-from finetune_utils.dataset import ComponentDataset   # ↙ 直接引用原始 class
+from finetune_utils.datasets import ComponentDataset
 from torchvision import transforms as T
-from __future__ import annotations
 import argparse, json, pathlib, os, numpy as np, torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from mobilesam import build_model
+from mobile_sam import sam_model_registry
 from finetune_utils.distill_losses import (
     encoder_matching_loss, decoder_matching_loss,
     attention_matching_loss, rkd_loss
@@ -72,7 +69,27 @@ def main():
 
 
     # ---------- Student ----------
-    student = build_model("configs/mobile_sam_finetune.yaml", None).to(device)
+    student_config_data = cfg.get("model") # 從載入的 JSON 設定檔中獲取 "model" 部分
+    if student_config_data is None:
+        raise ValueError("Model configuration ('model') not found in the config file.")
+
+    # 從學生模型的設定中獲取類型和初始權重路徑
+    # 預設學生模型為 'vit_t' (MobileSAM)，如果設定檔中沒有明確指定
+    student_model_type = student_config_data.get("type", "vit_t")
+    # 學生模型的初始權重，可以為 None (從頭訓練或由建構函數處理預設權重)
+    student_initial_checkpoint = student_config_data.get("checkpoint", None)
+
+    # 從 sam_model_registry 中獲取對應的模型建構函數
+    if student_model_type not in sam_model_registry:
+        raise ValueError(f"Student model type '{student_model_type}' not found in sam_model_registry. "
+                         f"Available types: {list(sam_model_registry.keys())}")
+    
+    model_builder_func = sam_model_registry[student_model_type]
+
+    print(f"Building student model of type '{student_model_type}' with initial checkpoint: {student_initial_checkpoint}")
+    # 使用獲取到的建構函數和權重路徑來建立學生模型
+    student = model_builder_func(checkpoint=student_initial_checkpoint).to(device)
+    
     optimizer = torch.optim.AdamW(student.parameters(), lr=cfg["train"]["lr"], weight_decay=1e-4)
 
     # ---------- Hooks ----------

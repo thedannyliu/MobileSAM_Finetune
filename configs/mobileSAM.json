@@ -18,7 +18,7 @@
   
     "train": {
       "epochs":              10000,
-      "learning_rate":       1e-5,
+      "lr":       1e-5,
       "batch_size":          4,
       "val_freq":            5,
       "gradient_accumulation": 1,
@@ -90,12 +90,12 @@
       {
         "name":        "SAM_vitH",
         "cfg":         "configs/sam_vith.yaml",
-        "checkpoint":  "weights/sam_vith.pth"
+        "checkpoint":  "weights/sam_vit_h_4b8939.pth"
       },
       {
         "name":        "MobileSAM_orig",
         "cfg":         "configs/mobile_sam_orig.yaml",
-        "checkpoint":  "weights/mobile_sam_orig.pth"
+        "checkpoint":  "weights/mobile_sam.pt"
       }
     ]
   }
