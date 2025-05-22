@@ -7,7 +7,7 @@ model:
   name: SAM                   # 內部識別名稱，可任意
   type: vit_h                 # backbone 型號，ViT‐H 表示 large‐H
   image_size: 1024            # SAM 預期輸入大小
-  checkpoint: weights/sam_vith.pth
+  checkpoint: weights/sam_vit_h_4b8939.pth
   # 其他可能需要的超參數，例如 patch_size, embed_dim, decoder_depth 等
   # patch_size: 16
   # embed_dim: 1280

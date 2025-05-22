@@ -6,6 +6,15 @@
 Bash
 
 python scripts/extract_teacher_features.py \
+    --teacher_name SAM_vitH \
+    --teacher_cfg ./configs/sam_vith.yaml \
+    --teacher_ckpt ./weights/sam_vit_h_4b8939.pth \
+    --dataset_base_dir ./datasets \
+    --output_base_dir ./precomputed/SAM_vitH \
+    --splits train val \
+    --image_subdir_name image
+
+python scripts/extract_teacher_features.py \
     --teacher_name MobileSAM_orig \
     --teacher_cfg configs/mobile_sam_orig.yaml \
     --teacher_ckpt weights/mobile_sam.pt \
@@ -39,10 +48,10 @@ import yaml
 
 from mobile_sam import sam_model_registry #
 
-def process_images_in_dir(model, image_dir_path: pathlib.Path, output_base_dir: pathlib.Path, capture_targets: list, device: str):
+def process_images_in_dir(model, image_dir_path: pathlib.Path, output_base_dir: pathlib.Path, capture_targets: list, device: str, model_type: str): # 新增 model_type 參數
     """
     處理指定目錄中的所有圖片，並將提取的特徵保存到指定的輸出位置。
-    每個特徵將保存為單獨的 .npy 檔案。
+    對於 ViT-H/L，特定的 image_encoder.blocks 會被合併。
     """
     if not image_dir_path.is_dir():
         print(f"Info: Image directory {image_dir_path} does not exist or is not a directory. Skipping.")
@@ -55,7 +64,7 @@ def process_images_in_dir(model, image_dir_path: pathlib.Path, output_base_dir: 
     imgs = []
     for ext in img_extensions:
         imgs.extend(list(image_dir_path.glob(ext)))
-    imgs = sorted(list(set(imgs))) # 去重並排序
+    imgs = sorted(list(set(imgs)))
 
     if not imgs:
         print(f"Warning: No images (jpg, jpeg, png) found in {image_dir_path}.")
@@ -63,8 +72,16 @@ def process_images_in_dir(model, image_dir_path: pathlib.Path, output_base_dir: 
 
     print(f"Processing {len(imgs)} images from {image_dir_path}...")
     
-    # 在處理整個目錄的圖像之前註冊一次 hooks
     handles = register_hooks(model, capture_targets)
+
+    # 定義 ViT-H/L 中要合併的 image encoder block 特徵的鍵名
+    # 這些鍵名應該與 capture_targets 中為 vit_h/vit_l 生成的鍵名一致
+    vit_block_keys_to_combine = [
+        "image_encoder.blocks.9",
+        "image_encoder.blocks.10",
+        "image_encoder.blocks.11",
+        "image_encoder.blocks.12"
+    ]
 
     for p in imgs:
         try:
@@ -84,43 +101,85 @@ def process_images_in_dir(model, image_dir_path: pathlib.Path, output_base_dir: 
             with torch.no_grad():
                 _ = model.forward(current_batched_input, multimask_output_setting)
             
-            feats = pop_features() # feats is a dict like {key: [tensor1], key2: [tensor2], ...}
+            feats = pop_features()
             
-            num_features_saved_for_image = 0
+            temp_numpy_features = {} # 暫存所有轉換為 numpy 的特徵
             for key, captured_list_of_features in feats.items():
                 if captured_list_of_features: 
                     feature_tensor = captured_list_of_features[0] 
-                    
                     if isinstance(feature_tensor, torch.Tensor):
-                        numpy_feature = feature_tensor.cpu().squeeze(0).numpy()
-                        
-                        # 創建特徵檔案名稱，例如：image_stem_feature_key.npy
-                        # 將 feature_key 中的 '.' 替換為 '_' 以避免檔案系統問題
-                        sanitized_key = key.replace(".", "_")
-                        feature_filename = f"{p.stem}_{sanitized_key}.npy"
-                        feature_save_path = current_output_dir / feature_filename
-                        
-                        np.save(feature_save_path, numpy_feature)
-                        # print(f"Saved feature '{key}' for {p.name} to {feature_save_path}")
-                        num_features_saved_for_image += 1
+                        temp_numpy_features[key] = feature_tensor.cpu().squeeze(0).numpy()
                     else:
-                        print(f"Warning: Captured item for key '{key}' is not a tensor, it's a {type(feature_tensor)}. Skipping save for this item for image {p.name}.")
+                        print(f"Warning: Captured item for key '{key}' is not a tensor, it's a {type(feature_tensor)} for image {p.name}.")
                 else:
                     print(f"Warning: No features captured in the list for key '{key}' for image {p.name}.")
 
-            if num_features_saved_for_image > 0:
-                print(f"Saved {num_features_saved_for_image} feature(s) for {p.name} in {current_output_dir}")
+            final_save_items = {} # 最終要儲存的項目 (鍵名 -> numpy 陣列)
+            collected_block_features_for_stacking = [] # 收集用於堆疊的特徵
+
+            # 檢查是否為 ViT-H/L 並嘗試合併指定的 block 特徵
+            attempt_combination = model_type in ['vit_h', 'vit_l']
+            
+            if attempt_combination:
+                can_combine_all_specific_blocks = True
+                for bk_key in vit_block_keys_to_combine:
+                    if bk_key in temp_numpy_features:
+                        collected_block_features_for_stacking.append(temp_numpy_features[bk_key])
+                    else:
+                        # 即使 capture_targets 中包含了這些鍵，也可能因為某些原因 (例如模型實際層數不足) 導致未捕獲到
+                        # 檢查 capture_targets 中是否真的包含了這些鍵 (對於 vit_b 可能不全包含)
+                        if bk_key in capture_targets:
+                            print(f"Warning: Expected feature '{bk_key}' was in capture_targets but not found in extracted feats for {p.name}. Cannot combine ViT blocks.")
+                        can_combine_all_specific_blocks = False
+                        break 
+                
+                if can_combine_all_specific_blocks and len(collected_block_features_for_stacking) == len(vit_block_keys_to_combine):
+                    try:
+                        combined_name = "image_encoder_blocks_9_12_combined"
+                        # 沿著新的第0維堆疊: (4, original_dims...)
+                        final_save_items[combined_name] = np.stack(collected_block_features_for_stacking, axis=0)
+                        print(f"Info: Combined {len(vit_block_keys_to_combine)} ViT block features into '{combined_name}' for {p.name}.")
+                        # 從 temp_numpy_features 中移除已合併的單獨 block 特徵，避免重複儲存
+                        for bk_key in vit_block_keys_to_combine:
+                            temp_numpy_features.pop(bk_key, None)
+                    except Exception as e:
+                        print(f"Error combining ViT block features for {p.name}: {e}. Will save them individually if available.")
+                elif attempt_combination : # 即使是 vit_h/l，如果未能收集齊全部指定的 block，則不合併
+                    print(f"Info: Not all specified ViT blocks ({len(vit_block_keys_to_combine)} expected, {len(collected_block_features_for_stacking)} found) were available for combination for {p.name}. Saving individually if present.")
+
+
+            # 將剩餘的 (或未被成功合併的) 特徵加入到最終儲存列表
+            for key, numpy_feature in temp_numpy_features.items():
+                final_save_items[key] = numpy_feature
+            
+            # 儲存 final_save_items 中的所有特徵為獨立的 .npy 檔案
+            num_features_saved_for_image = 0
+            if not final_save_items:
+                 print(f"No features processed to save for {p.name}.")
             else:
-                print(f"No features were saved for {p.name}.")
+                for key, numpy_feature_to_save in final_save_items.items():
+                    sanitized_key = key.replace(".", "_").replace("[","_").replace("]","") # 清理鍵名作為檔案名的一部分
+                    feature_filename = f"{p.stem}_{sanitized_key}.npy"
+                    feature_save_path = current_output_dir / feature_filename
+                    try:
+                        np.save(feature_save_path, numpy_feature_to_save)
+                        num_features_saved_for_image += 1
+                    except Exception as e:
+                        print(f"Error saving feature '{key}' for {p.name} to {feature_save_path}: {e}")
+
+            if num_features_saved_for_image > 0:
+                print(f"Saved {num_features_saved_for_image} feature file(s) for {p.name} in {current_output_dir}")
+            else:
+                print(f"No features were ultimately saved for {p.name}.")
 
         except Exception as e:
-            print(f"Error processing file {p.name}: {e}")
+            print(f"Critical error processing file {p.name}: {e}")
             import traceback
             traceback.print_exc()
         finally:
-            pass # pop_features 應該已經清空了 _FEATURE_STORE
+            pass 
 
-    for h in handles: # 處理完一個目錄的所有圖片後移除 hooks
+    for h in handles: 
         h.remove()
     print(f"Finished processing images in {image_dir_path}. Features potentially saved to {current_output_dir}")
 
@@ -206,10 +265,9 @@ def main():
         image_dir_path = base_dataset_path / split_name / args.image_subdir_name
         split_output_dir = output_root_path / split_name 
         
-        # 將 model, capture_targets 傳入
         print(f"Preparing to process images for split '{split_name}'. Using features: {capture_targets}")
-        # 注意：process_images_in_dir 內部應管理 hooks 的註冊與移除，以確保每個 split 獨立處理
-        process_images_in_dir(model, image_dir_path, split_output_dir, capture_targets, args.device)
+        # 將 model_type (或您在 main 中使用的變數名) 傳遞給 process_images_in_dir
+        process_images_in_dir(model, image_dir_path, split_output_dir, capture_targets, args.device, model_type) # <--- 確認這裡傳遞了 model_type
 
     print("\nFeature extraction process completed.")
 
