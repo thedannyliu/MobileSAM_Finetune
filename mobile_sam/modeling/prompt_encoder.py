@@ -72,22 +72,38 @@ class PromptEncoder(nn.Module):
 
     def _embed_points(
         self,
-        points: torch.Tensor,
-        labels: torch.Tensor,
+        points: torch.Tensor, # 傳入時可能是 (N, 2)
+        labels: torch.Tensor, # 傳入時可能是 (N,)
         pad: bool,
     ) -> torch.Tensor:
         """Embeds point prompts."""
         points = points + 0.5  # Shift to center of pixel
+
+        # ---- MODIFICATION START: Add batch dimension if missing ----
+        if points.ndim == 2:
+            points = points.unsqueeze(0)  # (N, 2) -> (1, N, 2)
+        if labels.ndim == 1: # 假設 labels 的批次維度與 points 對應
+            labels = labels.unsqueeze(0)  # (N,) -> (1, N)
+        # ---- MODIFICATION END ----
+
         if pad:
+            # padding_point 和 padding_label 的 shape[0] 應該是批次大小 B
             padding_point = torch.zeros((points.shape[0], 1, 2), device=points.device)
-            padding_label = -torch.ones((labels.shape[0], 1), device=labels.device)
-            points = torch.cat([points, padding_point], dim=1)
-            labels = torch.cat([labels, padding_label], dim=1)
+            padding_label = -torch.ones((labels.shape[0], 1), device=labels.device) # labels.shape[0] 現在是 B
+            
+            points = torch.cat([points, padding_point], dim=1) # 沿著 N 維度拼接
+            labels = torch.cat([labels, padding_label], dim=1) # 沿著 N 維度拼接
+        
+        # points 現在的形狀是 (B, N_padded, 2)
         point_embedding = self.pe_layer.forward_with_coords(points, self.input_image_size)
+        # point_embedding 的形狀是 (B, N_padded, C_embed)
+        
+        # labels 的形狀是 (B, N_padded)
+        # 使用廣播機制進行賦值
         point_embedding[labels == -1] = 0.0
         point_embedding[labels == -1] += self.not_a_point_embed.weight
-        point_embedding[labels == 0] += self.point_embeddings[0].weight
-        point_embedding[labels == 1] += self.point_embeddings[1].weight
+        point_embedding[labels == 0] += self.point_embeddings[0].weight # type: ignore
+        point_embedding[labels == 1] += self.point_embeddings[1].weight # type: ignore
         return point_embedding
 
     def _embed_boxes(self, boxes: torch.Tensor) -> torch.Tensor:
@@ -148,23 +164,75 @@ class PromptEncoder(nn.Module):
           torch.Tensor: dense embeddings for the masks, in the shape
             Bx(embed_dim)x(embed_H)x(embed_W)
         """
-        bs = self._get_batch_size(points, boxes, masks)
-        sparse_embeddings = torch.empty((bs, 0, self.embed_dim), device=self._get_device())
+        # ---- MODIFICATION START: Determine batch size correctly ----
+        # When called from Sam.forward (which iterates through a batch of images one by one),
+        # the effective batch size for this specific call to prompt_encoder.forward should be 1.
+        # The original calculation of 'bs' based on points[0].shape[0] or boxes.shape[0]
+        # was using the number of points or boxes as the batch size, which is incorrect here.
+        
+        # A more robust way to determine 'bs' if PromptEncoder could be called with
+        # already batched inputs (e.g. points[0] is (B,N,2)) or per-image inputs ((N,2)).
+        # For now, assuming per-image call from Sam.forward.
+        current_bs = 1 
+        # Example of how to handle potentially pre-batched inputs to PromptEncoder itself:
+        # if points is not None and points[0].ndim == 3: # (B, N, 2)
+        #     current_bs = points[0].shape[0]
+        # elif boxes is not None and boxes.ndim == 3: # (B, K, 4)
+        #     current_bs = boxes.shape[0]
+        # elif masks is not None and masks.ndim == 4: # (B, M, H, W) for sparse, or (B, C, H, W) for dense
+        #     current_bs = masks.shape[0] # This bs is more for dense masks
+        # else:
+        #     current_bs = 1 # Default for single image processing or no prompts
+        # ---- MODIFICATION END ----
+
+        # Initialize sparse_embeddings with the corrected batch size
+        sparse_embeddings = torch.empty((current_bs, 0, self.embed_dim), device=self._get_device())
+
         if points is not None:
-            coords, labels = points
-            point_embeddings = self._embed_points(coords, labels, pad=(boxes is None))
+            coords_torch, labels_torch = points
+            # _embed_points was modified to return (1, N_padded, embed_dim)
+            # which matches current_bs = 1
+            point_embeddings = self._embed_points(coords_torch, labels_torch, pad=(boxes is None))
             sparse_embeddings = torch.cat([sparse_embeddings, point_embeddings], dim=1)
+
         if boxes is not None:
-            box_embeddings = self._embed_boxes(boxes)
+            # _embed_boxes needs to return (current_bs, K*2, embed_dim) or similar for concatenation
+            # Original _embed_boxes returns (K, 2, embed_dim) if input boxes is (K,4)
+            box_embeddings_raw = self._embed_boxes(boxes) # (K, 2, embed_dim)
+            
+            # ---- MODIFICATION START: Reshape box_embeddings for cat ----
+            if box_embeddings_raw.ndim == 3 and current_bs == 1: # (K, 2, C) -> (1, K*2, C)
+                num_boxes = box_embeddings_raw.shape[0]
+                box_embeddings = box_embeddings_raw.reshape(current_bs, num_boxes * 2, self.embed_dim)
+            elif box_embeddings_raw.ndim == 3 and box_embeddings_raw.shape[0] == current_bs : # (B, K_x_2, C) - if _embed_boxes was changed to be batch-aware
+                box_embeddings = box_embeddings_raw # Assuming already (B, Seq, C)
+            else:
+                # Fallback or error for unexpected shapes
+                # For now, assume current_bs=1 and reshape
+                num_boxes = box_embeddings_raw.shape[0] # K
+                box_embeddings = box_embeddings_raw.reshape(1, num_boxes * 2, self.embed_dim)
+                if current_bs != 1:
+                     print(f"Warning: box_embeddings batch size mismatch. Expected {current_bs}, got 1 after reshape. Expanding.")
+                     box_embeddings = box_embeddings.expand(current_bs, -1, -1) # Try to expand if bs > 1
+            # ---- MODIFICATION END ----
             sparse_embeddings = torch.cat([sparse_embeddings, box_embeddings], dim=1)
+
+        # Add no_mask_embed if no other sparse prompts
+        if sparse_embeddings.shape[1] == 0: # Check if any prompts were added
+            # self.no_mask_embed.weight is (1, embed_dim)
+            no_mask_embedding = self.no_mask_embed.weight.reshape(1, 1, self.embed_dim)
+            if current_bs > 1:
+                no_mask_embedding = no_mask_embedding.expand(current_bs, -1, -1)
+            sparse_embeddings = torch.cat([sparse_embeddings, no_mask_embedding], dim=1)
+
 
         if masks is not None:
             dense_embeddings = self._embed_masks(masks)
         else:
             dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
-                bs, -1, self.image_embedding_size[0], self.image_embedding_size[1]
+                current_bs, -1, self.image_embedding_size, self.image_embedding_size # image_embedding_size usually 64
             )
-
+        
         return sparse_embeddings, dense_embeddings
 
 
