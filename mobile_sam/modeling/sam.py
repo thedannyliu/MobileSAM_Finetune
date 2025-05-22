@@ -51,7 +51,6 @@ class Sam(nn.Module):
     def device(self) -> Any:
         return self.pixel_mean.device
 
-    @torch.no_grad()
     def forward(
         self,
         batched_input: List[Dict[str, Any]],
@@ -121,12 +120,12 @@ class Sam(nn.Module):
                 input_size=image_record["image"].shape[-2:],
                 original_size=image_record["original_size"],
             )
-            masks = masks > self.mask_threshold
             outputs.append(
                 {
                     "masks": masks,
                     "iou_predictions": iou_predictions,
-                    "low_res_logits": low_res_masks,
+                    # ⇩⇩ 推論才 detach；training 保留 grad
+                    "low_res_logits": low_res_masks.detach() if not self.training else low_res_masks,
                 }
             )
         return outputs

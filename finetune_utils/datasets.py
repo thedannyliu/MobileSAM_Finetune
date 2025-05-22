@@ -113,7 +113,7 @@ class ComponentDataset(Dataset):
 
         # --- MODIFICATION START: Get original image size before resizing ---
         original_w, original_h = image_pil.size 
-        original_size_tuple = (original_h, original_w) # SAM expects (H, W) format
+        original_size_tuple = torch.tensor([original_h, original_w], dtype=torch.int) # SAM expects (H, W) format
         # --- MODIFICATION END ---
 
         # --- 在轉換為 Tensor 之前，統一調整大小 ---

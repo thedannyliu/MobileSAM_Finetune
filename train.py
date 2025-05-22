@@ -13,6 +13,14 @@ from finetune_utils.distill_losses import (
 )
 from finetune_utils.feature_hooks import register_hooks, pop_features
 
+def _parse_hw(item):
+    """item 可能是 Tensor(2,), list[2], tuple[2]"""
+    if isinstance(item, torch.Tensor):
+        h, w = int(item[0]), int(item[1])
+    else:
+        h, w = map(int, item)
+    return h, w
+
 
 def load_cached_npy_features(base_precomputed_dir: pathlib.Path,
                              teacher_name: str,
@@ -165,7 +173,7 @@ def main():
 
             batched_input_list = []
             for i in range(images.shape[0]):
-                h_orig, w_orig = original_sizes_batch_data[i]
+                h_orig, w_orig = _parse_hw(original_sizes_batch_data[i])
                 current_original_size = (int(h_orig), int(w_orig)) 
                 input_dict = {"image": images[i], "original_size": current_original_size}
                 if "box_prompt" in batch and batch["box_prompt"][i] is not None:
@@ -285,7 +293,7 @@ def main():
 
                 batched_input_list_val = []
                 for i in range(images_val.shape[0]):
-                    h_orig_val, w_orig_val = original_sizes_val_batch[i]
+                    h_orig_val, w_orig_val = _parse_hw(original_sizes_val_batch[i])
                     current_original_size_val = (int(h_orig_val), int(w_orig_val))
                     input_dict_val = {"image": images_val[i], "original_size": current_original_size_val}
                     if "box_prompt" in batch_val and batch_val["box_prompt"][i] is not None:
