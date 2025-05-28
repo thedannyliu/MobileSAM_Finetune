@@ -1,102 +1,89 @@
 {
-    "dataset": {
-      "train_dataset":       "./datasets/train",
-      "val_dataset":         "./datasets/val",
-      "max_bbox_shift":      20,
-      "num_workers":         4,
-      "prompt_mode":         "mixed",
-      "min_points":          1,
-      "max_points":          3
+  "dataset": {
+    "train_dataset": "./datasets/train",
+    "val_dataset": "./datasets/val",
+    "max_bbox_shift": 20,
+    "num_workers": 4,
+    "prompt_mode": "mixed",
+    "min_points": 1,
+    "max_points": 3
+  },
+  "model": {
+    "checkpoint_path": "./weights/mobile_sam.pt",
+    "type": "vit_t",
+    "image_size": 1024,
+    "save_path": "./logs"
+  },
+  "train": {
+    "epochs": 1000,
+    "lr": 1e-5,
+    "batch_size": 2,
+    "val_freq": 1,
+    "gradient_accumulation": 1,
+    "bf16": false,
+    "warmup_step": 250,
+    "min_lr_ratio": 0.0,
+    "resume": false,
+    "early_stop_patience": 20
+  },
+  "visual": {
+    "status": true,
+    "save_path": "./images",
+    "IOU_threshold": 0.5,
+    "save_every_n_epochs": 10
+  },
+  "freeze": {
+    "freeze_image_encoder": true,
+    "freeze_prompt_encoder": false,
+    "freeze_mask_decoder": false,
+    "unfreeze_epoch": 10
+  },
+  "distillation": {
+    "enable": true,
+    "use_precomputed_features": true,
+    "precomputed_root": "precomputed",
+    "encoder_matching": {
+      "enable": true,
+      "lambda_mse": 1.0,
+      "lambda_kl": 1.0,
+      "temperature": 2.0
     },
-  
-    "model": {
-      "checkpoint_path":     "./weights/mobile_sam.pt",
-      "type":                "vit_t",
-      "image_size":          1024,
-      "save_path":           "./logs"
+    "decoder_matching": {
+      "enable": true,
+      "lambda_mse": 1.0,
+      "lambda_cos": 1.0,
+      "lambda_kl": 1.0,
+      "temperature": 2.0
     },
-  
-    "train": {
-      "epochs":              10000,
-      "lr":       1e-5,
-      "batch_size":          2,
-      "val_freq":            5,
-      "gradient_accumulation": 1,
-      "bf16":                false,
-      "warmup_step":         250,
-      "resume":              false,
-      "early_stop_patience": 20
+    "attention_matching": {
+      "enable": true,
+      "lambda": 1.0,
+      "temperature": 0.5
     },
-  
-    "loss": {
-      "focal_weight":        20.0,
-      "dice_weight":         1.0,
-      "iou_weight":          0.0
+    "relational_KD": {
+      "enable": true,
+      "lambda": 1.0,
+      "dist_factor": 1.0,
+      "angle_factor": 2.0
     },
-  
-    "visual": {
-      "status":              true,
-      "save_path":           "./images",
-      "IOU_threshold":       0.5
+    "dynamic_lambda": {
+      "enable_plateau_scheduler": true,
+      "patience": 5,
+      "factor": 0.5
+    }
+  },
+  "teachers": [
+    {
+      "name": "SAM_vitH",
+      "cfg": "configs/sam_vith.yaml",
+      "checkpoint": "weights/sam_vit_h_4b8939.pth",
+      "weight": 0.7
     },
-  
-    "freeze": {
-      "freeze_image_encoder":   true,
-      "freeze_prompt_encoder":  true,
-      "freeze_mask_decoder":    false
-    },
-  
-    "distillation": {
-      "enable":                    true,
-      "use_precomputed_features":  true,
-      "precomputed_root":          "precomputed",
-  
-      "encoder_matching": {
-        "enable":                  true,
-        "lambda_mse":              1.0,
-        "lambda_kl":               1.0,
-        "temperature":             2.0
-      },
-  
-      "decoder_matching": {
-        "enable":                  true,
-        "lambda_mse":              1.0,
-        "lambda_cos":              1.0,
-        "lambda_kl":               1.0,
-        "temperature":             2.0
-      },
-  
-      "attention_matching": {
-        "enable":                  true,
-        "lambda":                  1.0,
-        "temperature":             0.5
-      },
-  
-      "relational_KD": {
-        "enable":                  true,
-        "lambda":                  1.0,
-        "dist_factor":             1.0,
-        "angle_factor":            2.0
-      },
-  
-      "dynamic_lambda": {
-        "enable_plateau_scheduler": true,
-        "patience":                5,
-        "factor":                  0.5
-      }
-    },
-  
-    "teachers": [
-      {
-        "name":        "SAM_vitH",
-        "cfg":         "configs/sam_vith.yaml",
-        "checkpoint":  "weights/sam_vit_h_4b8939.pth"
-      },
-      {
-        "name":        "MobileSAM_orig",
-        "cfg":         "configs/mobile_sam_orig.yaml",
-        "checkpoint":  "weights/mobile_sam.pt"
-      }
-    ]
-  }
-  
+    {
+      "name": "MobileSAM_orig",
+      "cfg": "configs/mobile_sam_orig.yaml",
+      "checkpoint": "weights/mobile_sam.pt",
+      "weight": 0.3
+    }
+  ]
+}

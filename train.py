@@ -1,339 +1,468 @@
-import yaml 
-from finetune_utils.datasets import ComponentDataset
-from torchvision import transforms as T
-import argparse, json, pathlib, os, numpy as np, torch
-import torch.nn.functional as F
+"""MobileSAM fine-tune + multi-teacher distillation (改良版)
+   ✔ 單一 Resize 移除重複插值
+   ✔ 自訂 collate_fn 處理 None / list
+   ✔ Param-group LR、凍結→漸解凍、GradAcc、GradClip
+   ✔ 任務損失重新加權、λ 自適應回升、動態教師權重
+   ✔ LRU cache 取代全域字典
+   ✔ 原圖尺寸傳遞一致
+"""
+
+import argparse, json, pathlib, logging, traceback, os, functools
+import numpy as np
+import torch, torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from torchvision.ops import sigmoid_focal_loss
 from tqdm import tqdm
+from torchvision import transforms as T
 
 from mobile_sam import sam_model_registry
+from finetune_utils.datasets import ComponentDataset
 from finetune_utils.distill_losses import (
     encoder_matching_loss, decoder_matching_loss,
     attention_matching_loss, rkd_loss
 )
 from finetune_utils.feature_hooks import register_hooks, pop_features
+from finetune_utils.visualization import overlay_mask_on_image
 
-def _parse_hw(item):
-    """item 可能是 Tensor(2,), list[2], tuple[2]"""
-    if isinstance(item, torch.Tensor):
-        h, w = int(item[0]), int(item[1])
-    else:
-        h, w = map(int, item)
-    return h, w
+# ───────────────────────────── logging ──────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("train")
 
+# ───────────────────────────── helpers ──────────────────────────────
+def _parse_hw(x):  # (H,W)
+    return (int(x[0]), int(x[1])) if isinstance(x, torch.Tensor) else tuple(map(int, x))
 
-def load_cached_npy_features(base_precomputed_dir: pathlib.Path,
-                             teacher_name: str,
-                             current_split: str,
-                             image_stems: list[str],
-                             feature_keys: list[str],
-                             verbose: bool = True):
-    batched_features_for_each_key = []
-    split_feature_dir = base_precomputed_dir / teacher_name / current_split
+class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, opt, warmup, total, min_ratio=0.0, last_epoch=-1):
+        self.warmup, self.total, self.min_ratio = warmup, total, min_ratio
+        super().__init__(opt, last_epoch)
 
-    for feature_key in feature_keys:
-        sanitized_feature_key = feature_key.replace(".", "_").replace("[","_").replace("]","")
-        tensors_for_current_key_in_batch = []
-        path_of_last_attempted_file = None
-        for img_stem in image_stems:
-            feature_filename = f"{img_stem}_{sanitized_feature_key}.npy"
-            feature_path = split_feature_dir / feature_filename
-            path_of_last_attempted_file = feature_path
-            try:
-                npy_array = np.load(feature_path)
-                tensors_for_current_key_in_batch.append(torch.from_numpy(npy_array).cuda(non_blocking=True))
-            except FileNotFoundError:
-                if verbose:
-                    print(f"ERROR: Precomputed feature file NOT FOUND: {feature_path}")
-                raise FileNotFoundError(f"Required feature file missing: {feature_path}. Please ensure extract_teacher_features.py ran successfully for teacher '{teacher_name}', split '{current_split}'.")
-            except Exception as e:
-                if verbose:
-                    print(f"ERROR: Could not load feature file {feature_path}: {e}")
-                raise RuntimeError(f"Failed to load feature file {feature_path}") from e
-        
-        if tensors_for_current_key_in_batch:
-            try:
-                batched_features_for_each_key.append(torch.stack(tensors_for_current_key_in_batch))
-            except Exception as e:
-                if verbose:
-                    print(f"ERROR: Could not stack {len(tensors_for_current_key_in_batch)} features for key '{feature_key}'. Error: {e}. Attempted path pattern: {path_of_last_attempted_file}")
-                raise RuntimeError(f"Failed to stack features for key '{feature_key}'. Check for consistent shapes of precomputed features.") from e
-        elif image_stems: 
-             raise RuntimeError(f"No features loaded for key '{feature_key}' for the batch, though image_stems were provided. Last path: {path_of_last_attempted_file}")
+    def get_lr(self):
+        cur = self.last_epoch + 1
+        if cur < self.warmup:
+            return [b * cur / self.warmup for b in self.base_lrs]
+        prog = (cur - self.warmup) / max(1, (self.total - self.warmup))
+        cos = 0.5 * (1 + np.cos(np.pi * prog))
+        return [b * (self.min_ratio + (1 - self.min_ratio) * cos) for b in self.base_lrs]
 
-    if len(batched_features_for_each_key) != len(feature_keys):
-        if not image_stems and feature_keys:
-             pass 
-        elif image_stems: 
-            raise RuntimeError(f"Logic error: Mismatch between number of loaded feature groups ({len(batched_features_for_each_key)}) and requested feature keys ({len(feature_keys)}).")
-            
-    return batched_features_for_each_key
+# ─── feature cache (LRU，避免記憶體爆炸) ───
+@functools.lru_cache(maxsize=256)
+def _load_single_feat(path: pathlib.Path):
+    arr = np.load(str(path))
+    return torch.from_numpy(arr).cuda(non_blocking=True)
 
+def load_cached_npy_features(base: pathlib.Path, teacher: str, split: str,
+                             stems: list[str], keys: list[str]):
+    feats = []
+    for stem in stems:
+        this_img = []
+        for k in keys:
+            fname = f"{stem}_{k.replace('.','_').replace('[','_').replace(']','')}.npy"
+            this_img.append(_load_single_feat(base/teacher/split/fname))
+        feats.append(torch.stack(this_img))
+    # (B,K,C,H,W) or (B,K,D)
+    return [torch.stack([feats[b, i] for b in range(len(stems))]) for i in range(len(keys))]
 
+# ─── custom collate_fn ───
+def sam_collate(batch):
+    """
+    • Tensor 型別 → 直接 stack
+    • 允許 None / list 保留原樣
+    """
+    elem = batch[0]
+    out = {}
+    for k in elem.keys():
+        vals = [d[k] for d in batch]
+        if isinstance(vals[0], torch.Tensor) and all(v is not None for v in vals):
+            out[k] = torch.stack(vals, 0)
+        else:
+            out[k] = vals  # list / None
+    return out
+
+# ───────────────────────────── main ──────────────────────────────
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    cfg = json.load(open(parser.parse_args().config))
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
 
-    cfg = json.load(open(args.config))
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # ─── transforms (單一 Resize 已在 dataset 完成；此處只 Normalize) ───
+    MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+    tf_img = T.Compose([T.ToTensor(), T.Normalize(MEAN, STD)])
+    tf_msk = T.Compose([T.ToTensor()])
 
+    # ─── dataset / dataloader ───
     ds_cfg = cfg["dataset"]
-    train_root = ds_cfg["train_dataset"]
-    val_root   = ds_cfg["val_dataset"]
-    img_tfms  = T.ToTensor()
-    mask_tfms = T.ToTensor()
+    train_ds = ComponentDataset(ds_cfg["train_dataset"], (tf_img, tf_msk),
+                                max_bbox_shift=ds_cfg.get("max_bbox_shift", 20),
+                                prompt_mode=ds_cfg.get("prompt_mode", "mixed"),
+                                min_points=ds_cfg.get("min_points", 1),
+                                max_points=ds_cfg.get("max_points", 3),
+                                image_size=cfg["model"].get("image_size", 1024))
+    val_ds = ComponentDataset(ds_cfg["val_dataset"], (tf_img, tf_msk),
+                              max_bbox_shift=ds_cfg.get("max_bbox_shift", 20),
+                              prompt_mode=ds_cfg.get("prompt_mode", "mixed"),
+                              min_points=ds_cfg.get("min_points", 1),
+                              max_points=ds_cfg.get("max_points", 3),
+                              image_size=cfg["model"].get("image_size", 1024))
 
-    train_set = ComponentDataset(
-        root_dir=train_root, transform=(img_tfms, mask_tfms),
-        max_bbox_shift=ds_cfg.get("max_bbox_shift", 20),
-        prompt_mode=ds_cfg.get("prompt_mode", "box"),
-        min_points=ds_cfg.get("min_points", 1),
-        max_points=ds_cfg.get("max_points", 3),
-        image_size=cfg["model"].get("image_size", 1024)
+    tr_loader = DataLoader(
+        train_ds,
+        batch_size=cfg["train"]["batch_size"],
+        shuffle=True,
+        num_workers=ds_cfg.get("num_workers", 4),
+        pin_memory=True,
+        collate_fn=sam_collate,
     )
-    val_set = ComponentDataset(
-        root_dir=val_root, transform=(img_tfms, mask_tfms),
-        max_bbox_shift=ds_cfg.get("max_bbox_shift", 20),
-        prompt_mode=ds_cfg.get("prompt_mode", "box"),
-        min_points=ds_cfg.get("min_points", 1),
-        max_points=ds_cfg.get("max_points", 3),
-        image_size=cfg["model"].get("image_size", 1024)
+    va_loader = DataLoader(
+        val_ds,
+        batch_size=cfg["train"]["batch_size"],
+        shuffle=False,
+        num_workers=ds_cfg.get("num_workers", 4),
+        pin_memory=True,
+        collate_fn=sam_collate,
     )
-    train_loader = DataLoader(train_set, batch_size=cfg["train"]["batch_size"],
-                            shuffle=True, num_workers=ds_cfg.get("num_workers",4),
-                            pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=cfg["train"]["batch_size"],
-                            shuffle=False, num_workers=ds_cfg.get("num_workers",4),
-                            pin_memory=True)
 
-    student_config_data = cfg.get("model")
-    if student_config_data is None:
-        raise ValueError("Model configuration ('model') not found in the config file.")
-    student_model_type = student_config_data.get("type", "vit_t")
-    student_initial_checkpoint = student_config_data.get("checkpoint_path", None)
+    # ─── model ───
+    m_cfg = cfg["model"]
+    student = sam_model_registry[m_cfg.get("type", "vit_t")](
+        checkpoint=m_cfg.get("checkpoint_path")
+    ).to(dev)
 
-    if student_model_type not in sam_model_registry:
-        raise ValueError(f"Student model type '{student_model_type}' not found. Available: {list(sam_model_registry.keys())}")
-    model_builder_func = sam_model_registry[student_model_type]
-    print(f"Building student model of type '{student_model_type}' with initial checkpoint: {student_initial_checkpoint}")
-    student = model_builder_func(checkpoint=student_initial_checkpoint).to(device)
-    optimizer = torch.optim.AdamW(student.parameters(), lr=cfg["train"]["lr"], weight_decay=1e-4)
+    # 初始凍結：image_encoder
+    if cfg["freeze"].get("freeze_image_encoder", True):
+        student.image_encoder.requires_grad_(False)
 
-    potential_hooks = {
-        "enc": [], "dec": [], "attn": [],
-        "rkd": ["image_encoder.patch_embed"] 
-    }
-    if student_model_type == 'vit_t':
-        print("Student model is vit_t (MobileSAM/TinyViT), selecting vit_t specific hook names.")
-        potential_hooks["enc"] = ["image_encoder.neck"]
-        potential_hooks["dec"] = [] 
-    elif student_model_type in ['vit_b', 'vit_l', 'vit_h']:
-        print(f"Student model is {student_model_type}, selecting standard ViT hook names (verify indices).")
-        potential_hooks["enc"] = [f"image_encoder.blocks.{i}" for i in (9,10,11,12)]
-        potential_hooks["dec"] = ["mask_decoder.pre_logits"] 
-        potential_hooks["attn"] = [f"image_encoder.blocks.{i}.attn" for i in range(12)]
+    if cfg["freeze"].get("freeze_prompt_encoder", False):
+        student.prompt_encoder.requires_grad_(False)
+    if cfg["freeze"].get("freeze_mask_decoder", False):
+        student.mask_decoder.requires_grad_(False)
+
+    # hooks for distillation
+    stype = m_cfg.get("type", "vit_t")
+    pot = {"enc": [], "dec": [], "attn": [], "rkd": ["image_encoder.patch_embed"]}
+    if stype == "vit_t":
+        pot["enc"] = ["image_encoder.neck"]
     else:
-        print(f"Warning: Unknown student_model_type '{student_model_type}'. Using default (likely ViT-H like) hook names which may cause warnings.")
-        potential_hooks["enc"] = [f"image_encoder.blocks.{i}" for i in (9,10,11,12)]
-        potential_hooks["dec"] = ["mask_decoder.pre_logits"]
-        potential_hooks["attn"] = [f"image_encoder.blocks.{i}.attn" for i in range(12)]
+        pot["enc"] = [f"image_encoder.blocks.{i}" for i in (9, 10, 11, 12)]
+        pot["dec"] = ["mask_decoder.pre_logits"]
+        pot["attn"] = [f"image_encoder.blocks.{i}.attn" for i in range(12)]
 
-    hook_names_to_register = []
-    distill_cfg = cfg.get("distillation", {})
-    if distill_cfg.get("encoder_matching", {}).get("enable"):
-        hook_names_to_register.extend(potential_hooks["enc"])
-    if distill_cfg.get("decoder_matching", {}).get("enable"):
-        hook_names_to_register.extend(potential_hooks["dec"])
-    if distill_cfg.get("attention_matching", {}).get("enable"):
-        hook_names_to_register.extend(potential_hooks["attn"])
-    if distill_cfg.get("relational_KD", {}).get("enable"):
-        hook_names_to_register.extend(potential_hooks["rkd"])
-    hook_names_to_register = sorted(list(set(h for h in hook_names_to_register if h))) 
+    dist_cfg = cfg.get("distillation", {})
+    hook_layers = []
+    for n, k in (
+        ("encoder_matching", "enc"),
+        ("decoder_matching", "dec"),
+        ("attention_matching", "attn"),
+        ("relational_KD", "rkd"),
+    ):
+        if dist_cfg.get(n, {}).get("enable"):
+            hook_layers += pot[k]
+    hook_layers = sorted(set(hook_layers))
+    hook_handles = register_hooks(student, hook_layers) if hook_layers else []
 
-    hook_handles = []
-    if distill_cfg.get("enable") and hook_names_to_register:
-        print(f"Registering hooks for layers: {hook_names_to_register}")
-        hook_handles = register_hooks(student, hook_names_to_register)
-    elif distill_cfg.get("enable"):
-        print("Warning: Distillation is enabled, but no hook names were determined for active distillation types. Hooks not registered.")
+    # ─── optimizer (param groups) ───
+    tr_cfg = cfg["train"]
+    enc_params, others = [], []
+    for n, p in student.named_parameters():
+        if not p.requires_grad:
+            continue
+        if n.startswith("image_encoder"):
+            enc_params.append(p)
+        else:
+            others.append(p)
 
-    best_metric = -1
-    patience = cfg["train"].get("early_stop_patience", 0)
-    stop_counter = 0
+    opt = torch.optim.AdamW(
+        [
+            {"params": others, "lr": tr_cfg["lr"]},
+            {"params": enc_params, "lr": tr_cfg["lr"] * 0.1},
+        ],
+        weight_decay=1e-4,
+    )
 
-    for epoch in range(cfg["train"]["epochs"]):
-        student.train()
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
-        for batch in pbar:
-            images = batch["image"].to(device)
-            gt_masks = batch["mask"].to(device)
-            ids = batch["id"] 
-            original_sizes_batch_data = batch["original_size"] 
+    total_steps = tr_cfg["epochs"] * len(tr_loader)
+    scheduler = WarmupCosineLR(
+        opt,
+        warmup=tr_cfg.get("warmup_step", 250),
+        total=total_steps,
+        min_ratio=tr_cfg.get("min_lr_ratio", 0.0),
+    )
 
-            batched_input_list = []
-            for i in range(images.shape[0]):
-                h_orig, w_orig = _parse_hw(original_sizes_batch_data[i])
-                current_original_size = (int(h_orig), int(w_orig)) 
-                input_dict = {"image": images[i], "original_size": current_original_size}
-                if "box_prompt" in batch and batch["box_prompt"][i] is not None:
-                    input_dict["boxes"] = batch["box_prompt"][i].to(device)
-                if "point_coords" in batch and batch["point_coords"][i] is not None:
-                    input_dict["point_coords"] = batch["point_coords"][i].to(device)
-                    if "point_labels" in batch and batch["point_labels"][i] is not None:
-                        input_dict["point_labels"] = batch["point_labels"][i].to(device)
-                batched_input_list.append(input_dict)
-            
-            optimizer.zero_grad()
-            model_outputs = student(batched_input=batched_input_list, multimask_output=False)
-            
-            pred_logits_list = [out["low_res_logits"] for out in model_outputs]
-            pred_logits = torch.stack(pred_logits_list, dim=0) 
+    scaler = GradScaler(enabled=not tr_cfg.get("bf16", False))
+    writer = SummaryWriter(pathlib.Path(m_cfg.get("save_path", "logs")) / "tb")
 
-            if pred_logits.ndim == 5 and pred_logits.shape[1] == 1: 
-                pred_logits = pred_logits.squeeze(1)
-            
-            pred_logits_upsampled = F.interpolate(
-                pred_logits, size=gt_masks.shape[-2:], mode="bilinear", align_corners=False
-            )
+    # ─── dynamic λ & early-stop setting ───
+    lambda_coef = 1.0
+    dyn_wait = 0
+    best_score, stop_counter = -1, 0
+    patience = tr_cfg.get("early_stop_patience", 20)
 
-            bce = F.binary_cross_entropy_with_logits(pred_logits_upsampled, gt_masks)
-            inter = (torch.sigmoid(pred_logits_upsampled) * gt_masks).sum(dim=(-2, -1)) * 2
-            union = torch.sigmoid(pred_logits_upsampled).sum(dim=(-2, -1)) + gt_masks.sum(dim=(-2, -1)) + 1e-6
-            dice = 1 - (inter / union).mean()
-            task_loss = 20 * bce + dice
+    # 逐 epoch 解凍 image_encoder
+    unfreeze_epoch = cfg["freeze"].get("unfreeze_epoch", 10)
 
-            dist_loss = torch.tensor(0.0, device=device)
-            if distill_cfg.get("enable") and hook_handles:
-                student_features_available = True
-                try:
-                    feats_s = pop_features()
-                    if not feats_s: student_features_available = False
-                except Exception: student_features_available = False
+    # teacher weighting
+    teacher_cfgs = cfg.get("teachers", [])
+    if teacher_cfgs:
+        for t in teacher_cfgs:
+            t.setdefault("weight", 1.0 / len(teacher_cfgs))
 
-                if student_features_available:
-                    base_precomp_dir = pathlib.Path(distill_cfg["precomputed_root"])
-                    teacher_info = cfg["teachers"][0]
-                    te_name = teacher_info["name"]
-                    teacher_model_type_cfg = ""
-                    try:
-                        with open(teacher_info["cfg"], 'r') as f_yaml:
-                            teacher_yaml_config = yaml.safe_load(f_yaml)
-                        teacher_model_type_cfg = teacher_yaml_config.get("model", {}).get("type", "")
-                    except Exception as e_yaml: print(f"Warning: YAML load failed {teacher_info['cfg']}: {e_yaml}")
+    # ─── training loop ───
+    grad_acc = tr_cfg.get("gradient_accumulation", 1)
+    val_freq = tr_cfg.get("val_freq", 1)
+    save_vis_cfg = cfg.get("visual", {})
+    vis_base = pathlib.Path(save_vis_cfg.get("save_path", "images"))
+    save_vis_base_n = save_vis_cfg.get("save_every_n_epochs", 10)
 
-                    current_epoch_dist_loss = torch.tensor(0.0, device=device)
+    try:
+        global_step = 0
+        for ep in range(tr_cfg["epochs"]):
+            # --- 解凍策略 ---
+            if ep == unfreeze_epoch:
+                log.info(f"Unfreeze image_encoder at epoch {ep}")
+                student.image_encoder.requires_grad_(True)
+                # 將 lr group 提高
+                opt.param_groups[1]["lr"] = tr_cfg["lr"] * 0.2
+
+            student.train()
+            tot_task, tot_dist = 0.0, 0.0
+            pbar = tqdm(tr_loader, desc=f"Train {ep}")
+            opt.zero_grad()
+
+            for step, batch in enumerate(pbar):
+                imgs = batch["image"].to(dev)
+                masks = batch["mask"].to(dev)
+                ids = batch["id"]
+                osz = batch["original_size"]
+
+                # 構建 batched_input
+                batched_input = []
+                for i in range(len(imgs)):
+                    entry = {
+                        "image": imgs[i],
+                        "original_size": _parse_hw(osz[i]),
+                    }
+                    if batch["box_prompt"][i] is not None:
+                        entry["boxes"] = batch["box_prompt"][i].to(dev)
+                    if batch["point_coords"][i] is not None:
+                        entry["point_coords"] = batch["point_coords"][i].to(dev)
+                        entry["point_labels"] = batch["point_labels"][i].to(dev)
+                    batched_input.append(entry)
+
+                with autocast(dtype=torch.bfloat16 if tr_cfg.get("bf16", False) else torch.float16):
+                # — 若你的 A100 支援 bf16，建議：
+                # with autocast(device_type='cuda', dtype=torch.bfloat16):
+
+                # # — 若想先關掉 AMP：
+                # with torch.autocast(device_type='cuda', enabled=False):
+                # scaler = GradScaler(enabled=False)   # 如果關掉 AMP
+                    out = student(batched_input=batched_input, multimask_output=False)
+                    logit = torch.stack([o["low_res_logits"] for o in out]).squeeze(1)
+                    logit_up = F.interpolate(logit, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+
+                    focal = sigmoid_focal_loss(logit_up, masks, reduction="mean")
+                    # safe dice:
+                    prob = torch.sigmoid(logit_up)
+                    num  = (prob * masks).sum((-2, -1)) * 2
+                    den  = prob.sum((-2, -1)) + masks.sum((-2, -1))
+                    dice = 1 - (num / (den + 1e-6)).mean()      # <- 加 ε 防分母 0
+                    task_loss = 2.0 * focal + dice
+
+                    # ─ distillation ─
+                    dist_loss = torch.tensor(0., device=dev)
+                    if dist_cfg.get("enable") and hook_layers:
+                        feat_student = pop_features() or {}
+                        base_dir = pathlib.Path(dist_cfg["precomputed_root"])
+
+                        for t_cfg in teacher_cfgs:
+                            weight = t_cfg["weight"]
+                            tname = t_cfg["name"]
+                            # encoder
+                            if dist_cfg["encoder_matching"]["enable"]:
+                                enc_keys = pot["enc"]
+                                if enc_keys:
+                                    try:
+                                        feat_teacher = load_cached_npy_features(
+                                            base_dir, tname, "train", ids, enc_keys
+                                        )
+                                        dist_loss += weight * encoder_matching_loss(
+                                            [feat_student[k] for k in enc_keys],
+                                            feat_teacher,
+                                            **dist_cfg["encoder_matching"],
+                                            n_layers=len(enc_keys),
+                                        )
+                                    except Exception as e:
+                                        log.debug(e)
+
+                            # decoder
+                            if dist_cfg["decoder_matching"]["enable"] and pot["dec"]:
+                                dk = pot["dec"][0]
+                                if dk in feat_student:
+                                    try:
+                                        feat_teacher = load_cached_npy_features(base_dir, tname, "train", ids, [dk])[0]
+                                        dist_loss += weight * decoder_matching_loss(
+                                            feat_student[dk],
+                                            feat_teacher,
+                                            **dist_cfg["decoder_matching"],
+                                        )
+                                    except Exception as e:
+                                        log.debug(e)
+
+                            # attention
+                            if dist_cfg["attention_matching"]["enable"] and pot["attn"]:
+                                try:
+                                    attn_teacher = load_cached_npy_features(base_dir, tname, "train", ids, pot["attn"])
+                                    dist_loss += weight * attention_matching_loss(
+                                        [feat_student[k] for k in pot["attn"]],
+                                        attn_teacher,
+                                        **dist_cfg["attention_matching"],
+                                        n_layers=len(pot["attn"]),
+                                    )
+                                except Exception as e:
+                                    log.debug(e)
+
+                            # RKD
+                            if dist_cfg["relational_KD"]["enable"]:
+                                rk = pot["rkd"][0]
+                                if rk in feat_student:
+                                    try:
+                                        feat_teacher = load_cached_npy_features(base_dir, tname, "train", ids, [rk])[0]
+                                        dist_loss += weight * rkd_loss(
+                                            feat_student[rk],
+                                            feat_teacher,
+                                            **dist_cfg["relational_KD"],
+                                        )
+                                    except Exception as e:
+                                        log.debug(e)
+
+                    loss = task_loss + lambda_coef * dist_loss
+                    loss = loss / grad_acc  # 梯度累積平均
+
+                scaler.scale(loss).backward()
+
+                # 梯度累積步
+                if (step + 1) % grad_acc == 0 or (step + 1) == len(tr_loader):
+                    # gradient clipping
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+
+                    scaler.step(opt)
+                    scaler.update()
+                    opt.zero_grad()
+                    global_step += 1
+                    scheduler.step()
+
+                tot_task += task_loss.item()
+                tot_dist += dist_loss.item()
+                pbar.set_postfix(
+                    t=f"{task_loss.item():.3f}",
+                    d=f"{dist_loss.item():.3f}",
+                    λ=f"{lambda_coef:.2f}",
+                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                )
+
+            # ─── log train -epoch ───
+            writer.add_scalar("train/task_loss", tot_task / len(tr_loader), ep)
+            writer.add_scalar("train/dist_loss", tot_dist / len(tr_loader), ep)
+            writer.add_scalar("train/lambda", lambda_coef, ep)
+            for i, g in enumerate(opt.param_groups):
+                writer.add_scalar(f"lr/group{i}", g["lr"], ep)
+
+            # ─── validation ───
+            if (ep + 1) % val_freq != 0:
+                continue
+
+            student.eval()
+            dices, ious = [], []
+            with torch.no_grad():
+                for bi, vb in enumerate(va_loader):
+                    imgs = vb["image"].to(dev)
+                    masks = vb["mask"].to(dev)
+                    vinp = [
+                        {"image": imgs[i], "original_size": _parse_hw(vb["original_size"][i])}
+                        for i in range(len(imgs))
+                    ]
+                    vo = student(batched_input=vinp, multimask_output=False)
+                    vl = torch.stack([o["low_res_logits"] for o in vo]).squeeze(1)
+                    vl_up = F.interpolate(vl, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+                    probs = torch.sigmoid(vl_up)
+
+                    num  = (probs * masks).sum((-2, -1)) * 2
+                    den  = probs.sum((-2, -1)) + masks.sum((-2, -1))
+                    dice = (num / (den + 1e-6)).mean().item()  # <- 同樣加 ε
+
+                    pred = (probs >= 0.5).float()
+                    union = pred + masks - pred * masks
+                    iou   = ((pred * masks).sum((-2, -1)) /
+                            (union.sum((-2, -1)) + 1e-6)).mean().item()
                     
-                    if distill_cfg.get("encoder_matching", {}).get("enable") and potential_hooks["enc"]:
-                        if all(layer in feats_s for layer in potential_hooks["enc"]):
-                            teacher_keys = potential_hooks["enc"]
-                            is_combined = False
-                            if teacher_model_type_cfg in ['vit_h', 'vit_l'] and \
-                               set(potential_hooks["enc"]) == {f"image_encoder.blocks.{i}" for i in (9,10,11,12)}:
-                                teacher_keys = ["image_encoder_blocks_9_12_combined"]
-                                is_combined = True
-                            try:
-                                loaded_te_feats = load_cached_npy_features(base_precomp_dir, te_name, "train", ids, teacher_keys)
-                                final_te_for_loss = []
-                                if is_combined:
-                                    if loaded_te_feats and loaded_te_feats[0].nelement() > 0:
-                                        combined_tensor = loaded_te_feats[0] 
-                                        if combined_tensor.shape[1] == len(potential_hooks["enc"]): 
-                                            final_te_for_loss = list(torch.unbind(combined_tensor, dim=1))
-                                else: 
-                                    final_te_for_loss = loaded_te_feats
-                                
-                                if final_te_for_loss and len(final_te_for_loss) == len(potential_hooks["enc"]):
-                                    current_epoch_dist_loss += encoder_matching_loss(
-                                        [feats_s[l] for l in potential_hooks["enc"]], final_te_for_loss,
-                                        **distill_cfg["encoder_matching"])
-                            except (FileNotFoundError, RuntimeError) as e_dist: print(f"Enc distill skip: {e_dist}")
-                    
-                    if distill_cfg.get("decoder_matching", {}).get("enable") and potential_hooks["dec"]:
-                        if potential_hooks["dec"] and potential_hooks["dec"][0] in feats_s : 
-                            try:
-                                te_dec = load_cached_npy_features(base_precomp_dir, te_name, "train", ids, potential_hooks["dec"])[0]
-                                if te_dec.nelement() > 0:
-                                    current_epoch_dist_loss += decoder_matching_loss(
-                                        feats_s[potential_hooks["dec"][0]], te_dec, **distill_cfg["decoder_matching"])
-                            except (FileNotFoundError, RuntimeError, IndexError) as e_dist: print(f"Dec distill skip: {e_dist}")
+                    dices.append(dice)
+                    ious.append(iou)
 
-                    if distill_cfg.get("attention_matching", {}).get("enable") and potential_hooks["attn"]:
-                        if all(layer in feats_s for layer in potential_hooks["attn"]):
-                            try:
-                                te_attn = load_cached_npy_features(base_precomp_dir, te_name, "train", ids, potential_hooks["attn"])
-                                if te_attn and all(t.nelement() > 0 for t in te_attn) and len(te_attn) == len(potential_hooks["attn"]):
-                                     current_epoch_dist_loss += attention_matching_loss(
-                                        [feats_s[l] for l in potential_hooks["attn"]], te_attn, **distill_cfg["attention_matching"])
-                            except (FileNotFoundError, RuntimeError) as e_dist: print(f"Attn distill skip: {e_dist}")
+                    # save visualization 只有最佳時 & 每 N epoch
+                    if (
+                        bi == 0
+                        and save_vis_cfg.get("status", False)
+                        and (ep % save_vis_base_n == 0 or (dice + iou) / 2 > best_score)
+                    ):
+                        cur_path = vis_base / f"epoch_{ep}"
+                        cur_path.mkdir(parents=True, exist_ok=True)
+                        for i in range(min(3, probs.shape[0])):
+                            img_denorm = imgs[i] * torch.tensor(STD, device=dev)[:, None, None] + torch.tensor(
+                                MEAN, device=dev
+                            )[:, None, None]
+                            overlay_mask_on_image(
+                                img_denorm.cpu(),
+                                probs[i].cpu(),
+                                None,
+                                threshold=save_vis_cfg.get("IOU_threshold", 0.5),
+                                save_dir=str(cur_path),
+                            )
 
-                    if distill_cfg.get("relational_KD", {}).get("enable") and potential_hooks["rkd"]: 
-                        if potential_hooks["rkd"][0] in feats_s:
-                            try:
-                                te_rkd = load_cached_npy_features(base_precomp_dir, te_name, "train", ids, potential_hooks["rkd"])[0]
-                                if te_rkd.nelement() > 0:
-                                    current_epoch_dist_loss += rkd_loss(
-                                        feats_s[potential_hooks["rkd"][0]], te_rkd, 
-                                        **distill_cfg["relational_KD"]) # TypeError: rkd_loss() got an unexpected keyword argument 'enable'
-                            except (FileNotFoundError, RuntimeError, IndexError) as e_dist: print(f"RKD distill skip: {e_dist}")
-                    dist_loss = current_epoch_dist_loss
-            
-            total_loss = task_loss + dist_loss
-            total_loss.backward()
-            optimizer.step()
-            dist_loss_item = dist_loss.item() if torch.is_tensor(dist_loss) else float(dist_loss)
-            pbar.set_postfix({"task": task_loss.item(), "dist": dist_loss_item, "tot": total_loss.item()})
+            v_dice, v_iou = np.mean(dices), np.mean(ious)
+            v_score = 0.5 * (v_dice + v_iou)
+            writer.add_scalar("val/dice", v_dice, ep)
+            writer.add_scalar("val/iou", v_iou, ep)
+            writer.add_scalar("val/score", v_score, ep)
+            log.info(f"Epoch {ep}  Dice={v_dice:.4f} IoU={v_iou:.4f} Score={v_score:.4f}")
 
-        student.eval(); dices = []
-        with torch.no_grad():
-            for batch_val in val_loader: 
-                images_val = batch_val["image"].to(device)
-                gt_masks_val = batch_val["mask"].to(device)
-                original_sizes_val_batch = batch_val["original_size"]
+            # ─── dynamic λ (plateau + 回升) ───
+            if dist_cfg["dynamic_lambda"]["enable_plateau_scheduler"]:
+                if v_score > best_score + 1e-4:
+                    dyn_wait = 0
+                    # 若 λ 曾下降且現在表現回升，緩慢提高 λ
+                    lambda_coef = min(lambda_coef / dist_cfg["dynamic_lambda"]["factor"], 1.0)
+                else:
+                    dyn_wait += 1
+                    if dyn_wait >= dist_cfg["dynamic_lambda"]["patience"]:
+                        lambda_coef = max(lambda_coef * dist_cfg["dynamic_lambda"]["factor"], 1e-3)
+                        dyn_wait = 0
+                        log.info(f"λ ↓ {lambda_coef:.3f}")
 
-                batched_input_list_val = []
-                for i in range(images_val.shape[0]):
-                    h_orig_val, w_orig_val = _parse_hw(original_sizes_val_batch[i])
-                    current_original_size_val = (int(h_orig_val), int(w_orig_val))
-                    input_dict_val = {"image": images_val[i], "original_size": current_original_size_val}
-                    if "box_prompt" in batch_val and batch_val["box_prompt"][i] is not None:
-                        input_dict_val["boxes"] = batch_val["box_prompt"][i].to(device)
-                    if "point_coords" in batch_val and batch_val["point_coords"][i] is not None:
-                        input_dict_val["point_coords"] = batch_val["point_coords"][i].to(device)
-                        if "point_labels" in batch_val and batch_val["point_labels"][i] is not None:
-                            input_dict_val["point_labels"] = batch_val["point_labels"][i].to(device)
-                    batched_input_list_val.append(input_dict_val)
-                
-                val_model_outputs = student(batched_input=batched_input_list_val, multimask_output=False)
-                val_pred_logits_list = [out["low_res_logits"] for out in val_model_outputs]
-                val_pred_logits = torch.stack(val_pred_logits_list, dim=0)
-
-                if val_pred_logits.ndim == 5 and val_pred_logits.shape[1] == 1:
-                    val_pred_logits = val_pred_logits.squeeze(1)
-                
-                val_pred_logits_upsampled = F.interpolate(
-                    val_pred_logits, size=gt_masks_val.shape[-2:], mode="bilinear", align_corners=False)
-                
-                inter_val = (torch.sigmoid(val_pred_logits_upsampled) * gt_masks_val).sum(dim=(-2,-1)) * 2
-                union_val = torch.sigmoid(val_pred_logits_upsampled).sum(dim=(-2,-1)) + gt_masks_val.sum(dim=(-2,-1)) + 1e-6
-                dices.append((inter_val/union_val).mean().item())
-        val_dice = float(np.mean(dices)) if dices else 0.0
-        print(f"Epoch {epoch}  ▸  val Dice={val_dice:.4f}")
-
-        if patience > 0:
-            if val_dice > best_metric:
-                best_metric = val_dice; stop_counter = 0
-                save_dir = pathlib.Path(cfg["model"].get("save_path", "."))
-                save_dir.mkdir(parents=True, exist_ok=True)
-                torch.save(student.state_dict(), save_dir / "best_student.pth")
-                print(f"Saved new best model to {save_dir / 'best_student.pth'}")
+            # ─── early-stop / checkpoint ───
+            if v_score > best_score:
+                best_score = v_score
+                stop_counter = 0
+                out_dir = pathlib.Path(m_cfg.get("save_path", "./"))
+                out_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(student.state_dict(), out_dir / "best_student.pth")
+                log.info(f"✨  Saved best model (score={best_score:.4f})")
             else:
                 stop_counter += 1
                 if stop_counter >= patience:
-                    print(f"Early stopping triggered ▸ best Dice={best_metric:.4f}"); break
-    
-    if hook_handles: 
-        for h in hook_handles: h.remove()
+                    log.info("Early stop triggered.")
+                    break
+
+    finally:
+        for h in hook_handles:
+            h.remove()
+        writer.close()
+
 
 if __name__ == "__main__":
     main()
