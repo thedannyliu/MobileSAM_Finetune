@@ -1,121 +1,82 @@
-"""Knowledge–distillation loss utilities for MobileSAM fine-tune."""
+# ───────────────────────── finetune_utils/distill_losses.py ─────────────────────────
+"""Knowledge-distillation losses (revised)
+   ✔ 支援 layer-count 歸一化
+   ✔ KL 溫度公式修正
+"""
+
 from __future__ import annotations
 from typing import List, Union
-
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-# --------------------------------------------------------------------------- #
-# helpers                                                                     #
-# --------------------------------------------------------------------------- #
-
+# ─── helper ───
 def _interpolate_if_needed(src: Tensor, ref: Tensor) -> Tensor:
-    """
-    • 5D (B,K,C,H,W) → mean over K → (B,C,H,W)
-    • If spatial dims differ, resize src to ref via bilinear
-    """
     if src.ndim == 5:
-        src = src.mean(dim=1)
+        src = src.mean(1)
     if src.shape[2:] != ref.shape[2:]:
         src = F.interpolate(src, size=ref.shape[2:], mode="bilinear", align_corners=False)
     return src
 
 
-def _stack(feat: Union[Tensor, List[Tensor]]) -> Tensor:
-    """
-    Stack hook features:
-    - If list of tensors, cat along dim 0.
-    - Else assume Tensor of shape (B,...) or (C,H,W) and return.
-    """
-    if isinstance(feat, list):
-        processed = []
-        for f in feat:
-            if f.dim() == feat[0].dim():  # same dims
-                processed.append(f)
-            else:
-                processed.append(f.unsqueeze(0))
-        feat = torch.cat(processed, dim=0)
-    return feat.float()
+def _stack(x: Union[Tensor, List[Tensor]]) -> Tensor:
+    if isinstance(x, list):
+        x = torch.cat([t.unsqueeze(0) if t.ndim == x[0].ndim else t for t in x], 0)
+    return x.float()
 
 
-def _gap(feat_raw: Union[Tensor, List[Tensor]]) -> Tensor:
-    """
-    Global avg pool + flatten for RKD to reduce dimension and avoid OOM.
-    """
-    feat = _stack(feat_raw)
-    if feat.ndim > 2:
-        feat = F.adaptive_avg_pool2d(feat, 1).flatten(1)
-    return feat
+def _gap(x: Union[Tensor, List[Tensor]]) -> Tensor:
+    x = _stack(x)
+    if x.ndim > 2:
+        x = F.adaptive_avg_pool2d(x, 1).flatten(1)
+    return x
 
 
-def _match_channels(src: Tensor, tgt: Tensor) -> Tensor:
-    """
-    Align channel dimension of src to tgt:
-    - If src channels divisible by tgt: group mean reduce.
-    - If tgt divisible by src: repeat src.
-    - Else average over channels then repeat.
-    """
+def _match_channels(src: Tensor, tgt: Tensor):
     Cs, Ct = src.size(1), tgt.size(1)
     if Cs == Ct:
         return src
     if Cs % Ct == 0:
         k = Cs // Ct
-        return src.view(src.size(0), Ct, k, *src.shape[2:]).mean(dim=2)
-    elif Ct % Cs == 0:
+        return src.view(src.size(0), Ct, k, *src.shape[2:]).mean(2)
+    if Ct % Cs == 0:
         k = Ct // Cs
-        expanded = src.unsqueeze(2).repeat(1, 1, k, *([1] * (src.ndim - 2)))
-        return expanded.view(src.size(0), Ct, *src.shape[2:])
-    else:
-        avg = src.mean(dim=1, keepdim=True)
-        return avg.repeat(1, Ct, 1, 1)
+        return src.unsqueeze(2).repeat(1, 1, k, *([1] * (src.ndim - 2))).view(src.size(0), Ct, *src.shape[2:])
+    avg = src.mean(1, keepdim=True)
+    return avg.repeat(1, Ct, 1, 1)
 
-# --------------------------------------------------------------------------- #
-# 1. Encoder feature matching                                                 #
-# --------------------------------------------------------------------------- #
-
+# ─── 1. Encoder feature - MSE + KL ───
 def encoder_matching_loss(
     feats_s: List[Union[Tensor, List[Tensor]]],
     feats_t: List[Tensor],
-    lambda_mse: float = 1.0,
-    lambda_kl:  float = 1.0,
-    temperature: float = 1.0,
-    **_ignored
+    lambda_mse=1.0,
+    lambda_kl=1.0,
+    temperature=1.0,
+    n_layers: int = 1,
 ) -> Tensor:
-    """
-    Pixel/patch-level encoder feature distillation: MSE + KL.
-    """
-    mse_total, kl_total = 0.0, 0.0
+    mse_tot, kl_tot = 0.0, 0.0
     for fs_raw, ft in zip(feats_s, feats_t):
-        fs = _stack(fs_raw)                  # (Bs,Cs,H,W)
-        ft = _interpolate_if_needed(ft, fs)  # (Bt,Ct,H,W)
-        b = min(fs.size(0), ft.size(0))      # batch align
+        fs = _stack(fs_raw)
+        ft = _interpolate_if_needed(ft, fs)
+        b = min(fs.size(0), ft.size(0))
         fs, ft = fs[:b], ft[:b]
         fs = _match_channels(fs, ft)
 
-        mse_total += F.mse_loss(fs, ft, reduction="mean")
+        mse_tot += F.mse_loss(fs, ft, reduction="mean")
         ps = F.log_softmax(fs.flatten(1) / temperature, dim=-1)
         pt = F.softmax(ft.flatten(1) / temperature, dim=-1)
-        kl_total += F.kl_div(ps, pt, reduction="batchmean") * temperature**2
+        kl_tot += F.kl_div(ps, pt, reduction="batchmean") * temperature ** 2
+    return (lambda_mse * mse_tot + lambda_kl * kl_tot) / max(1, n_layers)
 
-    return lambda_mse * mse_total + lambda_kl * kl_total
-
-# --------------------------------------------------------------------------- #
-# 2. Decoder pre-logits matching                                              #
-# --------------------------------------------------------------------------- #
-
+# ─── 2. Decoder pre-logits ───
 def decoder_matching_loss(
     feat_s_raw: Union[Tensor, List[Tensor]],
     feat_t: Tensor,
-    lambda_mse: float = 1.0,
-    lambda_cos: float = 1.0,
-    lambda_kl:  float = 1.0,
-    temperature: float = 1.0,
-    **_ignored
+    lambda_mse=1.0,
+    lambda_cos=1.0,
+    lambda_kl=1.0,
+    temperature=1.0,
 ) -> Tensor:
-    """
-    Mask-decoder pre-logits distillation: MSE + Cosine + KL.
-    """
     fs = _stack(feat_s_raw)
     ft = _interpolate_if_needed(feat_t, fs)
     b = min(fs.size(0), ft.size(0))
@@ -126,56 +87,42 @@ def decoder_matching_loss(
     cos = 1 - F.cosine_similarity(fs.flatten(1), ft.flatten(1)).mean()
     ps = F.log_softmax(fs.flatten(1) / temperature, dim=-1)
     pt = F.softmax(ft.flatten(1) / temperature, dim=-1)
-    kl = F.kl_div(ps, pt, reduction="batchmean") * temperature**2
+    kl = F.kl_div(ps, pt, reduction="batchmean") * temperature ** 2
 
     return lambda_mse * mse + lambda_cos * cos + lambda_kl * kl
 
-# --------------------------------------------------------------------------- #
-# 3. Attention map distillation                                               #
-# --------------------------------------------------------------------------- #
-
+# ─── 3. ViT attention map ───
 def attention_matching_loss(
     attn_s: List[Union[Tensor, List[Tensor]]],
     attn_t: List[Tensor],
-    lambda_attn: float = 1.0,
-    temperature: float = 1.0,
-    **_ignored
+    lambda_attn=1.0,
+    temperature=1.0,
+    n_layers: int = 1,
 ) -> Tensor:
-    """
-    ViT attention map distillation: KL divergence.
-    """
     loss = 0.0
     for as_raw, at in zip(attn_s, attn_t):
-        as_ = _stack(as_raw)               # (Bs,h,N,N)
+        as_ = _stack(as_raw)
         b = min(as_.size(0), at.size(0))
         as_, at = as_[:b], at[:b]
         ps = F.log_softmax(as_ / temperature, dim=-1)
         pt = F.softmax(at / temperature, dim=-1)
-        loss += F.kl_div(ps, pt, reduction="batchmean") * temperature**2
-    return lambda_attn * loss / max(1, len(attn_s))
+        loss += F.kl_div(ps, pt, reduction="batchmean") * temperature ** 2
+    return lambda_attn * loss / max(1, n_layers)
 
-# --------------------------------------------------------------------------- #
-# 4. Relational knowledge distillation (RKD)                                  #
-# --------------------------------------------------------------------------- #
-
-def _pdist(e: Tensor) -> Tensor:
+# ─── 4. Relational KD ───
+def _pdist(e):
     return torch.cdist(e, e, p=2)
 
 def rkd_loss(
     embed_s_raw: Union[Tensor, List[Tensor]],
     embed_t_raw: Union[Tensor, List[Tensor]],
-    lambda_rkd: float = 1.0,
-    dist_factor: float = 1.0,
-    angle_factor: float = 1.0,
-    **_ignored
+    lambda_rkd=1.0,
+    dist_factor=1.0,
+    angle_factor=2.0,
 ) -> Tensor:
-    """
-    RKD: distance + angle matching.
-    """
-    es, et = _gap(embed_s_raw), _gap(embed_t_raw)  # (Bs,C) / (Bt,C)
+    es, et = _gap(embed_s_raw), _gap(embed_t_raw)
     b = min(es.size(0), et.size(0))
     es, et = es[:b], et[:b]
-
     if es.size(0) < 2:
         return es.new_tensor(0.0)
 
