@@ -290,7 +290,7 @@ def main():
                 log_gpu_memory(f"Epoch {ep} start (after cache clear)")
 
             student.train()
-            tot_task, tot_dist = 0.0, 0.0
+            tot_task, tot_dist, total_loss = 0.0, 0.0, 0.0
             pbar = tqdm(tr_loader, desc=f"Train {ep}")
             opt.zero_grad()
 
@@ -320,13 +320,14 @@ def main():
                         logit = torch.stack([o["low_res_logits"] for o in out]).squeeze(1)
                         logit_up = F.interpolate(logit, size=masks.shape[-2:], mode="bilinear", align_corners=False)
 
+                        bce   = F.binary_cross_entropy_with_logits(logit_up, masks)
                         focal = sigmoid_focal_loss(logit_up, masks, reduction="mean")
                         # safe dice:
                         prob = torch.sigmoid(logit_up)
                         num  = (prob * masks).sum((-2, -1)) * 2
                         den  = prob.sum((-2, -1)) + masks.sum((-2, -1))
                         dice = 1 - (num / (den + 1e-6)).mean()
-                        task_loss = 2.0 * focal + dice
+                        task_loss = bce + 0.5 * focal + dice
 
                         # ─ distillation (只在啟用時執行) ─
                         dist_loss = torch.tensor(0., device=dev, requires_grad=False)
