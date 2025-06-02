@@ -39,7 +39,7 @@
     "unfreeze_epoch": 10
   },
   "distillation": {
-    "enable": true,
+    "enable": false,
     "use_precomputed_features": true,
     "precomputed_root": "precomputed",
     "encoder_matching": {
