@@ -131,7 +131,7 @@ def main():
         ds_cfg["train_dataset"],
         (tf_img, tf_msk),
         max_bbox_shift=ds_cfg.get("max_bbox_shift", 20),
-        prompt_mode=ds_cfg.get("prompt_mode", "point"),
+        prompt_mode=ds_cfg.get("prompt_mode", "point"),  # 或 "box"
         min_points=ds_cfg.get("min_points", 1),
         max_points=ds_cfg.get("max_points", 3),
         image_size=cfg["model"].get("image_size", 1024),
@@ -140,7 +140,7 @@ def main():
         ds_cfg["val_dataset"],
         (tf_img, tf_msk),
         max_bbox_shift=ds_cfg.get("max_bbox_shift", 20),
-        prompt_mode=ds_cfg.get("prompt_mode", "point"),
+        prompt_mode=ds_cfg.get("prompt_mode", "point"),  # 或 "box"
         min_points=ds_cfg.get("min_points", 1),
         max_points=ds_cfg.get("max_points", 3),
         image_size=cfg["model"].get("image_size", 1024),
@@ -282,8 +282,7 @@ def main():
                 dist_loss = torch.tensor(0.0, device=dev)
                 task_loss = torch.tensor(0.0, device=dev)
                 loss = torch.tensor(0.0, device=dev)
-                # ──────────────────────────────────────────────────────────
-
+                # 
                 imgs = batch["image"].to(dev)    # [B,3,1024,1024]
                 masks = batch["mask"].to(dev)    # [B,1,1024,1024]
                 ids = batch["id"]
@@ -304,128 +303,118 @@ def main():
                     if step % 200 == 0 and i == 0:
                         boxes = entry.get("boxes", None)
                         pts = entry.get("point_coords", None)
-                        pt0 = pts[:1] if (pts is not None) else None
-                        log.info(f"[PROMPT] ep{ep}_step{step} id={ids[i]}, "
-                                 f"orig={entry['original_size']}, "
-                                 f"box={boxes}, "
-                                 f"pt0={pt0}")
+                        # 如果 point_coords 是 None，就不要做切片
+                        pt0 = pts[:1] if pts is not None else None
+
+                        log.info(
+                            f"[PROMPT] ep{ep}_step{step} id={ids[i]}, "
+                            f"orig={entry['original_size']}, "
+                            f"box={boxes}, "
+                            f"pt0={pt0}"
+                        )
 
                     batched_input.append(entry)
 
-                try:
-                    with autocast(dtype=torch.bfloat16 if tr_cfg.get("bf16", False) else torch.float16):
-                        # ===== forward =====
-                        out = student(batched_input=batched_input, multimask_output=False)
+                with autocast(dtype=torch.bfloat16 if tr_cfg.get("bf16", False) else torch.float16):
+                    out = student(batched_input=batched_input, multimask_output=False)
 
-                        low_res_list = [o["low_res_logits"].squeeze() for o in out]  # [256,256]
-                        low_res_logits = torch.stack(low_res_list, dim=0)              # [B,256,256]
-                        tmp = low_res_logits.unsqueeze(1)                             # [B,1,256,256]
+                    low_res_list   = [o["low_res_logits"].squeeze() for o in out]  # [256,256]
+                    low_res_logits = torch.stack(low_res_list, dim=0)              # [B,256,256]
+                    tmp = low_res_logits.unsqueeze(1)                             # [B,1,256,256]
 
-                        logit_up = F.interpolate(
-                            tmp,
-                            size=masks.shape[-2:],  # (1024, 1024)
-                            mode="bilinear",
-                            align_corners=False
-                        )  # [B,1,1024,1024]
+                    logit_up = F.interpolate(
+                        tmp,
+                        size=masks.shape[-2:],  # (1024, 1024)
+                        mode="bilinear",
+                        align_corners=False
+                    )  # [B,1,1024,1024]
 
-                        # ===== task loss =====
-                        bce = F.binary_cross_entropy_with_logits(logit_up, masks)
-                        focal = sigmoid_focal_loss(logit_up, masks, reduction="mean")
+                    bce   = F.binary_cross_entropy_with_logits(logit_up, masks)
+                    focal = sigmoid_focal_loss(logit_up, masks, reduction="mean")
 
-                        prob = torch.sigmoid(logit_up)      # [B,1,1024,1024]
-                        num = (prob * masks).sum((-2, -1)) * 2  # sum over H,W
-                        den = prob.sum((-2, -1)) + masks.sum((-2, -1))
-                        dice_loss = 1 - (num / (den + 1e-6)).mean()
+                    prob = torch.sigmoid(logit_up)      # [B,1,1024,1024]
+                    num  = (prob * masks).sum((-2, -1)) * 2  # sum over H,W
+                    den  = prob.sum((-2, -1)) + masks.sum((-2, -1))
+                    dice_loss = 1 - (num / (den + 1e-6)).mean()
+                    task_loss = bce + 0.5 * focal + dice_loss
 
-                        task_loss = bce + 0.5 * focal + dice_loss
+                    dist_loss = torch.tensor(0.0, device=dev)
+                    if use_distillation and hook_handles:
+                        feat_student = pop_features() or {}
+                        base_dir = Path(dist_cfg["precomputed_root"])
 
-                        # ===== distillation loss =====
-                        dist_loss = torch.tensor(0.0, device=dev)
-                        if use_distillation and hook_handles:
-                            feat_student = pop_features() or {}
-                            base_dir = Path(dist_cfg["precomputed_root"])
+                        for t_cfg in teacher_cfgs:
+                            weight = t_cfg["weight"]
+                            tname = t_cfg["name"]
 
-                            for t_cfg in teacher_cfgs:
-                                weight = t_cfg["weight"]
-                                tname = t_cfg["name"]
-
-                                if dist_cfg.get("encoder_matching", {}).get("enable"):
-                                    enc_keys = pot["enc"]
-                                    if enc_keys:
-                                        try:
-                                            feat_teacher = load_cached_npy_features(
-                                                base_dir, tname, "train", ids, enc_keys
-                                            )
-                                            enc_loss = encoder_matching_loss(
-                                                [feat_student[k] for k in enc_keys],
-                                                feat_teacher,
-                                                **dist_cfg["encoder_matching"],
-                                                n_layers=len(enc_keys),
-                                            )
-                                            dist_loss = dist_loss + weight * enc_loss
-                                        except Exception as e:
-                                            log.debug(f"Encoder matching error: {e}")
-
-                                if dist_cfg.get("decoder_matching", {}).get("enable") and pot["dec"]:
-                                    dk = pot["dec"][0]
-                                    if dk in feat_student:
-                                        try:
-                                            feat_teacher = load_cached_npy_features(
-                                                base_dir, tname, "train", ids, [dk]
-                                            )[0]
-                                            dec_loss = decoder_matching_loss(
-                                                feat_student[dk],
-                                                feat_teacher,
-                                                **dist_cfg["decoder_matching"],
-                                            )
-                                            dist_loss = dist_loss + weight * dec_loss
-                                        except Exception as e:
-                                            log.debug(f"Decoder matching error: {e}")
-
-                                if dist_cfg.get("attention_matching", {}).get("enable") and pot["attn"]:
+                            if dist_cfg.get("encoder_matching", {}).get("enable"):
+                                enc_keys = pot["enc"]
+                                if enc_keys:
                                     try:
-                                        attn_teacher = load_cached_npy_features(
-                                            base_dir, tname, "train", ids, pot["attn"]
+                                        feat_teacher = load_cached_npy_features(
+                                            base_dir, tname, "train", ids, enc_keys
                                         )
-                                        attn_loss = attention_matching_loss(
-                                            [feat_student[k] for k in pot["attn"]],
-                                            attn_teacher,
-                                            **dist_cfg["attention_matching"],
-                                            n_layers=len(pot["attn"]),
+                                        enc_loss = encoder_matching_loss(
+                                            [feat_student[k] for k in enc_keys],
+                                            feat_teacher,
+                                            **dist_cfg["encoder_matching"],
+                                            n_layers=len(enc_keys),
                                         )
-                                        dist_loss = dist_loss + weight * attn_loss
+                                        dist_loss = dist_loss + weight * enc_loss
                                     except Exception as e:
-                                        log.debug(f"Attention matching error: {e}")
+                                        log.debug(f"Encoder matching error: {e}")
 
-                                if dist_cfg.get("relational_KD", {}).get("enable"):
-                                    rk = pot["rkd"][0]
-                                    if rk in feat_student:
-                                        try:
-                                            feat_teacher = load_cached_npy_features(
-                                                base_dir, tname, "train", ids, [rk]
-                                            )[0]
-                                            rkd_loss_val = rkd_loss(
-                                                feat_student[rk],
-                                                feat_teacher,
-                                                **dist_cfg["relational_KD"],
-                                            )
-                                            dist_loss = dist_loss + weight * rkd_loss_val
-                                        except Exception as e:
-                                            log.debug(f"RKD error: {e}")
+                            if dist_cfg.get("decoder_matching", {}).get("enable") and pot["dec"]:
+                                dk = pot["dec"][0]
+                                if dk in feat_student:
+                                    try:
+                                        feat_teacher = load_cached_npy_features(
+                                            base_dir, tname, "train", ids, [dk]
+                                        )[0]
+                                        dec_loss = decoder_matching_loss(
+                                            feat_student[dk],
+                                            feat_teacher,
+                                            **dist_cfg["decoder_matching"],
+                                        )
+                                        dist_loss = dist_loss + weight * dec_loss
+                                    except Exception as e:
+                                        log.debug(f"Decoder matching error: {e}")
 
-                        loss = (task_loss + lambda_coef * dist_loss) / tr_cfg.get("gradient_accumulation", 1)
-                        # ===== forward finished =====
+                            if dist_cfg.get("attention_matching", {}).get("enable") and pot["attn"]:
+                                try:
+                                    attn_teacher = load_cached_npy_features(
+                                        base_dir, tname, "train", ids, pot["attn"]
+                                    )
+                                    attn_loss = attention_matching_loss(
+                                        [feat_student[k] for k in pot["attn"]],
+                                        attn_teacher,
+                                        **dist_cfg["attention_matching"],
+                                        n_layers=len(pot["attn"]),
+                                    )
+                                    dist_loss = dist_loss + weight * attn_loss
+                                except Exception as e:
+                                    log.debug(f"Attention matching error: {e}")
 
-                except Exception as e:
-                    # 只要 forward/backward 發生錯誤，就跳出並 raise 到最外層
-                    log.error(f"Error during forward/backward at step {step}: {e}")
-                    raise
+                            if dist_cfg.get("relational_KD", {}).get("enable"):
+                                rk = pot["rkd"][0]
+                                if rk in feat_student:
+                                    try:
+                                        feat_teacher = load_cached_npy_features(
+                                            base_dir, tname, "train", ids, [rk]
+                                        )[0]
+                                        rkd_loss_val = rkd_loss(
+                                            feat_student[rk],
+                                            feat_teacher,
+                                            **dist_cfg["relational_KD"],
+                                        )
+                                        dist_loss = dist_loss + weight * rkd_loss_val
+                                    except Exception as e:
+                                        log.debug(f"RKD error: {e}")
 
-                # ===== backward & optimizer =====
+                    loss = (task_loss + lambda_coef * dist_loss) / tr_cfg.get("gradient_accumulation", 1)
+
                 scaler.scale(loss).backward()
-
-                # 手動清掉一些大 tensor
-                # del low_res_logits, tmp, logit_up, prob, 
+                # del low_res_logits, tmp, logit_up, prob, focal, dice_loss
                 if use_distillation and 'feat_student' in locals():
                     del feat_student
 
@@ -437,17 +426,12 @@ def main():
                     scaler.update()
                     opt.zero_grad()
                     global_step += 1
-
-                    # ─── 把 scheduler.step() 放在 optimizer.step() 之後 ───
                     scheduler.step()
-
-                    # 另外呼叫 empty_cache
                     torch.cuda.empty_cache()
 
                 tot_task += task_loss.item()
                 tot_dist += dist_loss.item()
 
-                # ─── 在所有變數都被初始化且已被更新後，才做 pbar.set_postfix ───
                 pbar.set_postfix(
                     bce=f"{bce.item():.3f}",
                     focal=f"{focal.item():.3f}",
@@ -470,7 +454,6 @@ def main():
             if (ep + 1) % tr_cfg.get("val_freq", 1) != 0:
                 continue
 
-            # ===== validation =====
             student.eval()
             dices, ious = [], []
             with torch.no_grad():
@@ -506,7 +489,7 @@ def main():
                             prob_i = probs[i]               # [1,1024,1024]
                             gt_i   = masks[i]               # [1,1024,1024]
 
-                            # Soft Dice for debug
+                            # Soft Dice for loss logging
                             num_soft = (prob_i * gt_i).sum((-2, -1)) * 2
                             den_soft = prob_i.sum((-2, -1)) + gt_i.sum((-2, -1))
                             soft_dice = (num_soft / (den_soft + 1e-6)).item()
@@ -604,7 +587,6 @@ def main():
                     if stop_counter >= patience:
                         log.info("Early stop triggered.")
                         break
-
     except Exception as e:
         log.error(f"Training error: {e}")
         log.error(traceback.format_exc())
