@@ -1,16 +1,20 @@
-# ───────────────────────── finetune_utils/datasets.py ─────────────────────────
+# finetune_utils/datasets.py
+
 import torch
 from torch.utils.data import Dataset
 import random
 from pathlib import Path
 from PIL import Image
 from torchvision import transforms
+
+
 class ComponentDataset(Dataset):
     """
-    針對 SAM fine-tune 的多物件資料集
-    ▶ 單一 Resize → (image_size, image_size)
-    ▶ 支援 box / point / mixed prompt
+    SAM Fine-tune 多物件資料集 (Option B)
+    • 保留原始尺寸，先在原圖上計算 prompt (box / point)，
+      再縮放到 1024×1024，並回傳原始尺寸給 SAM。
     """
+
     def __init__(
         self,
         root_dir,
@@ -28,6 +32,7 @@ class ComponentDataset(Dataset):
         if not self.image_dir.is_dir() or not self.mask_dir.is_dir():
             raise FileNotFoundError(f"{root_dir} 缺少 image/ 或 mask/")
 
+        # transform: (transform_image, transform_mask) for AFTER resize
         self.transform_image = transform[0] if transform else transforms.ToTensor()
         self.transform_mask = transform[1] if transform else transforms.ToTensor()
 
@@ -38,9 +43,7 @@ class ComponentDataset(Dataset):
         self.image_size = image_size
 
         self.samples = []
-        image_files = list(self.image_dir.glob("*.jpg")) + list(self.image_dir.glob("*.jpeg")) + list(
-            self.image_dir.glob("*.png")
-        )
+        image_files = list(self.image_dir.glob("*.jpg")) + list(self.image_dir.glob("*.jpeg")) + list(self.image_dir.glob("*.png"))
 
         for img_path in image_files:
             img_stem = img_path.stem
@@ -54,18 +57,12 @@ class ComponentDataset(Dataset):
 
         print(f"ComponentDataset: {len(self.samples)} samples, prompt={self.prompt_mode}")
 
+        # 用於後續 Resize
         self.img_resize = transforms.Resize((image_size, image_size), transforms.InterpolationMode.BILINEAR)
         self.msk_resize = transforms.Resize((image_size, image_size), transforms.InterpolationMode.NEAREST)
 
-    def __len__(self):
-        return len(self.samples)
-
-    # ─── util ───
     @staticmethod
     def _morph_close(mask_tensor: torch.Tensor, k: int = 3):
-        """
-        簡易形態學 closing，避免 tiny bbox
-        """
         if mask_tensor.ndim == 3:
             mask_tensor = mask_tensor.squeeze(0)
         kernel = torch.ones((1, 1, k, k), dtype=torch.float32, device=mask_tensor.device)
@@ -76,33 +73,46 @@ class ComponentDataset(Dataset):
         ero = (ero >= k * k).float()
         return ero.squeeze()
 
-    def compute_bbox(self, mask_tensor: torch.Tensor):
-        mask = self._morph_close(mask_tensor)
-        rows, cols = torch.any(mask, 1), torch.any(mask, 0)
+    def compute_bbox_raw(self, mask_tensor: torch.Tensor):
+        """
+        在原始尺寸 mask_tensor ([1, H_raw, W_raw]) 上計算 tight bbox。
+        回傳 [xmin, ymin, xmax, ymax] (raw scale)。
+        """
+        m = mask_tensor.squeeze(0)
+        m_close = self._morph_close(m)
+        rows = torch.any(m_close, dim=1)
+        cols = torch.any(m_close, dim=0)
         if not rows.any() or not cols.any():
             return torch.zeros(4, dtype=torch.float)
-        y_idx, x_idx = torch.where(rows)[0], torch.where(cols)[0]
+        y_idx = torch.where(rows)[0]
+        x_idx = torch.where(cols)[0]
         y_min, y_max = y_idx[0].item(), y_idx[-1].item()
         x_min, x_max = x_idx[0].item(), x_idx[-1].item()
-        # 面積過小則視為無效 bbox
         if (x_max - x_min) * (y_max - y_min) < 16:
             return torch.zeros(4, dtype=torch.float)
         return torch.tensor([x_min, y_min, x_max, y_max], dtype=torch.float)
 
-    def compute_point_prompts(self, mask_tensor: torch.Tensor):
-        mask = mask_tensor.squeeze(0)
-        fg = torch.argwhere(mask > 0.5)
-        point_coords = torch.zeros((self.max_points, 2), dtype=torch.float)
-        point_labels = torch.zeros(self.max_points, dtype=torch.long)
+    def compute_point_prompts_raw(self, mask_tensor: torch.Tensor):
+        """
+        在原始尺寸 mask_tensor ([1, H_raw, W_raw]) 隨機挑 k 個正點 (mask>0.5)，
+        其餘填 (-1,-1)，label 填 -1(忽略)。
+        """
+        m = mask_tensor.squeeze(0)
+        fg = torch.argwhere(m > 0.5)  # [[y,x], ...]
+        point_coords = torch.full((self.max_points, 2), -1.0, dtype=torch.float)
+        point_labels = torch.full((self.max_points,), -1, dtype=torch.long)
         if fg.shape[0] == 0:
             return point_coords, point_labels
         k = random.randint(self.min_points, self.max_points)
         idx = torch.randperm(fg.shape[0])[:k]
-        samp = fg[idx]
-        samp = torch.flip(samp.float(), dims=[1])  # yx→xy
-        point_coords[: k] = samp
-        point_labels[: k] = 1
+        samp = fg[idx].float()  # yx
+        samp = torch.flip(samp, dims=[1])  # 轉成 (x,y)
+        point_coords[:k] = samp
+        point_labels[:k] = 1
         return point_coords, point_labels
+
+    def __len__(self):
+        return len(self.samples)
 
     def __getitem__(self, idx):
         meta = self.samples[idx]
@@ -110,34 +120,75 @@ class ComponentDataset(Dataset):
         msk_pil = Image.open(meta["mask"]).convert("L")
 
         orig_w, orig_h = img_pil.size
-        original_size = torch.tensor([orig_h, orig_w], dtype=torch.int)
+        raw_size = torch.tensor([orig_h, orig_w], dtype=torch.int)
 
-        img_resized = self.img_resize(img_pil)
-        msk_resized = self.msk_resize(msk_pil)
+        # 1. 先把 raw mask 轉成 tensor 做 prompt
+        msk_raw = transforms.ToTensor()(msk_pil)  # [1, H_raw, W_raw]
+        msk_raw = (msk_raw > 0.5).float()
 
-        img_tensor = self.transform_image(img_resized)
-        msk_tensor = self.transform_mask(msk_resized)
-        msk_tensor = (msk_tensor > 0.5).float()
+        # 計算 raw prompt
+        box_prompt_raw = torch.zeros(4, dtype=torch.float)
+        point_coords_raw = torch.full((self.max_points, 2), -1.0, dtype=torch.float)
+        point_labels_raw = torch.full((self.max_points,), -1, dtype=torch.long)
 
-        # prompts
-        box_prompt = torch.zeros(4, dtype=torch.float)
-        point_coords = torch.zeros((self.max_points, 2), dtype=torch.float)
-        point_labels = torch.zeros(self.max_points, dtype=torch.long)
         cur_type = self.prompt_mode
         if self.prompt_mode == "mixed":
             cur_type = random.choice(["box", "point"])
 
         if cur_type == "box":
-            box_prompt = self.compute_bbox(msk_tensor)
+            box_prompt_raw = self.compute_bbox_raw(msk_raw)
         else:
-            point_coords, point_labels = self.compute_point_prompts(msk_tensor)
+            point_coords_raw, point_labels_raw = self.compute_point_prompts_raw(msk_raw)
+
+        # 2. Resize image & mask to image_size × image_size
+        img_resized = self.img_resize(img_pil)
+        msk_resized = self.msk_resize(msk_pil)
+
+        img_tensor = self.transform_image(img_resized)  # [3, 1024,1024]
+        msk_tensor = self.transform_mask(msk_resized)   # [1,1024,1024]
+        msk_tensor = (msk_tensor > 0.5).float()
+
+        # 3. 把 raw prompt 縮放到 1024×1024
+        scale_x = self.image_size / orig_w
+        scale_y = self.image_size / orig_h
+
+        if cur_type == "box":
+            if box_prompt_raw.sum() != 0:
+                box_prompt = box_prompt_raw.clone()
+                box_prompt[0] = box_prompt_raw[0] * scale_x
+                box_prompt[1] = box_prompt_raw[1] * scale_y
+                box_prompt[2] = box_prompt_raw[2] * scale_x
+                box_prompt[3] = box_prompt_raw[3] * scale_y
+            else:
+                box_prompt = torch.zeros(4, dtype=torch.float)
+            point_coords, point_labels = None, None
+        else:
+            if (point_coords_raw >= 0).any():
+                pc = point_coords_raw.clone()
+                pc[:, 0] = point_coords_raw[:, 0] * scale_x
+                pc[:, 1] = point_coords_raw[:, 1] * scale_y
+                point_coords = pc
+                point_labels = point_labels_raw.clone()
+            else:
+                point_coords = torch.full((self.max_points, 2), -1.0, dtype=torch.float)
+                point_labels = torch.full((self.max_points,), -1, dtype=torch.long)
+            box_prompt = None
+
+        # 4. DEBUG: 隨機小機率印一次 prompt 原始 & 縮放值
+        if random.random() < 0.002:
+            print(f"[DBG] idx={idx}, id={meta['id']}, raw_size={(orig_h,orig_w)}, "
+                  f"prompt_type={cur_type}, "
+                  f"box_raw={box_prompt_raw.tolist() if cur_type=='box' else None}, "
+                  f"box_scaled={box_prompt.tolist() if cur_type=='box' else None}, "
+                  f"pt_raw={point_coords_raw[:1].tolist() if cur_type=='point' else None}, "
+                  f"pt_scaled={(point_coords[:1].tolist() if cur_type=='point' else None)}")
 
         return {
-            "image": img_tensor,
-            "mask": msk_tensor,
+            "image": img_tensor,                    # [3,1024,1024]
+            "mask": msk_tensor,                     # [1,1024,1024]
             "box_prompt": box_prompt if cur_type == "box" else None,
             "point_coords": point_coords if cur_type == "point" else None,
             "point_labels": point_labels if cur_type == "point" else None,
             "id": meta["id"],
-            "original_size": original_size,
+            "original_size": raw_size,              # (H_raw, W_raw)
         }
