@@ -34,7 +34,7 @@
   },
   "freeze": {
     "freeze_image_encoder": true,
-    "freeze_prompt_encoder": false,
+    "freeze_prompt_encoder": true,
     "freeze_mask_decoder": false,
     "unfreeze_epoch": 10
   },

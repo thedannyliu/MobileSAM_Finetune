@@ -290,15 +290,12 @@ def main():
 
                 batched_input = []
                 for i in range(len(imgs)):
-                    entry = {
-                        "image": imgs[i],
-                        "original_size": _parse_hw(osz[i]),  # (H_raw, W_raw)
-                    }
+                    entry = { "image": imgs[i], "original_size": (int(osz[i][0]), int(osz[i][1])) }
                     if batch["box_prompt"][i] is not None:
-                        entry["boxes"] = batch["box_prompt"][i].to(dev)
+                        entry["boxes"] = batch["box_prompt"][i].to(dev).unsqueeze(0)
                     if batch["point_coords"][i] is not None:
-                        entry["point_coords"] = batch["point_coords"][i].to(dev)
-                        entry["point_labels"] = batch["point_labels"][i].to(dev)
+                        entry["point_coords"] = batch["point_coords"][i].to(dev).unsqueeze(0)
+                        entry["point_labels"] = batch["point_labels"][i].to(dev).unsqueeze(0)
 
                     if step % 200 == 0 and i == 0:
                         boxes = entry.get("boxes", None)
@@ -463,13 +460,18 @@ def main():
                         masks = vb["mask"].to(dev)
                         original_sizes = vb["original_size"]
 
-                        vinp = [
-                            {
+                        vinp = []
+                        for i in range(len(imgs)):
+                            entry = {
                                 "image": imgs[i],
-                                "original_size": (int(original_sizes[i][0]), int(original_sizes[i][1]))
+                                "original_size": (int(original_sizes[i][0]), int(original_sizes[i][1])),
                             }
-                            for i in range(len(imgs))
-                        ]
+                            if vb["box_prompt"][i] is not None:
+                                entry["boxes"] = vb["box_prompt"][i].to(dev).unsqueeze(0)  # (1,4)
+                            if vb["point_coords"][i] is not None:
+                                entry["point_coords"] = vb["point_coords"][i].to(dev).unsqueeze(0)  # (1,K,2)
+                                entry["point_labels"] = vb["point_labels"][i].to(dev).unsqueeze(0)  # (1,K)
+                            vinp.append(entry)
                         vo = student(batched_input=vinp, multimask_output=False)
 
                         low_res_list = [o["low_res_logits"].squeeze() for o in vo]
@@ -538,7 +540,7 @@ def main():
                                     pts = pts.to(torch.float32)
                                 if lbl is not None:
                                     lbl = lbl.to(torch.long)
-                                orig_h, orig_w = int(original_sizes[i][0]), int(original_sizes[i][1])
+                                # orig_h, orig_w = int(original_sizes[i][0]), int(original_sizes[i][1])
 
                                 overlay_mask_on_image(
                                     image_tensor=img_denorm,
@@ -546,7 +548,8 @@ def main():
                                     bbox_tensor=box.cpu() if box is not None else None,
                                     point_coords=pts.cpu() if pts is not None else None,
                                     point_labels=lbl.cpu() if lbl is not None else None,
-                                    original_size=(orig_h, orig_w),
+                                    # original_size=(orig_h, orig_w),
+                                    original_size=None,
                                     threshold=cfg["visual"].get("IOU_threshold", 0.5),
                                     save_dir=str(cur_path),
                                     filename_info=f"ep{ep}_id{vb['id'][i]}_b{bi}_s{i}"
