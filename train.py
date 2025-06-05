@@ -330,60 +330,57 @@ def main():
                         )
 
                     batched_input.append(entry)
+                    
+                with autocast(
+                    dtype=torch.bfloat16 if tr_cfg.get("bf16", False) else torch.float16
+                ):
+                    out = student(batched_input=batched_input, multimask_output=True)
 
-                    with autocast(
-                        dtype=torch.bfloat16
-                        if tr_cfg.get("bf16", False)
-                        else torch.float16
-                    ):
-                        out = student(
-                            batched_input=batched_input, multimask_output=True
+                    mask_list = []
+                    iou_list = []
+                    for o in out:
+                        mask_up = F.interpolate(
+                            o["masks"].to(torch.float32),
+                            size=masks.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        ).squeeze(0)
+                        mask_list.append(mask_up)
+                        iou_list.append(
+                            o["iou_predictions"].squeeze(0).to(torch.float32)
                         )
 
-                        mask_list = []
-                        iou_list = []
-                        for o in out:
-                            mask_up = F.interpolate(
-                                o["masks"].to(torch.float32),
-                                size=masks.shape[-2:],
-                                mode="bilinear",
-                                align_corners=False,
+                    pred_masks = torch.stack(mask_list, dim=0)
+                    pred_ious = torch.stack(iou_list, dim=0)
+
+                    best_indices = pred_ious.argmax(dim=1)
+                    sel_masks = pred_masks[torch.arange(len(pred_masks)), best_indices]
+                    sel_masks = sel_masks.unsqueeze(1)
+
+                    bce = F.binary_cross_entropy_with_logits(sel_masks, masks)
+                    focal = sigmoid_focal_loss(sel_masks, masks, reduction="mean")
+
+                    prob = torch.sigmoid(sel_masks)
+                    num = (prob * masks).sum((-2, -1)) * 2
+                    den = prob.sum((-2, -1)) + masks.sum((-2, -1))
+                    dice_loss = 1 - (num / (den + 1e-6)).mean()
+                    task_loss = bce + 0.5 * focal + dice_loss
+
+                    with torch.no_grad():
+                        gt_bin = masks > 0.5
+                        ious = []
+                        for b in range(pred_masks.shape[0]):
+                            preds_bin = (torch.sigmoid(pred_masks[b]) > 0.5).float()
+                            inter = (preds_bin * gt_bin[b]).sum((-2, -1))
+                            union = (
+                                preds_bin.sum((-2, -1))
+                                + gt_bin[b].sum((-2, -1))
+                                - inter
                             )
-                            mask_list.append(mask_up)
-                            iou_list.append(o["iou_predictions"].to(torch.float32))
+                            ious.append(inter / (union + 1e-6))
+                        gt_ious = torch.stack(ious, dim=0)
 
-                        pred_masks = torch.stack(mask_list, dim=0)
-                        pred_ious = torch.stack(iou_list, dim=0)
-
-                        best_indices = pred_ious.argmax(dim=1)
-                        sel_masks = pred_masks[
-                            torch.arange(len(pred_masks)), best_indices
-                        ]
-
-                        bce = F.binary_cross_entropy_with_logits(sel_masks, masks)
-                        focal = sigmoid_focal_loss(sel_masks, masks, reduction="mean")
-
-                        prob = torch.sigmoid(sel_masks)
-                        num = (prob * masks).sum((-2, -1)) * 2
-                        den = prob.sum((-2, -1)) + masks.sum((-2, -1))
-                        dice_loss = 1 - (num / (den + 1e-6)).mean()
-                        task_loss = bce + 0.5 * focal + dice_loss
-
-                        with torch.no_grad():
-                            gt_bin = masks > 0.5
-                            ious = []
-                            for b in range(pred_masks.shape[0]):
-                                preds_bin = (torch.sigmoid(pred_masks[b]) > 0.5).float()
-                                inter = (preds_bin * gt_bin[b]).sum((-2, -1))
-                                union = (
-                                    preds_bin.sum((-2, -1))
-                                    + gt_bin[b].sum((-2, -1))
-                                    - inter
-                                )
-                                ious.append(inter / (union + 1e-6))
-                            gt_ious = torch.stack(ious, dim=0)
-
-                        iou_loss = F.mse_loss(pred_ious, gt_ious)
+                    iou_loss = F.mse_loss(pred_ious, gt_ious)
 
                     dist_loss = torch.tensor(0.0, device=dev)
                     if use_distillation and hook_handles:
@@ -553,16 +550,24 @@ def main():
                                 size=masks.shape[-2:],
                                 mode="bilinear",
                                 align_corners=False,
-                            )
+
+                            ).squeeze(0)
                             mask_list.append(mask_up)
-                            iou_list.append(o["iou_predictions"].to(torch.float32))
+                            iou_list.append(
+                                o["iou_predictions"].squeeze(0).to(torch.float32)
+                            )
+
 
                         pred_masks = torch.stack(mask_list, dim=0)
                         pred_ious = torch.stack(iou_list, dim=0)
 
                         best_indices = pred_ious.argmax(dim=1)
                         probs = torch.sigmoid(
-                            pred_masks[torch.arange(len(pred_masks)), best_indices]
+
+                            pred_masks[
+                                torch.arange(len(pred_masks)), best_indices
+                            ].unsqueeze(1)
+
                         )
 
                         for i in range(len(imgs)):
@@ -595,7 +600,10 @@ def main():
                                     f"[VAL] id={vb['id'][i]}, "
                                     f"soft_dice={soft_dice:.3f}, "
                                     f"bin_dice={bin_dice:.3f}, bin_iou={bin_iou:.3f}, "
-                                    f"gt_sum={gt_i.sum().item():.0f}, pred_sum={pred_bin.sum().item():.0f}"
+
+                                    f"gt_sum={gt_i.sum().item():.0f}, "
+                                    f"pred_sum={pred_bin.sum().item():.0f}"
+
                                 )
 
                             # Visualization
@@ -643,7 +651,11 @@ def main():
                                     original_size=None,
                                     threshold=cfg["visual"].get("IOU_threshold", 0.5),
                                     save_dir=str(cur_path),
-                                    filename_info=f"ep{ep}_id{vb['id'][i]}_b{bi}_s{i}",
+
+                                    filename_info=(
+                                        f"ep{ep}_id{vb['id'][i]}_b{bi}_s{i}"
+                                    ),
+
                                 )
                     except Exception as e:
                         log.error(f"Error in validation step {bi}: {e}")
@@ -656,7 +668,12 @@ def main():
                 writer.add_scalar("val/iou", v_iou, ep)
                 writer.add_scalar("val/score", v_score, ep)
                 log.info(
-                    f"Epoch {ep}  Bin-Dice={v_dice:.4f} Bin-IoU={v_iou:.4f} Score={v_score:.4f}"
+
+                    (
+                        f"Epoch {ep}  Bin-Dice={v_dice:.4f} "
+                        f"Bin-IoU={v_iou:.4f} Score={v_score:.4f}"
+                    )
+
                 )
                 log_gpu_memory(f"Epoch {ep} validation completed")
 
@@ -666,13 +683,19 @@ def main():
                     if v_score > best_score + 1e-4:
                         dyn_wait = 0
                         lambda_coef = min(
-                            lambda_coef / dist_cfg["dynamic_lambda"]["factor"], 1.0
+
+                            lambda_coef / dist_cfg["dynamic_lambda"]["factor"],
+                            1.0,
+
                         )
                     else:
                         dyn_wait += 1
                         if dyn_wait >= dist_cfg["dynamic_lambda"]["patience"]:
                             lambda_coef = max(
-                                lambda_coef * dist_cfg["dynamic_lambda"]["factor"], 1e-3
+
+                                lambda_coef * dist_cfg["dynamic_lambda"]["factor"],
+                                1e-3,
+
                             )
                             dyn_wait = 0
                             log.info(f"λ ↓ {lambda_coef:.3f}")
