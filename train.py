@@ -330,7 +330,7 @@ def main():
                         )
 
                     batched_input.append(entry)
-
+                    
                 with autocast(
                     dtype=torch.bfloat16 if tr_cfg.get("bf16", False) else torch.float16
                 ):
@@ -550,20 +550,24 @@ def main():
                                 size=masks.shape[-2:],
                                 mode="bilinear",
                                 align_corners=False,
+
                             ).squeeze(0)
                             mask_list.append(mask_up)
                             iou_list.append(
                                 o["iou_predictions"].squeeze(0).to(torch.float32)
                             )
 
+
                         pred_masks = torch.stack(mask_list, dim=0)
                         pred_ious = torch.stack(iou_list, dim=0)
 
                         best_indices = pred_ious.argmax(dim=1)
                         probs = torch.sigmoid(
+
                             pred_masks[
                                 torch.arange(len(pred_masks)), best_indices
                             ].unsqueeze(1)
+
                         )
 
                         for i in range(len(imgs)):
@@ -596,8 +600,10 @@ def main():
                                     f"[VAL] id={vb['id'][i]}, "
                                     f"soft_dice={soft_dice:.3f}, "
                                     f"bin_dice={bin_dice:.3f}, bin_iou={bin_iou:.3f}, "
+
                                     f"gt_sum={gt_i.sum().item():.0f}, "
                                     f"pred_sum={pred_bin.sum().item():.0f}"
+
                                 )
 
                             # Visualization
@@ -645,9 +651,11 @@ def main():
                                     original_size=None,
                                     threshold=cfg["visual"].get("IOU_threshold", 0.5),
                                     save_dir=str(cur_path),
+
                                     filename_info=(
                                         f"ep{ep}_id{vb['id'][i]}_b{bi}_s{i}"
                                     ),
+
                                 )
                     except Exception as e:
                         log.error(f"Error in validation step {bi}: {e}")
@@ -660,10 +668,12 @@ def main():
                 writer.add_scalar("val/iou", v_iou, ep)
                 writer.add_scalar("val/score", v_score, ep)
                 log.info(
+
                     (
                         f"Epoch {ep}  Bin-Dice={v_dice:.4f} "
                         f"Bin-IoU={v_iou:.4f} Score={v_score:.4f}"
                     )
+
                 )
                 log_gpu_memory(f"Epoch {ep} validation completed")
 
@@ -673,15 +683,19 @@ def main():
                     if v_score > best_score + 1e-4:
                         dyn_wait = 0
                         lambda_coef = min(
+
                             lambda_coef / dist_cfg["dynamic_lambda"]["factor"],
                             1.0,
+
                         )
                     else:
                         dyn_wait += 1
                         if dyn_wait >= dist_cfg["dynamic_lambda"]["patience"]:
                             lambda_coef = max(
+
                                 lambda_coef * dist_cfg["dynamic_lambda"]["factor"],
                                 1e-3,
+
                             )
                             dyn_wait = 0
                             log.info(f"λ ↓ {lambda_coef:.3f}")
