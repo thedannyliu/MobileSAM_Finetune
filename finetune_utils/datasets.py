@@ -2,10 +2,11 @@
 
 import torch
 from torch.utils.data import Dataset
+from torchvision import transforms
+
 import random
 from pathlib import Path
 from PIL import Image
-from torchvision import transforms
 
 
 class ComponentDataset(Dataset):
@@ -43,7 +44,11 @@ class ComponentDataset(Dataset):
         self.image_size = image_size
 
         self.samples = []
-        image_files = list(self.image_dir.glob("*.jpg")) + list(self.image_dir.glob("*.jpeg")) + list(self.image_dir.glob("*.png"))
+        image_files = (
+            list(self.image_dir.glob("*.jpg"))
+            + list(self.image_dir.glob("*.jpeg"))
+            + list(self.image_dir.glob("*.png"))
+        )
 
         for img_path in image_files:
             img_stem = img_path.stem
@@ -58,8 +63,12 @@ class ComponentDataset(Dataset):
         print(f"ComponentDataset: {len(self.samples)} samples, prompt={self.prompt_mode}")
 
         # 用於後續 Resize
-        self.img_resize = transforms.Resize((image_size, image_size), transforms.InterpolationMode.BILINEAR)
-        self.msk_resize = transforms.Resize((image_size, image_size), transforms.InterpolationMode.NEAREST)
+        self.img_resize = transforms.Resize(
+            (image_size, image_size), transforms.InterpolationMode.BILINEAR
+        )
+        self.msk_resize = transforms.Resize(
+            (image_size, image_size), transforms.InterpolationMode.NEAREST
+        )
 
     @staticmethod
     def _morph_close(mask_tensor: torch.Tensor, k: int = 3):
@@ -91,6 +100,30 @@ class ComponentDataset(Dataset):
         if (x_max - x_min) * (y_max - y_min) < 16:
             return torch.zeros(4, dtype=torch.float)
         return torch.tensor([x_min, y_min, x_max, y_max], dtype=torch.float)
+
+    def _jitter_box(self, box: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        """Apply random jitter so the box still covers the object."""
+        if box.sum() == 0:
+            return box
+
+        x_min, y_min, x_max, y_max = box.tolist()
+
+        dx1 = random.randint(-self.max_bbox_shift, self.max_bbox_shift)
+        dy1 = random.randint(-self.max_bbox_shift, self.max_bbox_shift)
+        dx2 = random.randint(-self.max_bbox_shift, self.max_bbox_shift)
+        dy2 = random.randint(-self.max_bbox_shift, self.max_bbox_shift)
+
+        j_xmin = x_min + dx1
+        j_ymin = y_min + dy1
+        j_xmax = x_max + dx2
+        j_ymax = y_max + dy2
+
+        x_min_new = max(0, min(j_xmin, x_min))
+        y_min_new = max(0, min(j_ymin, y_min))
+        x_max_new = min(w - 1, max(j_xmax, x_max))
+        y_max_new = min(h - 1, max(j_ymax, y_max))
+
+        return torch.tensor([x_min_new, y_min_new, x_max_new, y_max_new], dtype=torch.float)
 
     def compute_point_prompts_raw(self, mask_tensor: torch.Tensor):
         """
@@ -137,6 +170,7 @@ class ComponentDataset(Dataset):
 
         if cur_type == "box":
             box_prompt_raw = self.compute_bbox_raw(msk_raw)
+            box_prompt_raw = self._jitter_box(box_prompt_raw, orig_h, orig_w)
         else:
             point_coords_raw, point_labels_raw = self.compute_point_prompts_raw(msk_raw)
 
@@ -145,7 +179,7 @@ class ComponentDataset(Dataset):
         msk_resized = self.msk_resize(msk_pil)
 
         img_tensor = self.transform_image(img_resized)  # [3, 1024,1024]
-        msk_tensor = self.transform_mask(msk_resized)   # [1,1024,1024]
+        msk_tensor = self.transform_mask(msk_resized)  # [1,1024,1024]
         msk_tensor = (msk_tensor > 0.5).float()
 
         # 3. 把 raw prompt 縮放到 1024×1024
@@ -176,19 +210,21 @@ class ComponentDataset(Dataset):
 
         # 4. DEBUG: 隨機小機率印一次 prompt 原始 & 縮放值
         if random.random() < 0.002:
-            print(f"[DBG] idx={idx}, id={meta['id']}, raw_size={(orig_h,orig_w)}, "
-                  f"prompt_type={cur_type}, "
-                  f"box_raw={box_prompt_raw.tolist() if cur_type=='box' else None}, "
-                  f"box_scaled={box_prompt.tolist() if cur_type=='box' else None}, "
-                  f"pt_raw={point_coords_raw[:1].tolist() if cur_type=='point' else None}, "
-                  f"pt_scaled={(point_coords[:1].tolist() if cur_type=='point' else None)}")
+            print(
+                f"[DBG] idx={idx}, id={meta['id']}, raw_size={(orig_h,orig_w)}, "
+                f"prompt_type={cur_type}, "
+                f"box_raw={box_prompt_raw.tolist() if cur_type=='box' else None}, "
+                f"box_scaled={box_prompt.tolist() if cur_type=='box' else None}, "
+                f"pt_raw={point_coords_raw[:1].tolist() if cur_type=='point' else None}, "
+                f"pt_scaled={(point_coords[:1].tolist() if cur_type=='point' else None)}"
+            )
 
         return {
-            "image": img_tensor,                    # [3,1024,1024]
-            "mask": msk_tensor,                     # [1,1024,1024]
+            "image": img_tensor,  # [3,1024,1024]
+            "mask": msk_tensor,  # [1,1024,1024]
             "box_prompt": box_prompt if cur_type == "box" else None,
             "point_coords": point_coords if cur_type == "point" else None,
             "point_labels": point_labels if cur_type == "point" else None,
             "id": meta["id"],
-            "original_size": raw_size,              # (H_raw, W_raw)
+            "original_size": raw_size,  # (H_raw, W_raw)
         }
