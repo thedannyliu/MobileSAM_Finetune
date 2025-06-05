@@ -27,6 +27,7 @@ from finetune_utils.distill_losses import (
 from finetune_utils.feature_hooks import pop_features, register_hooks
 from finetune_utils.visualization import overlay_mask_on_image
 from pathlib import Path
+import yaml
 from tqdm import tqdm
 
 # ─────────────────── logging ───────────────────
@@ -200,16 +201,24 @@ def main():
     dist_cfg = cfg.get("distillation", {})
     use_distillation = dist_cfg.get("enable", False)
     hook_handles = []
-    pot = {"enc": [], "dec": [], "attn": [], "rkd": []}
-    if use_distillation:
-        stype = m_cfg.get("type", "vit_t")
-        if stype == "vit_t":
-            pot["enc"] = ["image_encoder.neck"]
+
+    def _build_pot(model_type: str):
+        p = {"enc": [], "dec": [], "attn": [], "rkd": ["image_encoder.patch_embed"]}
+        if model_type == "vit_t":
+            p["enc"] = ["image_encoder.neck"]
         else:
-            pot["enc"] = [f"image_encoder.blocks.{i}" for i in (9, 10, 11, 12)]
-            pot["dec"] = ["mask_decoder.pre_logits"]
-            pot["attn"] = [f"image_encoder.blocks.{i}.attn" for i in range(12)]
-        pot["rkd"] = ["image_encoder.patch_embed"]
+            p["enc"] = [f"image_encoder.blocks.{i}" for i in (9, 10, 11, 12)]
+            p["dec"] = ["mask_decoder.pre_logits"]
+            p["attn"] = [f"image_encoder.blocks.{i}.attn" for i in range(12)]
+        return p
+
+    pot = _build_pot(m_cfg.get("type", "vit_t"))
+
+    teacher_models = []
+    teacher_pots = {}
+    if use_distillation:
+        use_precomputed = dist_cfg.get("use_precomputed_features", False)
+        stype = m_cfg.get("type", "vit_t")
 
         hook_layers = []
         for name, key in (
@@ -224,6 +233,40 @@ def main():
         if hook_layers:
             hook_handles = register_hooks(student, hook_layers)
             log.info(f"Registered hooks for distillation: {hook_layers}")
+
+        for t in cfg.get("teachers", []):
+            try:
+                with open(t["cfg"], "r") as f:
+                    t_yaml = yaml.safe_load(f)
+                mtype = t_yaml.get("model", {}).get("type", "vit_t")
+            except Exception:
+                mtype = "vit_t"
+            teacher_pots[t["name"]] = _build_pot(mtype)
+
+            if not use_precomputed:
+                ckpt = t.get("checkpoint")
+                if not ckpt or not os.path.exists(ckpt):
+                    log.warning(f"Teacher checkpoint {ckpt} not found; skip {t['name']}")
+                    continue
+                builder = sam_model_registry.get(mtype)
+                if builder is None:
+                    log.warning(f"Unknown teacher model type {mtype}; skip {t['name']}")
+                    continue
+                model_t = builder(checkpoint=ckpt).to(dev).eval()
+                hooks_t = []
+                hook_layers_t = []
+                for name, key in (
+                    ("encoder_matching", "enc"),
+                    ("decoder_matching", "dec"),
+                    ("attention_matching", "attn"),
+                    ("relational_KD", "rkd"),
+                ):
+                    if dist_cfg.get(name, {}).get("enable"):
+                        hook_layers_t += teacher_pots[t["name"]][key]
+                hook_layers_t = sorted(set(hook_layers_t))
+                if hook_layers_t:
+                    hooks_t = register_hooks(model_t, hook_layers_t)
+                teacher_models.append({"name": t["name"], "model": model_t, "hooks": hooks_t, "weight": t["weight"], "type": mtype})
     else:
         log.info("Distillation disabled - no hooks registered")
 
@@ -385,19 +428,31 @@ def main():
                     dist_loss = torch.tensor(0.0, device=dev)
                     if use_distillation and hook_handles:
                         feat_student = pop_features() or {}
-                        base_dir = Path(dist_cfg["precomputed_root"])
+                        use_precomputed = dist_cfg.get("use_precomputed_features", False)
+                        base_dir = Path(dist_cfg.get("precomputed_root", "precomputed"))
+                        teacher_feats = {}
+
+                        if not use_precomputed:
+                            for tinfo in teacher_models:
+                                with torch.no_grad():
+                                    _ = tinfo["model"](batched_input=batched_input, multimask_output=False)
+                                teacher_feats[tinfo["name"]] = pop_features() or {}
 
                         for t_cfg in teacher_cfgs:
                             weight = t_cfg["weight"]
                             tname = t_cfg["name"]
+                            tpot = teacher_pots.get(tname, pot)
 
                             if dist_cfg.get("encoder_matching", {}).get("enable"):
-                                enc_keys = pot["enc"]
+                                enc_keys = tpot["enc"]
                                 if enc_keys:
                                     try:
-                                        feat_teacher = load_cached_npy_features(
-                                            base_dir, tname, "train", ids, enc_keys
-                                        )
+                                        if use_precomputed:
+                                            feat_teacher = load_cached_npy_features(
+                                                base_dir, tname, "train", ids, enc_keys
+                                            )
+                                        else:
+                                            feat_teacher = [teacher_feats[tname][k][0] for k in enc_keys]
                                         enc_loss = encoder_matching_loss(
                                             [feat_student[k] for k in enc_keys],
                                             feat_teacher,
@@ -410,14 +465,17 @@ def main():
 
                             if (
                                 dist_cfg.get("decoder_matching", {}).get("enable")
-                                and pot["dec"]
+                                and tpot["dec"]
                             ):
-                                dk = pot["dec"][0]
+                                dk = tpot["dec"][0]
                                 if dk in feat_student:
                                     try:
-                                        feat_teacher = load_cached_npy_features(
-                                            base_dir, tname, "train", ids, [dk]
-                                        )[0]
+                                        if use_precomputed:
+                                            feat_teacher = load_cached_npy_features(
+                                                base_dir, tname, "train", ids, [dk]
+                                            )[0]
+                                        else:
+                                            feat_teacher = teacher_feats[tname][dk][0]
                                         dec_loss = decoder_matching_loss(
                                             feat_student[dk],
                                             feat_teacher,
@@ -429,29 +487,35 @@ def main():
 
                             if (
                                 dist_cfg.get("attention_matching", {}).get("enable")
-                                and pot["attn"]
+                                and tpot["attn"]
                             ):
                                 try:
-                                    attn_teacher = load_cached_npy_features(
-                                        base_dir, tname, "train", ids, pot["attn"]
-                                    )
+                                    if use_precomputed:
+                                        attn_teacher = load_cached_npy_features(
+                                            base_dir, tname, "train", ids, tpot["attn"]
+                                        )
+                                    else:
+                                        attn_teacher = [teacher_feats[tname][k][0] for k in tpot["attn"]]
                                     attn_loss = attention_matching_loss(
-                                        [feat_student[k] for k in pot["attn"]],
+                                        [feat_student[k] for k in tpot["attn"]],
                                         attn_teacher,
                                         **dist_cfg["attention_matching"],
-                                        n_layers=len(pot["attn"]),
+                                        n_layers=len(tpot["attn"]),
                                     )
                                     dist_loss = dist_loss + weight * attn_loss
                                 except Exception as e:
                                     log.debug(f"Attention matching error: {e}")
 
                             if dist_cfg.get("relational_KD", {}).get("enable"):
-                                rk = pot["rkd"][0]
+                                rk = tpot["rkd"][0]
                                 if rk in feat_student:
                                     try:
-                                        feat_teacher = load_cached_npy_features(
-                                            base_dir, tname, "train", ids, [rk]
-                                        )[0]
+                                        if use_precomputed:
+                                            feat_teacher = load_cached_npy_features(
+                                                base_dir, tname, "train", ids, [rk]
+                                            )[0]
+                                        else:
+                                            feat_teacher = teacher_feats[tname][rk][0]
                                         rkd_loss_val = rkd_loss(
                                             feat_student[rk],
                                             feat_teacher,
@@ -719,6 +783,9 @@ def main():
     finally:
         for h in hook_handles:
             h.remove()
+        for t in teacher_models:
+            for h in t.get("hooks", []):
+                h.remove()
         feature_cache.clear()
         writer.close()
         clear_gpu_cache()
