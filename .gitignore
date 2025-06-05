@@ -5,7 +5,7 @@
 *pth
 __py
 **/__pycache__/
-precomputed
+# precomputed
 logs
 runs
 images
