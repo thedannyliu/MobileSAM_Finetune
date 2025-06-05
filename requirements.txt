@@ -1,0 +1,10 @@
+torch>=1.12.0
+torchvision>=0.13.0
+tensorboard
+packaging
+timm
+tqdm
+black==23.12.1
+isort==5.12.0
+flake8
+mypy
