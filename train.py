@@ -206,6 +206,19 @@ def main():
         p = {"enc": [], "dec": [], "attn": [], "rkd": ["image_encoder.patch_embed"]}
         if model_type == "vit_t":
             p["enc"] = ["image_encoder.neck"]
+            p["dec"] = ["mask_decoder.output_upscaling"]
+            p["attn"] = [
+                "image_encoder.layers.1.blocks.0.attn",
+                "image_encoder.layers.1.blocks.1.attn",
+                "image_encoder.layers.2.blocks.0.attn",
+                "image_encoder.layers.2.blocks.1.attn",
+                "image_encoder.layers.2.blocks.2.attn",
+                "image_encoder.layers.2.blocks.3.attn",
+                "image_encoder.layers.2.blocks.4.attn",
+                "image_encoder.layers.2.blocks.5.attn",
+                "image_encoder.layers.3.blocks.0.attn",
+                "image_encoder.layers.3.blocks.1.attn",
+            ]
         else:
             p["enc"] = [f"image_encoder.blocks.{i}" for i in (9, 10, 11, 12)]
             p["dec"] = ["mask_decoder.pre_logits"]
