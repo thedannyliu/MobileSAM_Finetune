@@ -74,16 +74,11 @@
   },
   "teachers": [
     {
-      "name": "SAM_vitH",
-      "cfg": "configs/mobile_sam_orig.yaml",
-      "checkpoint": "weights/mobile_sam.pt",
-      "weight": 0.7
-    },
-    {
       "name": "MobileSAM_orig",
       "cfg": "configs/mobile_sam_orig.yaml",
       "checkpoint": "weights/mobile_sam.pt",
-      "weight": 0.3
+      "weight": 1.0
     }
   ]
 }
+
