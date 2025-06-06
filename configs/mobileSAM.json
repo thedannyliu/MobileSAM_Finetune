@@ -15,7 +15,7 @@
     "save_path": "./logs"
   },
   "train": {
-    "epochs": 2,
+    "epochs": 1,
     "lr": 1e-5,
     "batch_size": 2,
     "val_freq": 1,
@@ -74,9 +74,9 @@
   },
   "teachers": [
     {
-      "name": "MobileSAM_orig",
-      "cfg": "configs/mobile_sam_orig.yaml",
-      "checkpoint": "weights/mobile_sam.pt",
+      "name": "SAM_vitH",
+      "cfg": "configs/sam_vith.yaml",
+      "checkpoint": "weights/sam_vit_h_4b8939.pth",
       "weight": 1.0
     }
   ]
