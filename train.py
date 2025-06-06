@@ -217,7 +217,13 @@ def main():
     teacher_models = []
     teacher_pots = {}
     if use_distillation:
+        enabled_losses = [n for n in ("encoder_matching", "decoder_matching", "attention_matching", "relational_KD") if dist_cfg.get(n, {}).get("enable")]
+        log.info(
+            f"Distillation enabled. Methods: {', '.join(enabled_losses) if enabled_losses else 'none'}"
+        )
         use_precomputed = dist_cfg.get("use_precomputed_features", False)
+        if use_precomputed:
+            log.info("Using precomputed teacher features")
         stype = m_cfg.get("type", "vit_t")
 
         hook_layers = []
@@ -232,7 +238,7 @@ def main():
         hook_layers = sorted(set(hook_layers))
         if hook_layers:
             hook_handles = register_hooks(student, hook_layers)
-            log.info(f"Registered hooks for distillation: {hook_layers}")
+            log.info(f"Registered hooks for student: {hook_layers}")
 
         for t in cfg.get("teachers", []):
             try:
@@ -267,6 +273,11 @@ def main():
                 if hook_layers_t:
                     hooks_t = register_hooks(model_t, hook_layers_t)
                 teacher_models.append({"name": t["name"], "model": model_t, "hooks": hooks_t, "weight": t["weight"], "type": mtype})
+                log.info(
+                    f"Loaded teacher {t['name']} ({mtype}) with weight {t['weight']}"
+                )
+            else:
+                log.info(f"Using precomputed features for teacher {t['name']}")
     else:
         log.info("Distillation disabled - no hooks registered")
 
@@ -335,6 +346,10 @@ def main():
                 focal = torch.tensor(0.0, device=dev)
                 dice_loss = torch.tensor(0.0, device=dev)
                 dist_loss = torch.tensor(0.0, device=dev)
+                enc_loss_val = torch.tensor(0.0, device=dev)
+                dec_loss_val = torch.tensor(0.0, device=dev)
+                attn_loss_val = torch.tensor(0.0, device=dev)
+                rkd_loss_val = torch.tensor(0.0, device=dev)
                 task_loss = torch.tensor(0.0, device=dev)
                 loss = torch.tensor(0.0, device=dev)
                 #
@@ -428,6 +443,11 @@ def main():
                     dist_loss = torch.tensor(0.0, device=dev)
                     if use_distillation and hook_handles:
                         feat_student = pop_features() or {}
+                        if step % 20 == 0:
+                            log.info(
+                                f"Student features: { {k: [tuple(t.shape) for t in v] for k, v in feat_student.items()} }"
+                            )
+
                         use_precomputed = dist_cfg.get("use_precomputed_features", False)
                         base_dir = Path(dist_cfg.get("precomputed_root", "precomputed"))
                         teacher_feats = {}
@@ -437,6 +457,11 @@ def main():
                                 with torch.no_grad():
                                     _ = tinfo["model"](batched_input=batched_input, multimask_output=False)
                                 teacher_feats[tinfo["name"]] = pop_features() or {}
+                            if step % 20 == 0:
+                                for tn, feats in teacher_feats.items():
+                                    log.info(
+                                        f"Teacher {tn} features: { {k: [tuple(t.shape) for t in v] for k, v in feats.items()} }"
+                                    )
 
                         for t_cfg in teacher_cfgs:
                             weight = t_cfg["weight"]
@@ -459,7 +484,9 @@ def main():
                                             **dist_cfg["encoder_matching"],
                                             n_layers=len(enc_keys),
                                         )
-                                        dist_loss = dist_loss + weight * enc_loss
+                                        enc_loss_val += weight * enc_loss
+                                        if step % 20 == 0:
+                                            log.info(f"enc_loss[{tname}]={enc_loss.item():.4f}")
                                     except Exception as e:
                                         log.debug(f"Encoder matching error: {e}")
 
@@ -481,7 +508,9 @@ def main():
                                             feat_teacher,
                                             **dist_cfg["decoder_matching"],
                                         )
-                                        dist_loss = dist_loss + weight * dec_loss
+                                        dec_loss_val += weight * dec_loss
+                                        if step % 20 == 0:
+                                            log.info(f"dec_loss[{tname}]={dec_loss.item():.4f}")
                                     except Exception as e:
                                         log.debug(f"Decoder matching error: {e}")
 
@@ -502,7 +531,9 @@ def main():
                                         **dist_cfg["attention_matching"],
                                         n_layers=len(tpot["attn"]),
                                     )
-                                    dist_loss = dist_loss + weight * attn_loss
+                                    attn_loss_val += weight * attn_loss
+                                    if step % 20 == 0:
+                                        log.info(f"attn_loss[{tname}]={attn_loss.item():.4f}")
                                 except Exception as e:
                                     log.debug(f"Attention matching error: {e}")
 
@@ -516,15 +547,18 @@ def main():
                                             )[0]
                                         else:
                                             feat_teacher = teacher_feats[tname][rk][0]
-                                        rkd_loss_val = rkd_loss(
+                                        rk_loss = rkd_loss(
                                             feat_student[rk],
                                             feat_teacher,
                                             **dist_cfg["relational_KD"],
                                         )
-                                        dist_loss = dist_loss + weight * rkd_loss_val
+                                        rkd_loss_val += weight * rk_loss
+                                        if step % 20 == 0:
+                                            log.info(f"rkd_loss[{tname}]={rk_loss.item():.4f}")
                                     except Exception as e:
                                         log.debug(f"RKD error: {e}")
 
+                    dist_loss = enc_loss_val + dec_loss_val + attn_loss_val + rkd_loss_val
                     loss = (
                         task_loss + iou_loss + lambda_coef * dist_loss
                     ) / tr_cfg.get("gradient_accumulation", 1)
@@ -555,6 +589,10 @@ def main():
                     focal=f"{focal.item():.3f}",
                     dice=f"{dice_loss.item():.3f}",
                     iou=f"{iou_loss.item():.3f}",
+                    enc=f"{enc_loss_val.item():.3f}",
+                    dec=f"{dec_loss_val.item():.3f}",
+                    attn=f"{attn_loss_val.item():.3f}",
+                    rkd=f"{rkd_loss_val.item():.3f}",
                     dist=f"{dist_loss.item():.3f}",
                     total=f"{loss.item():.3f}",
                     lr=f"{scheduler.get_last_lr()[0]:.2e}",
