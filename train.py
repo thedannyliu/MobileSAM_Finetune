@@ -481,95 +481,115 @@ def main():
                             tname = t_cfg["name"]
                             tpot = teacher_pots.get(tname, pot)
 
+                            def _get_loss_params(config_dict, rename_map=None):
+                                params = {k: v for k, v in config_dict.items() if k != "enable"}
+                                if rename_map:
+                                    for old_key, new_key in rename_map.items():
+                                        if old_key in params:
+                                            params[new_key] = params.pop(old_key)
+                                return params
+
                             if dist_cfg.get("encoder_matching", {}).get("enable"):
-                                enc_keys = tpot["enc"]
-                                if enc_keys:
+                                enc_keys_s = pot.get("enc", [])
+                                enc_keys_t = tpot.get("enc", [])
+                                
+                                if enc_keys_s and enc_keys_t and all(k in feat_student for k in enc_keys_s):
                                     try:
+                                        num_layers_to_compare = len(enc_keys_s)
+                                        selected_enc_keys_t = enc_keys_t[-num_layers_to_compare:]
+
                                         if use_precomputed:
                                             feat_teacher = load_cached_npy_features(
-                                                base_dir, tname, "train", ids, enc_keys
+                                                base_dir, tname, "train", ids, selected_enc_keys_t
                                             )
                                         else:
-                                            feat_teacher = [teacher_feats[tname][k][0] for k in enc_keys]
+                                            feat_teacher = [teacher_feats[tname][k][0] for k in selected_enc_keys_t]
+
                                         enc_loss = encoder_matching_loss(
-                                            [feat_student[k] for k in enc_keys],
+                                            [feat_student[k][0] for k in enc_keys_s],
                                             feat_teacher,
-                                            **dist_cfg["encoder_matching"],
-                                            n_layers=len(enc_keys),
+                                            **_get_loss_params(dist_cfg["encoder_matching"]),
+                                            n_layers=num_layers_to_compare,
                                         )
                                         enc_loss_val += weight * enc_loss
                                         if step % 20 == 0:
                                             log.info(f"enc_loss[{tname}]={enc_loss.item():.4f}")
                                     except Exception as e:
-                                        log.debug(f"Encoder matching error: {e}")
+                                        log.warning(f"Encoder matching error for teacher {tname}: {e}")
 
-                            if (
-                                dist_cfg.get("decoder_matching", {}).get("enable")
-                                and tpot["dec"]
-                            ):
-                                dk = tpot["dec"][0]
-                                if dk in feat_student:
+                            if dist_cfg.get("decoder_matching", {}).get("enable"):
+                                dec_keys_s = pot.get("dec", [])
+                                dec_keys_t = tpot.get("dec", [])
+                                if dec_keys_s and dec_keys_t and all(k in feat_student for k in dec_keys_s) and dec_keys_t[0] in teacher_feats.get(tname, {}):
                                     try:
                                         if use_precomputed:
                                             feat_teacher = load_cached_npy_features(
-                                                base_dir, tname, "train", ids, [dk]
+                                                base_dir, tname, "train", ids, dec_keys_t
                                             )[0]
                                         else:
-                                            feat_teacher = teacher_feats[tname][dk][0]
+                                            feat_teacher = teacher_feats[tname][dec_keys_t[0]][0]
+
                                         dec_loss = decoder_matching_loss(
-                                            feat_student[dk],
+                                            feat_student[dec_keys_s[0]][0],
                                             feat_teacher,
-                                            **dist_cfg["decoder_matching"],
+                                            **_get_loss_params(dist_cfg["decoder_matching"]),
                                         )
                                         dec_loss_val += weight * dec_loss
                                         if step % 20 == 0:
                                             log.info(f"dec_loss[{tname}]={dec_loss.item():.4f}")
                                     except Exception as e:
-                                        log.debug(f"Decoder matching error: {e}")
+                                        log.warning(f"Decoder matching error for teacher {tname}: {e}")
 
-                            if (
-                                dist_cfg.get("attention_matching", {}).get("enable")
-                                and tpot["attn"]
-                            ):
-                                try:
-                                    if use_precomputed:
-                                        attn_teacher = load_cached_npy_features(
-                                            base_dir, tname, "train", ids, tpot["attn"]
+                            if dist_cfg.get("attention_matching", {}).get("enable"):
+                                attn_keys_s = pot.get("attn", [])
+                                attn_keys_t = tpot.get("attn", [])
+                                
+                                if attn_keys_s and attn_keys_t and all(k in feat_student for k in attn_keys_s):
+                                    try:
+                                        num_layers_to_compare = len(attn_keys_s)
+                                        selected_attn_keys_t = attn_keys_t[-num_layers_to_compare:]
+
+                                        if use_precomputed:
+                                            attn_teacher = load_cached_npy_features(
+                                                base_dir, tname, "train", ids, selected_attn_keys_t
+                                            )
+                                        else:
+                                            attn_teacher = [teacher_feats[tname][k][0] for k in selected_attn_keys_t]
+                                        
+                                        attn_loss = attention_matching_loss(
+                                            [feat_student[k][0] for k in attn_keys_s],
+                                            attn_teacher,
+                                            **_get_loss_params(dist_cfg["attention_matching"], {"lambda": "lambda_attn"}),
+                                            n_layers=num_layers_to_compare,
                                         )
-                                    else:
-                                        attn_teacher = [teacher_feats[tname][k][0] for k in tpot["attn"]]
-                                    attn_loss = attention_matching_loss(
-                                        [feat_student[k] for k in tpot["attn"]],
-                                        attn_teacher,
-                                        **dist_cfg["attention_matching"],
-                                        n_layers=len(tpot["attn"]),
-                                    )
-                                    attn_loss_val += weight * attn_loss
-                                    if step % 20 == 0:
-                                        log.info(f"attn_loss[{tname}]={attn_loss.item():.4f}")
-                                except Exception as e:
-                                    log.debug(f"Attention matching error: {e}")
+                                        attn_loss_val += weight * attn_loss
+                                        if step % 20 == 0:
+                                            log.info(f"attn_loss[{tname}]={attn_loss.item():.4f}")
+                                    except Exception as e:
+                                        log.warning(f"Attention matching error for teacher {tname}: {e}")
 
                             if dist_cfg.get("relational_KD", {}).get("enable"):
-                                rk = tpot["rkd"][0]
-                                if rk in feat_student:
+                                rk_keys_s = pot.get("rkd", [])
+                                rk_keys_t = tpot.get("rkd", [])
+                                if rk_keys_s and rk_keys_t and all(k in feat_student for k in rk_keys_s) and rk_keys_t[0] in teacher_feats.get(tname, {}):
                                     try:
                                         if use_precomputed:
                                             feat_teacher = load_cached_npy_features(
-                                                base_dir, tname, "train", ids, [rk]
+                                                base_dir, tname, "train", ids, rk_keys_t
                                             )[0]
                                         else:
-                                            feat_teacher = teacher_feats[tname][rk][0]
+                                            feat_teacher = teacher_feats[tname][rk_keys_t[0]][0]
+                                        
                                         rk_loss = rkd_loss(
-                                            feat_student[rk],
+                                            feat_student[rk_keys_s[0]][0],
                                             feat_teacher,
-                                            **dist_cfg["relational_KD"],
+                                            **_get_loss_params(dist_cfg["relational_KD"], {"lambda": "lambda_rkd"}),
                                         )
                                         rkd_loss_val += weight * rk_loss
                                         if step % 20 == 0:
                                             log.info(f"rkd_loss[{tname}]={rk_loss.item():.4f}")
                                     except Exception as e:
-                                        log.debug(f"RKD error: {e}")
+                                        log.warning(f"RKD error for teacher {tname}: {e}")
 
                     dist_loss = enc_loss_val + dec_loss_val + attn_loss_val + rkd_loss_val
                     loss = (

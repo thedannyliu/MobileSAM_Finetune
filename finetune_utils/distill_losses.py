@@ -11,6 +11,13 @@ import torch.nn.functional as F
 from torch import Tensor
 
 # ─── helper ───
+def _permute_if_channel_last(t: Tensor) -> Tensor:
+    if t.ndim == 4:
+        # Heuristic: if the last dim is much larger than spatial dims, it's probably channels.
+        if t.shape[3] > t.shape[1] and t.shape[3] > t.shape[2]:
+            return t.permute(0, 3, 1, 2)
+    return t
+
 def _interpolate_if_needed(src: Tensor, ref: Tensor) -> Tensor:
     if src.ndim == 5:
         src = src.mean(1)
@@ -57,6 +64,11 @@ def encoder_matching_loss(
     mse_tot, kl_tot = 0.0, 0.0
     for fs_raw, ft in zip(feats_s, feats_t):
         fs = _stack(fs_raw)
+        
+        # Permute if teacher feature seems to be channel-last
+        if ft.ndim == 4 and fs.ndim == 4 and ft.shape[1:3] == fs.shape[2:4]:
+            ft = ft.permute(0, 3, 1, 2)  # B, H, W, C -> B, C, H, W
+
         ft = _interpolate_if_needed(ft, fs)
         b = min(fs.size(0), ft.size(0))
         fs, ft = fs[:b], ft[:b]
@@ -78,6 +90,11 @@ def decoder_matching_loss(
     temperature=1.0,
 ) -> Tensor:
     fs = _stack(feat_s_raw)
+
+    # Permute if teacher feature seems to be channel-last
+    if feat_t.ndim == 4 and fs.ndim == 4 and feat_t.shape[1:3] == fs.shape[2:4]:
+        feat_t = feat_t.permute(0, 3, 1, 2)  # B, H, W, C -> B, C, H, W
+
     ft = _interpolate_if_needed(feat_t, fs)
     b = min(fs.size(0), ft.size(0))
     fs, ft = fs[:b], ft[:b]
@@ -100,13 +117,28 @@ def attention_matching_loss(
     n_layers: int = 1,
 ) -> Tensor:
     loss = 0.0
-    for as_raw, at in zip(attn_s, attn_t):
+    for as_raw, at_raw in zip(attn_s, attn_t):
         as_ = _stack(as_raw)
-        b = min(as_.size(0), at.size(0))
-        as_, at = as_[:b], at[:b]
-        ps = F.log_softmax(as_ / temperature, dim=-1)
-        pt = F.softmax(at / temperature, dim=-1)
-        loss += F.kl_div(ps, pt, reduction="batchmean") * temperature ** 2
+        at_ = _stack(at_raw)
+        
+        # Reshape to be 4D-compatible for interpolation and channel matching
+        if as_.ndim == 3: as_ = as_.permute(0, 2, 1).unsqueeze(-1)
+        if at_.ndim == 3: at_ = at_.permute(0, 2, 1).unsqueeze(-1)
+
+        at_ = _interpolate_if_needed(at_, as_)
+        
+        b = min(as_.size(0), at_.size(0))
+        as_, at_ = as_[:b], at_[:b]
+        
+        at_ = _match_channels(at_, as_)
+        
+        ps = F.log_softmax(as_.flatten(1) / temperature, dim=-1)
+        pt = F.softmax(at_.flatten(1) / temperature, dim=-1)
+
+        if ps.shape != pt.shape:
+            continue
+
+        loss += F.kl_div(ps, pt, reduction="batchmean") * (temperature ** 2)
     return lambda_attn * loss / max(1, n_layers)
 
 # ─── 4. Relational KD ───
@@ -120,9 +152,21 @@ def rkd_loss(
     dist_factor=1.0,
     angle_factor=2.0,
 ) -> Tensor:
-    es, et = _gap(embed_s_raw), _gap(embed_t_raw)
+    es_raw, et_raw = _stack(embed_s_raw), _stack(embed_t_raw)
+    
+    es_p = _permute_if_channel_last(es_raw)
+    et_p = _permute_if_channel_last(et_raw)
+
+    es, et = _gap(es_p), _gap(et_p)
     b = min(es.size(0), et.size(0))
     es, et = es[:b], et[:b]
+
+    if es.shape[1] != et.shape[1]:
+        et_4d = et.unsqueeze(-1).unsqueeze(-1)
+        es_4d = es.unsqueeze(-1).unsqueeze(-1)
+        et_matched_4d = _match_channels(et_4d, es_4d)
+        et = et_matched_4d.squeeze(-1).squeeze(-1)
+
     if es.size(0) < 2:
         return es.new_tensor(0.0)
 

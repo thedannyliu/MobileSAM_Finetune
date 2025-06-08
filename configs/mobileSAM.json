@@ -15,12 +15,12 @@
     "save_path": "./logs"
   },
   "train": {
-    "epochs": 1,
+    "epochs": 1000,
     "lr": 1e-5,
     "batch_size": 2,
     "val_freq": 1,
     "gradient_accumulation": 1,
-    "bf16": false,
+    "bf16": true,
     "warmup_step": 250,
     "min_lr_ratio": 0.0,
     "resume": false,
@@ -36,7 +36,7 @@
     "freeze_image_encoder": false,
     "freeze_prompt_encoder": false,
     "freeze_mask_decoder": false,
-    "unfreeze_epoch": 0
+    "unfreeze_epoch": 10
   },
   "distillation": {
     "enable": true,
@@ -77,8 +77,13 @@
       "name": "SAM_vitH",
       "cfg": "configs/sam_vith.yaml",
       "checkpoint": "weights/sam_vit_h_4b8939.pth",
-      "weight": 1.0
+      "weight": 0.5
+    },
+    {
+      "name": "MobileSAM_orig",
+      "cfg": "configs/mobile_sam_orig.yaml",
+      "checkpoint": "weights/mobile_sam.pt",
+      "weight": 0.5
     }
   ]
 }
-
