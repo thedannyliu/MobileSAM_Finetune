@@ -159,41 +159,17 @@ class PromptEncoder(nn.Module):
 
         Returns:
           torch.Tensor: sparse embeddings for the points and boxes, with shape
-            BxNx(embed_dim), where N is determined by the number of input points
-            and boxes.
-          torch.Tensor: dense embeddings for the masks, in the shape
-            Bx(embed_dim)x(embed_H)x(embed_W)
+            BxNxC.
+          torch.Tensor: dense embeddings for the masks, with shape Bx(embed_dim)x(embed_h)x(embed_w)
         """
-        # ---- MODIFICATION START: Determine batch size correctly ----
-        # When called from Sam.forward (which iterates through a batch of images one by one),
-        # the effective batch size for this specific call to prompt_encoder.forward should be 1.
-        # The original calculation of 'bs' based on points[0].shape[0] or boxes.shape[0]
-        # was using the number of points or boxes as the batch size, which is incorrect here.
-        
-        # A more robust way to determine 'bs' if PromptEncoder could be called with
-        # already batched inputs (e.g. points[0] is (B,N,2)) or per-image inputs ((N,2)).
-        # For now, assuming per-image call from Sam.forward.
-        current_bs = 1 
-        # Example of how to handle potentially pre-batched inputs to PromptEncoder itself:
-        # if points is not None and points[0].ndim == 3: # (B, N, 2)
-        #     current_bs = points[0].shape[0]
-        # elif boxes is not None and boxes.ndim == 3: # (B, K, 4)
-        #     current_bs = boxes.shape[0]
-        # elif masks is not None and masks.ndim == 4: # (B, M, H, W) for sparse, or (B, C, H, W) for dense
-        #     current_bs = masks.shape[0] # This bs is more for dense masks
-        # else:
-        #     current_bs = 1 # Default for single image processing or no prompts
-        # ---- MODIFICATION END ----
-
-        # Initialize sparse_embeddings with the corrected batch size
-        sparse_embeddings = torch.empty((current_bs, 0, self.embed_dim), device=self._get_device())
-
+        bs = self._get_batch_size(points, boxes, masks)
+        sparse_embeddings = torch.empty(
+            (bs, 0, self.embed_dim), device=self._get_device(), dtype=next(self.parameters()).dtype
+        )
         if points is not None:
-            coords_torch, labels_torch = points
-            # _embed_points was modified to return (1, N_padded, embed_dim)
-            # which matches current_bs = 1
-            point_embeddings = self._embed_points(coords_torch, labels_torch, pad=(boxes is None))
-            sparse_embeddings = torch.cat([sparse_embeddings, point_embeddings], dim=1)
+            coords, labels = points
+            point_embedding = self._embed_points(coords, labels, pad=(boxes is None))
+            sparse_embeddings = torch.cat([sparse_embeddings, point_embedding], dim=1)
 
         if boxes is not None:
             # _embed_boxes needs to return (current_bs, K*2, embed_dim) or similar for concatenation
@@ -201,19 +177,19 @@ class PromptEncoder(nn.Module):
             box_embeddings_raw = self._embed_boxes(boxes) # (K, 2, embed_dim)
             
             # ---- MODIFICATION START: Reshape box_embeddings for cat ----
-            if box_embeddings_raw.ndim == 3 and current_bs == 1: # (K, 2, C) -> (1, K*2, C)
+            if box_embeddings_raw.ndim == 3 and bs == 1: # (K, 2, C) -> (1, K*2, C)
                 num_boxes = box_embeddings_raw.shape[0]
-                box_embeddings = box_embeddings_raw.reshape(current_bs, num_boxes * 2, self.embed_dim)
-            elif box_embeddings_raw.ndim == 3 and box_embeddings_raw.shape[0] == current_bs : # (B, K_x_2, C) - if _embed_boxes was changed to be batch-aware
+                box_embeddings = box_embeddings_raw.reshape(bs, num_boxes * 2, self.embed_dim)
+            elif box_embeddings_raw.ndim == 3 and box_embeddings_raw.shape[0] == bs : # (B, K_x_2, C) - if _embed_boxes was changed to be batch-aware
                 box_embeddings = box_embeddings_raw # Assuming already (B, Seq, C)
             else:
                 # Fallback or error for unexpected shapes
-                # For now, assume current_bs=1 and reshape
+                # For now, assume bs=1 and reshape
                 num_boxes = box_embeddings_raw.shape[0] # K
                 box_embeddings = box_embeddings_raw.reshape(1, num_boxes * 2, self.embed_dim)
-                if current_bs != 1:
-                     print(f"Warning: box_embeddings batch size mismatch. Expected {current_bs}, got 1 after reshape. Expanding.")
-                     box_embeddings = box_embeddings.expand(current_bs, -1, -1) # Try to expand if bs > 1
+                if bs != 1:
+                     print(f"Warning: box_embeddings batch size mismatch. Expected {bs}, got 1 after reshape. Expanding.")
+                     box_embeddings = box_embeddings.expand(bs, -1, -1) # Try to expand if bs > 1
             # ---- MODIFICATION END ----
             sparse_embeddings = torch.cat([sparse_embeddings, box_embeddings], dim=1)
 
@@ -221,8 +197,8 @@ class PromptEncoder(nn.Module):
         if sparse_embeddings.shape[1] == 0: # Check if any prompts were added
             # self.no_mask_embed.weight is (1, embed_dim)
             no_mask_embedding = self.no_mask_embed.weight.reshape(1, 1, self.embed_dim)
-            if current_bs > 1:
-                no_mask_embedding = no_mask_embedding.expand(current_bs, -1, -1)
+            if bs > 1:
+                no_mask_embedding = no_mask_embedding.expand(bs, -1, -1)
             sparse_embeddings = torch.cat([sparse_embeddings, no_mask_embedding], dim=1)
 
 
@@ -230,7 +206,7 @@ class PromptEncoder(nn.Module):
             dense_embeddings = self._embed_masks(masks)
         else:
             dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
-                current_bs, 
+                bs, 
                 -1, 
                 self.image_embedding_size[0], # 使用元組的第一個元素 (高度)
                 self.image_embedding_size[1]  # 使用元組的第二個元素 (寬度)
@@ -265,8 +241,9 @@ class PositionEmbeddingRandom(nn.Module):
     def forward(self, size: Tuple[int, int]) -> torch.Tensor:
         """Generate positional encoding for a grid of the specified size."""
         h, w = size
-        device: Any = self.positional_encoding_gaussian_matrix.device
-        grid = torch.ones((h, w), device=device, dtype=torch.float32)
+        device = self.positional_encoding_gaussian_matrix.device
+        dtype = self.positional_encoding_gaussian_matrix.dtype
+        grid = torch.ones((h, w), device=device, dtype=dtype)
         y_embed = grid.cumsum(dim=0) - 0.5
         x_embed = grid.cumsum(dim=1) - 0.5
         y_embed = y_embed / h
