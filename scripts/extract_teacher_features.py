@@ -26,17 +26,19 @@ python scripts/extract_teacher_features.py \
     --splits train val
 """
 
-import argparse
-import pathlib
 import numpy as np
 import torch
+import torchvision.transforms as T
+
+from mobile_sam import sam_model_registry
+
+import argparse
+import pathlib
 import yaml
+from finetune_utils.feature_hooks import pop_features, register_hooks
 from PIL import Image
 from tqdm import tqdm
 
-import torchvision.transforms as T
-from finetune_utils.feature_hooks import pop_features, register_hooks
-from mobile_sam import sam_model_registry
 
 # This function is a direct copy from `train.py` to ensure consistency.
 def _build_pot(model_type: str):
@@ -56,9 +58,11 @@ def _build_pot(model_type: str):
             "image_encoder.layers.3.blocks.0.attn",
             "image_encoder.layers.3.blocks.1.attn",
         ]
-    else: # vit_b, vit_l, vit_h
+    else:  # vit_b, vit_l, vit_h
         p["enc"] = [f"image_encoder.blocks.{i}" for i in (9, 10, 11, 12)]
-        p["dec"] = ["mask_decoder.pre_logits"] # Note: This layer might not exist in all models, hook will fail gracefully.
+        # Official SAM models do not expose `pre_logits`; reuse output_upscaling
+        # for decoder matching to avoid missing features.
+        p["dec"] = ["mask_decoder.output_upscaling"]
         p["attn"] = [f"image_encoder.blocks.{i}.attn" for i in range(12)]
     return p
 
@@ -106,7 +110,7 @@ def process_images_in_dir(
                 img_tensor = img_tensor.half()
 
             batched_item = {
-                "image": img_tensor, # Do NOT add batch dimension, model.forward will do it.
+                "image": img_tensor,  # Do NOT add batch dimension, model.forward will do it.
                 "original_size": (original_h, original_w),
             }
 
@@ -118,7 +122,9 @@ def process_images_in_dir(
 
             feats = pop_features()
             if not feats:
-                print(f"Warning: No features were captured for image {p.name}. Check if `capture_targets` are correct for the model.")
+                print(
+                    f"Warning: No features were captured for image {p.name}. Check if `capture_targets` are correct for the model."
+                )
                 continue
 
             for key, captured_list_of_features in feats.items():
@@ -131,13 +137,18 @@ def process_images_in_dir(
                         feature_save_path = output_dir / feature_filename
                         np.save(feature_save_path, numpy_feature)
                     else:
-                        print(f"Warning: Captured item for key '{key}' is not a tensor for image {p.name}.")
+                        print(
+                            f"Warning: Captured item for key '{key}' is not a tensor for image {p.name}."
+                        )
                 else:
-                    print(f"Warning: No features captured in the list for key '{key}' for image {p.name}.")
+                    print(
+                        f"Warning: No features captured in the list for key '{key}' for image {p.name}."
+                    )
 
         except Exception as e:
             print(f"Critical error processing file {p.name}: {e}")
             import traceback
+
             traceback.print_exc()
 
     for h in handles:
@@ -146,28 +157,67 @@ def process_images_in_dir(
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Extract features from a teacher model for specified dataset splits.")
-    ap.add_argument("--teacher_name", required=True, help="Name of the teacher model (e.g., 'SAM_vitH', 'MobileSAM_orig').")
-    ap.add_argument("--teacher_cfg", required=True, help="Path to the teacher model's YAML configuration file.")
-    ap.add_argument("--teacher_ckpt", required=True, help="Path to the teacher model's checkpoint file.")
-    ap.add_argument("--dataset_base_dir", required=True, type=pathlib.Path, help="Base directory for the datasets (e.g., './datasets').")
-    ap.add_argument("--output_base_dir", required=True, type=pathlib.Path, help="Base directory for saving precomputed features. A subdirectory with `teacher_name` will be created here.")
-    ap.add_argument("--splits", nargs='+', default=['train', 'val'], help="List of dataset splits to process (e.g., 'train' 'val'). Default: ['train', 'val']")
-    ap.add_argument("--image_subdir_name", default="image", help="Subdirectory name under each split containing images. Default: 'image'")
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use for computation. Default: 'cuda' if available, else 'cpu'")
-    ap.add_argument("--fp16", action="store_true", help="Use half-precision (FP16) for inference to reduce memory usage.")
+    ap = argparse.ArgumentParser(
+        description="Extract features from a teacher model for specified dataset splits."
+    )
+    ap.add_argument(
+        "--teacher_name",
+        required=True,
+        help="Name of the teacher model (e.g., 'SAM_vitH', 'MobileSAM_orig').",
+    )
+    ap.add_argument(
+        "--teacher_cfg", required=True, help="Path to the teacher model's YAML configuration file."
+    )
+    ap.add_argument(
+        "--teacher_ckpt", required=True, help="Path to the teacher model's checkpoint file."
+    )
+    ap.add_argument(
+        "--dataset_base_dir",
+        required=True,
+        type=pathlib.Path,
+        help="Base directory for the datasets (e.g., './datasets').",
+    )
+    ap.add_argument(
+        "--output_base_dir",
+        required=True,
+        type=pathlib.Path,
+        help="Base directory for saving precomputed features. A subdirectory with `teacher_name` will be created here.",
+    )
+    ap.add_argument(
+        "--splits",
+        nargs="+",
+        default=["train", "val"],
+        help="List of dataset splits to process (e.g., 'train' 'val'). Default: ['train', 'val']",
+    )
+    ap.add_argument(
+        "--image_subdir_name",
+        default="image",
+        help="Subdirectory name under each split containing images. Default: 'image'",
+    )
+    ap.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to use for computation. Default: 'cuda' if available, else 'cpu'",
+    )
+    ap.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Use half-precision (FP16) for inference to reduce memory usage.",
+    )
     args = ap.parse_args()
 
-    with open(args.teacher_cfg, 'r') as f:
+    with open(args.teacher_cfg, "r") as f:
         teacher_config = yaml.safe_load(f)
 
-    model_config_dict = teacher_config.get('model')
+    model_config_dict = teacher_config.get("model")
     if model_config_dict is None:
         raise ValueError(f"Error: 'model' key not found in the teacher config: {args.teacher_cfg}")
 
-    model_type = model_config_dict.get('type')
+    model_type = model_config_dict.get("type")
     if model_type is None:
-        raise ValueError(f"Error: 'type' not found under 'model' key in the teacher config: {args.teacher_cfg}")
+        raise ValueError(
+            f"Error: 'type' not found under 'model' key in the teacher config: {args.teacher_cfg}"
+        )
 
     # Use the same logic as train.py to determine which features to capture.
     pot = _build_pot(model_type)
@@ -175,25 +225,31 @@ def main():
     print(f"Model type '{model_type}' requires capturing {len(capture_targets)} feature layers.")
     print("Capture targets:", capture_targets)
 
-
     try:
         model_builder = sam_model_registry[model_type]
     except KeyError:
-        raise ValueError(f"Error: Unsupported 'model_type' ('{model_type}') in {args.teacher_cfg}. Available: {list(sam_model_registry.keys())}")
+        raise ValueError(
+            f"Error: Unsupported 'model_type' ('{model_type}') in {args.teacher_cfg}. Available: {list(sam_model_registry.keys())}"
+        )
 
-    print(f"Building model '{model_type}' with checkpoint '{args.teacher_ckpt}' for teacher '{args.teacher_name}'")
+    print(
+        f"Building model '{model_type}' with checkpoint '{args.teacher_ckpt}' for teacher '{args.teacher_name}'"
+    )
     model = model_builder(checkpoint=args.teacher_ckpt).to(args.device).eval()
 
     if args.fp16:
-        if args.device == 'cuda':
+        if args.device == "cuda":
             print("-> Using half-precision (FP16) for inference.")
             model.half()
         else:
-            print("Warning: --fp16 was specified, but device is not 'cuda'. FP16 is only supported on CUDA devices. Ignoring.")
+            print(
+                "Warning: --fp16 was specified, but device is not 'cuda'. FP16 is only supported on CUDA devices. Ignoring."
+            )
 
-    # The model's internal `preprocess` method will handle normalization.
-    # We only need to convert PIL image to a tensor.
-    transform = T.Compose([T.ToTensor()])
+    # Resize images to the same size used during training to ensure that
+    # precomputed features match the online pipeline.
+    img_size = model_config_dict.get("image_size", 1024)
+    transform = T.Compose([T.Resize((img_size, img_size)), T.ToTensor()])
 
     # The output directory will be named after the teacher
     output_root_path = args.output_base_dir
@@ -202,7 +258,7 @@ def main():
         print(f"\nProcessing split: {split_name}")
         image_dir_path = args.dataset_base_dir / split_name / args.image_subdir_name
         split_output_dir = output_root_path / split_name
-        
+
         process_images_in_dir(
             model=model,
             image_dir_path=image_dir_path,

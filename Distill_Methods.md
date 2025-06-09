@@ -42,7 +42,7 @@ The distillation pipeline supports two teachers: **MobileSAM_orig** (a TinyViT b
 | Loss Type | MobileSAM_orig Layers | SAM-H Layers |
 |-----------|----------------------|--------------|
 | **Encoder Matching** | `image_encoder.neck` | `image_encoder.blocks.[9,10,11,12]` |
-| **Decoder Matching** | `mask_decoder.output_upscaling` | `mask_decoder.pre_logits` |
+| **Decoder Matching** | `mask_decoder.output_upscaling` | `mask_decoder.output_upscaling` |
 | **Attention Matching** | 10 attention maps from `image_encoder.layers.[1-3]` | all 12 attention maps from `image_encoder.blocks.[0-11]` |
 | **Relational KD** | `image_encoder.patch_embed` | `image_encoder.patch_embed` |
 

@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import traceback
+import yaml
 from finetune_utils.datasets import ComponentDataset
 from finetune_utils.distill_losses import (
     attention_matching_loss,
@@ -27,7 +28,6 @@ from finetune_utils.distill_losses import (
 from finetune_utils.feature_hooks import pop_features, register_hooks
 from finetune_utils.visualization import overlay_mask_on_image
 from pathlib import Path
-import yaml
 from tqdm import tqdm
 
 # ─────────────────── logging ───────────────────
@@ -43,9 +43,7 @@ def log_gpu_memory(step_name=""):
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1024**3
         cached = torch.cuda.memory_reserved() / 1024**3
-        log.info(
-            f"{step_name} GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB"
-        )
+        log.info(f"{step_name} GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB")
 
 
 def clear_gpu_cache():
@@ -68,8 +66,7 @@ class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
         prog = (cur - self.warmup) / max(1, (self.total - self.warmup))
         cos = 0.5 * (1 + np.cos(np.pi * prog))
         return [
-            base_lr * (self.min_ratio + (1 - self.min_ratio) * cos)
-            for base_lr in self.base_lrs
+            base_lr * (self.min_ratio + (1 - self.min_ratio) * cos) for base_lr in self.base_lrs
         ]
 
 
@@ -106,18 +103,12 @@ feature_cache = MemoryEfficientFeatureCache()
 def load_cached_npy_features(
     base: Path, teacher: str, split: str, stems: list[str], keys: list[str]
 ):
-    feats = []
+    stacked = {k: [] for k in keys}
     for stem in stems:
-        this_img = []
         for k in keys:
-            fname = (
-                f"{stem}_{k.replace('.', '_').replace('[', '_').replace(']', '')}.npy"
-            )
-            this_img.append(feature_cache.get(base / teacher / split / fname))
-        feats.append(torch.stack(this_img))
-    return [
-        torch.stack([feats[b][i] for b in range(len(stems))]) for i in range(len(keys))
-    ]
+            fname = f"{stem}_{k.replace('.', '_').replace('[', '_').replace(']', '')}.npy"
+            stacked[k].append(feature_cache.get(base / teacher / split / fname))
+    return [torch.stack(stacked[k]) for k in keys]
 
 
 def _parse_hw(x):
@@ -221,7 +212,9 @@ def main():
             ]
         else:
             p["enc"] = [f"image_encoder.blocks.{i}" for i in (9, 10, 11, 12)]
-            p["dec"] = ["mask_decoder.pre_logits"]
+            # Some official SAM models do not expose `pre_logits`. Fallback to
+            # `output_upscaling` which exists in all variants.
+            p["dec"] = ["mask_decoder.output_upscaling"]
             p["attn"] = [f"image_encoder.blocks.{i}.attn" for i in range(12)]
         return p
 
@@ -230,7 +223,11 @@ def main():
     teacher_models = []
     teacher_pots = {}
     if use_distillation:
-        enabled_losses = [n for n in ("encoder_matching", "decoder_matching", "attention_matching", "relational_KD") if dist_cfg.get(n, {}).get("enable")]
+        enabled_losses = [
+            n
+            for n in ("encoder_matching", "decoder_matching", "attention_matching", "relational_KD")
+            if dist_cfg.get(n, {}).get("enable")
+        ]
         log.info(
             f"Distillation enabled. Methods: {', '.join(enabled_losses) if enabled_losses else 'none'}"
         )
@@ -285,10 +282,16 @@ def main():
                 hook_layers_t = sorted(set(hook_layers_t))
                 if hook_layers_t:
                     hooks_t = register_hooks(model_t, hook_layers_t)
-                teacher_models.append({"name": t["name"], "model": model_t, "hooks": hooks_t, "weight": t["weight"], "type": mtype})
-                log.info(
-                    f"Loaded teacher {t['name']} ({mtype}) with weight {t['weight']}"
+                teacher_models.append(
+                    {
+                        "name": t["name"],
+                        "model": model_t,
+                        "hooks": hooks_t,
+                        "weight": t["weight"],
+                        "type": mtype,
+                    }
                 )
+                log.info(f"Loaded teacher {t['name']} ({mtype}) with weight {t['weight']}")
             else:
                 log.info(f"Using precomputed features for teacher {t['name']}")
     else:
@@ -380,12 +383,8 @@ def main():
                     if batch["box_prompt"][i] is not None:
                         entry["boxes"] = batch["box_prompt"][i].to(dev).unsqueeze(0)
                     if batch["point_coords"][i] is not None:
-                        entry["point_coords"] = (
-                            batch["point_coords"][i].to(dev).unsqueeze(0)
-                        )
-                        entry["point_labels"] = (
-                            batch["point_labels"][i].to(dev).unsqueeze(0)
-                        )
+                        entry["point_coords"] = batch["point_coords"][i].to(dev).unsqueeze(0)
+                        entry["point_labels"] = batch["point_labels"][i].to(dev).unsqueeze(0)
 
                     if step % 200 == 0 and i == 0:
                         boxes = entry.get("boxes", None)
@@ -401,10 +400,8 @@ def main():
                         )
 
                     batched_input.append(entry)
-                    
-                with autocast(
-                    dtype=torch.bfloat16 if tr_cfg.get("bf16", False) else torch.float16
-                ):
+
+                with autocast(dtype=torch.bfloat16 if tr_cfg.get("bf16", False) else torch.float16):
                     out = student(batched_input=batched_input, multimask_output=True)
 
                     mask_list = []
@@ -417,9 +414,7 @@ def main():
                             align_corners=False,
                         ).squeeze(0)
                         mask_list.append(mask_up)
-                        iou_list.append(
-                            o["iou_predictions"].squeeze(0).to(torch.float32)
-                        )
+                        iou_list.append(o["iou_predictions"].squeeze(0).to(torch.float32))
 
                     pred_masks = torch.stack(mask_list, dim=0)
                     pred_ious = torch.stack(iou_list, dim=0)
@@ -443,11 +438,7 @@ def main():
                         for b in range(pred_masks.shape[0]):
                             preds_bin = (torch.sigmoid(pred_masks[b]) > 0.5).float()
                             inter = (preds_bin * gt_bin[b]).sum((-2, -1))
-                            union = (
-                                preds_bin.sum((-2, -1))
-                                + gt_bin[b].sum((-2, -1))
-                                - inter
-                            )
+                            union = preds_bin.sum((-2, -1)) + gt_bin[b].sum((-2, -1)) - inter
                             ious.append(inter / (union + 1e-6))
                         gt_ious = torch.stack(ious, dim=0)
 
@@ -468,7 +459,9 @@ def main():
                         if not use_precomputed:
                             for tinfo in teacher_models:
                                 with torch.no_grad():
-                                    _ = tinfo["model"](batched_input=batched_input, multimask_output=False)
+                                    _ = tinfo["model"](
+                                        batched_input=batched_input, multimask_output=False
+                                    )
                                 teacher_feats[tinfo["name"]] = pop_features() or {}
                             if step % 20 == 0:
                                 for tn, feats in teacher_feats.items():
@@ -492,8 +485,12 @@ def main():
                             if dist_cfg.get("encoder_matching", {}).get("enable"):
                                 enc_keys_s = pot.get("enc", [])
                                 enc_keys_t = tpot.get("enc", [])
-                                
-                                if enc_keys_s and enc_keys_t and all(k in feat_student for k in enc_keys_s):
+
+                                if (
+                                    enc_keys_s
+                                    and enc_keys_t
+                                    and all(k in feat_student for k in enc_keys_s)
+                                ):
                                     try:
                                         num_layers_to_compare = len(enc_keys_s)
                                         selected_enc_keys_t = enc_keys_t[-num_layers_to_compare:]
@@ -503,7 +500,10 @@ def main():
                                                 base_dir, tname, "train", ids, selected_enc_keys_t
                                             )
                                         else:
-                                            feat_teacher = [teacher_feats[tname][k][0] for k in selected_enc_keys_t]
+                                            feat_teacher = [
+                                                teacher_feats[tname][k][0]
+                                                for k in selected_enc_keys_t
+                                            ]
 
                                         enc_loss = encoder_matching_loss(
                                             [feat_student[k][0] for k in enc_keys_s],
@@ -515,12 +515,22 @@ def main():
                                         if step % 20 == 0:
                                             log.info(f"enc_loss[{tname}]={enc_loss.item():.4f}")
                                     except Exception as e:
-                                        log.warning(f"Encoder matching error for teacher {tname}: {e}")
+                                        log.warning(
+                                            f"Encoder matching error for teacher {tname}: {e}"
+                                        )
 
                             if dist_cfg.get("decoder_matching", {}).get("enable"):
                                 dec_keys_s = pot.get("dec", [])
                                 dec_keys_t = tpot.get("dec", [])
-                                if dec_keys_s and dec_keys_t and all(k in feat_student for k in dec_keys_s) and (use_precomputed or dec_keys_t[0] in teacher_feats.get(tname, {})):
+                                if (
+                                    dec_keys_s
+                                    and dec_keys_t
+                                    and all(k in feat_student for k in dec_keys_s)
+                                    and (
+                                        use_precomputed
+                                        or dec_keys_t[0] in teacher_feats.get(tname, {})
+                                    )
+                                ):
                                     try:
                                         if use_precomputed:
                                             feat_teacher = load_cached_npy_features(
@@ -538,13 +548,19 @@ def main():
                                         if step % 20 == 0:
                                             log.info(f"dec_loss[{tname}]={dec_loss.item():.4f}")
                                     except Exception as e:
-                                        log.warning(f"Decoder matching error for teacher {tname}: {e}")
+                                        log.warning(
+                                            f"Decoder matching error for teacher {tname}: {e}"
+                                        )
 
                             if dist_cfg.get("attention_matching", {}).get("enable"):
                                 attn_keys_s = pot.get("attn", [])
                                 attn_keys_t = tpot.get("attn", [])
-                                
-                                if attn_keys_s and attn_keys_t and all(k in feat_student for k in attn_keys_s):
+
+                                if (
+                                    attn_keys_s
+                                    and attn_keys_t
+                                    and all(k in feat_student for k in attn_keys_s)
+                                ):
                                     try:
                                         num_layers_to_compare = len(attn_keys_s)
                                         selected_attn_keys_t = attn_keys_t[-num_layers_to_compare:]
@@ -554,24 +570,40 @@ def main():
                                                 base_dir, tname, "train", ids, selected_attn_keys_t
                                             )
                                         else:
-                                            attn_teacher = [teacher_feats[tname][k][0] for k in selected_attn_keys_t]
-                                        
+                                            attn_teacher = [
+                                                teacher_feats[tname][k][0]
+                                                for k in selected_attn_keys_t
+                                            ]
+
                                         attn_loss = attention_matching_loss(
                                             [feat_student[k][0] for k in attn_keys_s],
                                             attn_teacher,
-                                            **_get_loss_params(dist_cfg["attention_matching"], {"lambda": "lambda_attn"}),
+                                            **_get_loss_params(
+                                                dist_cfg["attention_matching"],
+                                                {"lambda": "lambda_attn"},
+                                            ),
                                             n_layers=num_layers_to_compare,
                                         )
                                         attn_loss_val += weight * attn_loss
                                         if step % 20 == 0:
                                             log.info(f"attn_loss[{tname}]={attn_loss.item():.4f}")
                                     except Exception as e:
-                                        log.warning(f"Attention matching error for teacher {tname}: {e}")
+                                        log.warning(
+                                            f"Attention matching error for teacher {tname}: {e}"
+                                        )
 
                             if dist_cfg.get("relational_KD", {}).get("enable"):
                                 rk_keys_s = pot.get("rkd", [])
                                 rk_keys_t = tpot.get("rkd", [])
-                                if rk_keys_s and rk_keys_t and all(k in feat_student for k in rk_keys_s) and (use_precomputed or rk_keys_t[0] in teacher_feats.get(tname, {})):
+                                if (
+                                    rk_keys_s
+                                    and rk_keys_t
+                                    and all(k in feat_student for k in rk_keys_s)
+                                    and (
+                                        use_precomputed
+                                        or rk_keys_t[0] in teacher_feats.get(tname, {})
+                                    )
+                                ):
                                     try:
                                         if use_precomputed:
                                             feat_teacher = load_cached_npy_features(
@@ -579,11 +611,13 @@ def main():
                                             )[0]
                                         else:
                                             feat_teacher = teacher_feats[tname][rk_keys_t[0]][0]
-                                        
+
                                         rk_loss = rkd_loss(
                                             feat_student[rk_keys_s[0]][0],
                                             feat_teacher,
-                                            **_get_loss_params(dist_cfg["relational_KD"], {"lambda": "lambda_rkd"}),
+                                            **_get_loss_params(
+                                                dist_cfg["relational_KD"], {"lambda": "lambda_rkd"}
+                                            ),
                                         )
                                         rkd_loss_val += weight * rk_loss
                                         if step % 20 == 0:
@@ -592,18 +626,18 @@ def main():
                                         log.warning(f"RKD error for teacher {tname}: {e}")
 
                     dist_loss = enc_loss_val + dec_loss_val + attn_loss_val + rkd_loss_val
-                    loss = (
-                        task_loss + iou_loss + lambda_coef * dist_loss
-                    ) / tr_cfg.get("gradient_accumulation", 1)
+                    loss = (task_loss + iou_loss + lambda_coef * dist_loss) / tr_cfg.get(
+                        "gradient_accumulation", 1
+                    )
 
                 scaler.scale(loss).backward()
                 # del low_res_logits, tmp, logit_up, prob, focal, dice_loss
                 if use_distillation and "feat_student" in locals():
                     del feat_student
 
-                if (step + 1) % tr_cfg.get("gradient_accumulation", 1) == 0 or (
-                    step + 1
-                ) == len(tr_loader):
+                if (step + 1) % tr_cfg.get("gradient_accumulation", 1) == 0 or (step + 1) == len(
+                    tr_loader
+                ):
                     scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
                     scaler.step(opt)
@@ -664,9 +698,7 @@ def main():
                                 ),
                             }
                             if vb["box_prompt"][i] is not None:
-                                entry["boxes"] = (
-                                    vb["box_prompt"][i].to(dev).unsqueeze(0)
-                                )  # (1,4)
+                                entry["boxes"] = vb["box_prompt"][i].to(dev).unsqueeze(0)  # (1,4)
                             if vb["point_coords"][i] is not None:
                                 entry["point_coords"] = (
                                     vb["point_coords"][i].to(dev).unsqueeze(0)
@@ -685,24 +717,16 @@ def main():
                                 size=masks.shape[-2:],
                                 mode="bilinear",
                                 align_corners=False,
-
                             ).squeeze(0)
                             mask_list.append(mask_up)
-                            iou_list.append(
-                                o["iou_predictions"].squeeze(0).to(torch.float32)
-                            )
-
+                            iou_list.append(o["iou_predictions"].squeeze(0).to(torch.float32))
 
                         pred_masks = torch.stack(mask_list, dim=0)
                         pred_ious = torch.stack(iou_list, dim=0)
 
                         best_indices = pred_ious.argmax(dim=1)
                         probs = torch.sigmoid(
-
-                            pred_masks[
-                                torch.arange(len(pred_masks)), best_indices
-                            ].unsqueeze(1)
-
+                            pred_masks[torch.arange(len(pred_masks)), best_indices].unsqueeze(1)
                         )
 
                         for i in range(len(imgs)):
@@ -722,8 +746,7 @@ def main():
 
                             union = pred_bin + gt_i - pred_bin * gt_i
                             bin_iou = (
-                                (pred_bin * gt_i).sum((-2, -1))
-                                / (union.sum((-2, -1)) + 1e-6)
+                                (pred_bin * gt_i).sum((-2, -1)) / (union.sum((-2, -1)) + 1e-6)
                             ).item()
 
                             dices.append(bin_dice)
@@ -735,10 +758,8 @@ def main():
                                     f"[VAL] id={vb['id'][i]}, "
                                     f"soft_dice={soft_dice:.3f}, "
                                     f"bin_dice={bin_dice:.3f}, bin_iou={bin_iou:.3f}, "
-
                                     f"gt_sum={gt_i.sum().item():.0f}, "
                                     f"pred_sum={pred_bin.sum().item():.0f}"
-
                                 )
 
                             # Visualization
@@ -746,19 +767,14 @@ def main():
                                 bi == 0
                                 and cfg["visual"].get("status", False)
                                 and (
-                                    ep % cfg["visual"].get("save_every_n_epochs", 10)
-                                    == 0
-                                    or ((np.mean(dices) + np.mean(ious)) / 2)
-                                    > best_score
+                                    ep % cfg["visual"].get("save_every_n_epochs", 10) == 0
+                                    or ((np.mean(dices) + np.mean(ious)) / 2) > best_score
                                 )
                             ):
-                                cur_path = (
-                                    Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
-                                )
+                                cur_path = Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
                                 cur_path.mkdir(parents=True, exist_ok=True)
                                 img_denorm = (
-                                    imgs[i]
-                                    * torch.tensor(STD, device=dev)[:, None, None]
+                                    imgs[i] * torch.tensor(STD, device=dev)[:, None, None]
                                     + torch.tensor(MEAN, device=dev)[:, None, None]
                                 )
                                 img_denorm = img_denorm.clamp(0, 1).cpu()
@@ -786,11 +802,7 @@ def main():
                                     original_size=None,
                                     threshold=cfg["visual"].get("IOU_threshold", 0.5),
                                     save_dir=str(cur_path),
-
-                                    filename_info=(
-                                        f"ep{ep}_id{vb['id'][i]}_b{bi}_s{i}"
-                                    ),
-
+                                    filename_info=(f"ep{ep}_id{vb['id'][i]}_b{bi}_s{i}"),
                                 )
                     except Exception as e:
                         log.error(f"Error in validation step {bi}: {e}")
@@ -803,12 +815,10 @@ def main():
                 writer.add_scalar("val/iou", v_iou, ep)
                 writer.add_scalar("val/score", v_score, ep)
                 log.info(
-
                     (
                         f"Epoch {ep}  Bin-Dice={v_dice:.4f} "
                         f"Bin-IoU={v_iou:.4f} Score={v_score:.4f}"
                     )
-
                 )
                 log_gpu_memory(f"Epoch {ep} validation completed")
 
@@ -818,19 +828,15 @@ def main():
                     if v_score > best_score + 1e-4:
                         dyn_wait = 0
                         lambda_coef = min(
-
                             lambda_coef / dist_cfg["dynamic_lambda"]["factor"],
                             1.0,
-
                         )
                     else:
                         dyn_wait += 1
                         if dyn_wait >= dist_cfg["dynamic_lambda"]["patience"]:
                             lambda_coef = max(
-
                                 lambda_coef * dist_cfg["dynamic_lambda"]["factor"],
                                 1e-3,
-
                             )
                             dyn_wait = 0
                             log.info(f"λ ↓ {lambda_coef:.3f}")
