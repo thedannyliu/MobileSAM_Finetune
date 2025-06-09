@@ -34,3 +34,16 @@ All losses and their logging are implemented in `train.py`, which records indivi
 ## 7. Online Distillation
 
 When `distillation.use_precomputed_features` is `false`, the teachers are instantiated during training and the same feature hooks are attached to them. Features are captured on the fly from each teacher's forward pass, enabling distillation without pre-extracting `.npy` files. This offers flexibility at the expense of additional compute time.
+
+## 8. Teacher-Specific Feature Details
+
+The distillation pipeline supports two teachers: **MobileSAM_orig** (a TinyViT backbone) and **SAM-H** (the large ViT-H model). The features used for each loss depend on the teacher's architecture.
+
+| Loss Type | MobileSAM_orig Layers | SAM-H Layers |
+|-----------|----------------------|--------------|
+| **Encoder Matching** | `image_encoder.neck` | `image_encoder.blocks.[9,10,11,12]` |
+| **Decoder Matching** | `mask_decoder.output_upscaling` | `mask_decoder.pre_logits` |
+| **Attention Matching** | 10 attention maps from `image_encoder.layers.[1-3]` | all 12 attention maps from `image_encoder.blocks.[0-11]` |
+| **Relational KD** | `image_encoder.patch_embed` | `image_encoder.patch_embed` |
+
+Both teachers can be used simultaneously or individually. Precomputing these features with `scripts/extract_teacher_features.py` enables fast training when `use_precomputed_features` is set to `true`.

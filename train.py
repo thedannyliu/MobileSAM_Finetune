@@ -520,7 +520,7 @@ def main():
                             if dist_cfg.get("decoder_matching", {}).get("enable"):
                                 dec_keys_s = pot.get("dec", [])
                                 dec_keys_t = tpot.get("dec", [])
-                                if dec_keys_s and dec_keys_t and all(k in feat_student for k in dec_keys_s) and dec_keys_t[0] in teacher_feats.get(tname, {}):
+                                if dec_keys_s and dec_keys_t and all(k in feat_student for k in dec_keys_s) and (use_precomputed or dec_keys_t[0] in teacher_feats.get(tname, {})):
                                     try:
                                         if use_precomputed:
                                             feat_teacher = load_cached_npy_features(
@@ -571,7 +571,7 @@ def main():
                             if dist_cfg.get("relational_KD", {}).get("enable"):
                                 rk_keys_s = pot.get("rkd", [])
                                 rk_keys_t = tpot.get("rkd", [])
-                                if rk_keys_s and rk_keys_t and all(k in feat_student for k in rk_keys_s) and rk_keys_t[0] in teacher_feats.get(tname, {}):
+                                if rk_keys_s and rk_keys_t and all(k in feat_student for k in rk_keys_s) and (use_precomputed or rk_keys_t[0] in teacher_feats.get(tname, {})):
                                     try:
                                         if use_precomputed:
                                             feat_teacher = load_cached_npy_features(

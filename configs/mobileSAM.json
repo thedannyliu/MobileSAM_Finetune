@@ -15,7 +15,7 @@
     "save_path": "./logs"
   },
   "train": {
-    "epochs": 1000,
+    "epochs": 1,
     "lr": 1e-5,
     "batch_size": 2,
     "val_freq": 1,
@@ -40,7 +40,7 @@
   },
   "distillation": {
     "enable": true,
-    "use_precomputed_features": false,
+    "use_precomputed_features": true,
     "precomputed_root": "precomputed",
     "encoder_matching": {
       "enable": true,
@@ -74,8 +74,8 @@
   },
   "teachers": [
     {
-      "name": "SAM_vitH",
-      "cfg": "configs/sam_vith.yaml",
+      "name": "SAM-H",
+      "cfg": "configs/sam_h.yaml",
       "checkpoint": "weights/sam_vit_h_4b8939.pth",
       "weight": 0.5
     },

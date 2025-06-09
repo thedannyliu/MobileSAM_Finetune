@@ -1,0 +1,8 @@
+# ====================================================
+# SAM-H teacher model configuration
+# ====================================================
+model:
+  name: SAM-H
+  type: vit_h
+  image_size: 1024
+  checkpoint: weights/sam_vit_h_4b8939.pth
