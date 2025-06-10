@@ -651,16 +651,16 @@ def main():
                 tot_dist += dist_loss.item()
                 tot_iou += iou_loss.item()
 
+                ga = tr_cfg.get("gradient_accumulation", 1)
                 pbar.set_postfix(
-                    bce=f"{bce.item():.3f}",
-                    focal=f"{focal.item():.3f}",
-                    dice=f"{dice_loss.item():.3f}",
-                    iou=f"{iou_loss.item():.3f}",
-                    enc=f"{enc_loss_val.item():.3f}",
-                    dec=f"{dec_loss_val.item():.3f}",
-                    attn=f"{attn_loss_val.item():.3f}",
-                    rkd=f"{rkd_loss_val.item():.3f}",
-                    dist=f"{dist_loss.item():.3f}",
+                    bce=f"{(bce.item() / ga):.3f}",
+                    focal=f"{(0.5 * focal.item() / ga):.3f}",
+                    dice=f"{(dice_loss.item() / ga):.3f}",
+                    iou=f"{(iou_loss.item() / ga):.3f}",
+                    enc=f"{(lambda_coef * enc_loss_val.item() / ga):.3f}",
+                    dec=f"{(lambda_coef * dec_loss_val.item() / ga):.3f}",
+                    attn=f"{(lambda_coef * attn_loss_val.item() / ga):.3f}",
+                    rkd=f"{(lambda_coef * rkd_loss_val.item() / ga):.3f}",
                     total=f"{loss.item():.3f}",
                     lr=f"{scheduler.get_last_lr()[0]:.2e}",
                 )
