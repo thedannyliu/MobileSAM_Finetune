@@ -55,16 +55,12 @@ class ComponentDataset(Dataset):
             mask_sub = self.mask_dir / img_stem
             if mask_sub.is_dir():
                 for mask_path in sorted(mask_sub.glob("*.png")):
-                    self.samples.append(
-                        {"image": img_path, "mask": mask_path, "id": img_stem}
-                    )
+                    self.samples.append({"image": img_path, "mask": mask_path, "id": img_stem})
 
         if not self.samples:
             raise ValueError(f"{root_dir} 找不到任何樣本")
 
-        print(
-            f"ComponentDataset: {len(self.samples)} samples, prompt={self.prompt_mode}"
-        )
+        print(f"ComponentDataset: {len(self.samples)} samples, prompt={self.prompt_mode}")
 
         # 用於後續 Resize
         self.img_resize = transforms.Resize(
@@ -78,9 +74,7 @@ class ComponentDataset(Dataset):
     def _morph_close(mask_tensor: torch.Tensor, k: int = 3):
         if mask_tensor.ndim == 3:
             mask_tensor = mask_tensor.squeeze(0)
-        kernel = torch.ones(
-            (1, 1, k, k), dtype=torch.float32, device=mask_tensor.device
-        )
+        kernel = torch.ones((1, 1, k, k), dtype=torch.float32, device=mask_tensor.device)
         m = mask_tensor.unsqueeze(0).unsqueeze(0)
         dil = torch.nn.functional.conv2d(m, kernel, padding=k // 2)
         dil = (dil > 0).float()
@@ -129,9 +123,7 @@ class ComponentDataset(Dataset):
         x_max_new = min(w - 1, max(j_xmax, x_max))
         y_max_new = min(h - 1, max(j_ymax, y_max))
 
-        return torch.tensor(
-            [x_min_new, y_min_new, x_max_new, y_max_new], dtype=torch.float
-        )
+        return torch.tensor([x_min_new, y_min_new, x_max_new, y_max_new], dtype=torch.float)
 
     def compute_point_prompts_raw(self, mask_tensor: torch.Tensor):
         """
@@ -235,4 +227,104 @@ class ComponentDataset(Dataset):
             "point_labels": point_labels if cur_type == "point" else None,
             "id": meta["id"],
             "original_size": raw_size,  # (H_raw, W_raw)
+        }
+
+
+class SegmentEverythingDataset(Dataset):
+    """Dataset to train SAM in a segment-everything manner.
+
+    Each sample returns an image with *all* of its object masks stacked
+    together. Prompts are generated using a regular point grid over the
+    entire image, mimicking ``SamAutomaticMaskGenerator``.
+    """
+
+    def __init__(
+        self,
+        root_dir: str,
+        transform=None,
+        grid_points: int = 32,
+        image_size: int = 1024,
+    ) -> None:
+        self.root_dir = Path(root_dir)
+        self.image_dir = self.root_dir / "image"
+        self.mask_dir = self.root_dir / "mask"
+
+        if not self.image_dir.is_dir() or not self.mask_dir.is_dir():
+            raise FileNotFoundError(f"{root_dir} 缺少 image/ 或 mask/")
+
+        self.transform_image = transform[0] if transform else transforms.ToTensor()
+        self.transform_mask = transform[1] if transform else transforms.ToTensor()
+
+        self.grid_points = grid_points
+        self.image_size = image_size
+
+        self.samples = []
+        image_files = (
+            list(self.image_dir.glob("*.jpg"))
+            + list(self.image_dir.glob("*.jpeg"))
+            + list(self.image_dir.glob("*.png"))
+        )
+
+        for img_path in sorted(image_files):
+            img_stem = img_path.stem
+            mask_sub = self.mask_dir / img_stem
+            if mask_sub.is_dir():
+                masks = sorted(mask_sub.glob("*.png"))
+                if masks:
+                    self.samples.append({"image": img_path, "masks": masks, "id": img_stem})
+
+        if not self.samples:
+            raise ValueError(f"{root_dir} 找不到任何樣本")
+
+        print(f"SegmentEverythingDataset: {len(self.samples)} images, grid={self.grid_points}")
+
+        self.img_resize = transforms.Resize(
+            (image_size, image_size), transforms.InterpolationMode.BILINEAR
+        )
+        self.msk_resize = transforms.Resize(
+            (image_size, image_size), transforms.InterpolationMode.NEAREST
+        )
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        meta = self.samples[idx]
+        img_pil = Image.open(meta["image"]).convert("RGB")
+        orig_w, orig_h = img_pil.size
+        raw_size = torch.tensor([orig_h, orig_w], dtype=torch.int)
+
+        # Load all masks for this image
+        msk_tensors = []
+        for mp in meta["masks"]:
+            m = Image.open(mp).convert("L")
+            m = self.msk_resize(m)
+            m = self.transform_mask(m)
+            m = (m > 0.5).float()
+            msk_tensors.append(m)
+        gt_masks = torch.stack(msk_tensors)  # [K,1,S,S]
+
+        img_resized = self.img_resize(img_pil)
+        img_tensor = self.transform_image(img_resized)
+
+        # Build grid prompts on the original resolution then scale
+        step = self.grid_points
+        x_points = torch.linspace(0.5 * step, orig_w - 0.5 * step, int(orig_w / step))
+        y_points = torch.linspace(0.5 * step, orig_h - 0.5 * step, int(orig_h / step))
+        grid = torch.stack(torch.meshgrid(y_points, x_points, indexing="ij"), dim=-1).view(-1, 2)
+        # (y,x) -> (x,y)
+        grid = grid[:, [1, 0]]
+        scale_x = self.image_size / orig_w
+        scale_y = self.image_size / orig_h
+        grid[:, 0] *= scale_x
+        grid[:, 1] *= scale_y
+        labels = torch.ones(len(grid), dtype=torch.long)
+
+        return {
+            "image": img_tensor,
+            "gt_masks": gt_masks,
+            "point_coords": grid,
+            "point_labels": labels,
+            "id": meta["id"],
+            "original_size": raw_size,
         }

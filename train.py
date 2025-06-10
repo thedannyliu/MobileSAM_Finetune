@@ -10,6 +10,7 @@ from torchvision import transforms as T
 from torchvision.ops import sigmoid_focal_loss
 
 from mobile_sam import sam_model_registry
+from mobile_sam.utils.amg import batch_iterator
 
 import argparse
 import gc
@@ -18,7 +19,7 @@ import logging
 import os
 import traceback
 import yaml
-from finetune_utils.datasets import ComponentDataset
+from finetune_utils.datasets import ComponentDataset, SegmentEverythingDataset
 from finetune_utils.distill_losses import (
     attention_matching_loss,
     decoder_matching_loss,
@@ -115,6 +116,36 @@ def _parse_hw(x):
     return (int(x[0]), int(x[1])) if isinstance(x, torch.Tensor) else tuple(map(int, x))
 
 
+def predict_from_grid(model, image, points, orig_size, batch_size=64):
+    """Run the SAM model on a grid of points and return masks and IoU preds."""
+    device = image.device
+    inp = model.preprocess(image.unsqueeze(0))
+    embedding = model.image_encoder(inp)
+    dense_pe = model.prompt_encoder.get_dense_pe()
+
+    all_masks = []
+    all_ious = []
+    for (pts,) in batch_iterator(batch_size, points):
+        coords = torch.as_tensor(pts, dtype=torch.float, device=device)
+        labels = torch.ones(coords.shape[0], dtype=torch.int, device=device)
+        sparse, dense = model.prompt_encoder(
+            points=(coords.unsqueeze(0), labels.unsqueeze(0)),
+            boxes=None,
+            masks=None,
+        )
+        low_res, iou_pred = model.mask_decoder(
+            image_embeddings=embedding,
+            image_pe=dense_pe,
+            sparse_prompt_embeddings=sparse,
+            dense_prompt_embeddings=dense,
+            multimask_output=True,
+        )
+        masks = model.postprocess_masks(low_res, image.shape[-2:], orig_size).squeeze(0)
+        all_masks.append(masks)
+        all_ious.append(iou_pred.squeeze(0))
+    return torch.cat(all_masks, dim=0), torch.cat(all_ious, dim=0)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -131,29 +162,47 @@ def main():
     tf_msk = T.Compose([T.ToTensor()])
 
     ds_cfg = cfg["dataset"]
-    train_ds = ComponentDataset(
-        ds_cfg["train_dataset"],
-        (tf_img, tf_msk),
-        max_bbox_shift=ds_cfg.get("max_bbox_shift", 20),
-        prompt_mode=ds_cfg.get("prompt_mode", "point"),  # 或 "box"
-        min_points=ds_cfg.get("min_points", 1),
-        max_points=ds_cfg.get("max_points", 3),
-        image_size=cfg["model"].get("image_size", 1024),
-    )
-    val_ds = ComponentDataset(
-        ds_cfg["val_dataset"],
-        (tf_img, tf_msk),
-        max_bbox_shift=ds_cfg.get("max_bbox_shift", 20),
-        prompt_mode=ds_cfg.get("prompt_mode", "point"),  # 或 "box"
-        min_points=ds_cfg.get("min_points", 1),
-        max_points=ds_cfg.get("max_points", 3),
-        image_size=cfg["model"].get("image_size", 1024),
-    )
+    dataset_mode = ds_cfg.get("mode", "single")
+    if dataset_mode == "everything":
+        train_ds = SegmentEverythingDataset(
+            ds_cfg["train_dataset"],
+            (tf_img, tf_msk),
+            grid_points=ds_cfg.get("grid_points", 32),
+            image_size=cfg["model"].get("image_size", 1024),
+        )
+        val_ds = SegmentEverythingDataset(
+            ds_cfg["val_dataset"],
+            (tf_img, tf_msk),
+            grid_points=ds_cfg.get("grid_points", 32),
+            image_size=cfg["model"].get("image_size", 1024),
+        )
+    else:
+        train_ds = ComponentDataset(
+            ds_cfg["train_dataset"],
+            (tf_img, tf_msk),
+            max_bbox_shift=ds_cfg.get("max_bbox_shift", 20),
+            prompt_mode=ds_cfg.get("prompt_mode", "point"),
+            min_points=ds_cfg.get("min_points", 1),
+            max_points=ds_cfg.get("max_points", 3),
+            image_size=cfg["model"].get("image_size", 1024),
+        )
+        val_ds = ComponentDataset(
+            ds_cfg["val_dataset"],
+            (tf_img, tf_msk),
+            max_bbox_shift=ds_cfg.get("max_bbox_shift", 20),
+            prompt_mode=ds_cfg.get("prompt_mode", "point"),
+            min_points=ds_cfg.get("min_points", 1),
+            max_points=ds_cfg.get("max_points", 3),
+            image_size=cfg["model"].get("image_size", 1024),
+        )
 
     def sam_collate(batch):
         out = {}
         for k in batch[0].keys():
             vals = [d[k] for d in batch]
+            if k in ("gt_masks", "point_coords", "point_labels"):
+                out[k] = vals  # keep list due to variable lengths
+                continue
             if isinstance(vals[0], torch.Tensor) and all(v is not None for v in vals):
                 out[k] = torch.stack(vals, 0)
             else:
@@ -190,7 +239,7 @@ def main():
         student.mask_decoder.requires_grad_(False)
 
     dist_cfg = cfg.get("distillation", {})
-    use_distillation = dist_cfg.get("enable", False)
+    use_distillation = dist_cfg.get("enable", False) and dataset_mode == "single"
     hook_handles = []
 
     def _build_pot(model_type: str):
@@ -369,80 +418,123 @@ def main():
                 task_loss = torch.tensor(0.0, device=dev)
                 loss = torch.tensor(0.0, device=dev)
                 #
-                imgs = batch["image"].to(dev)  # [B,3,1024,1024]
-                masks = batch["mask"].to(dev)  # [B,1,1024,1024]
+                imgs = batch["image"].to(dev)
                 ids = batch["id"]
-                osz = batch["original_size"]  # [B, 2] raw sizes
+                osz = batch["original_size"]
 
-                batched_input = []
-                for i in range(len(imgs)):
-                    entry = {
-                        "image": imgs[i],
-                        "original_size": (int(osz[i][0]), int(osz[i][1])),
-                    }
-                    if batch["box_prompt"][i] is not None:
-                        entry["boxes"] = batch["box_prompt"][i].to(dev).unsqueeze(0)
-                    if batch["point_coords"][i] is not None:
-                        entry["point_coords"] = batch["point_coords"][i].to(dev).unsqueeze(0)
-                        entry["point_labels"] = batch["point_labels"][i].to(dev).unsqueeze(0)
+                if dataset_mode == "single":
+                    masks = batch["mask"].to(dev)
 
-                    if step % 200 == 0 and i == 0:
-                        boxes = entry.get("boxes", None)
-                        pts = entry.get("point_coords", None)
-                        # 如果 point_coords 是 None，就不要做切片
-                        pt0 = pts[:1] if pts is not None else None
+                    batched_input = []
+                    for i in range(len(imgs)):
+                        entry = {
+                            "image": imgs[i],
+                            "original_size": (int(osz[i][0]), int(osz[i][1])),
+                        }
+                        if batch["box_prompt"][i] is not None:
+                            entry["boxes"] = batch["box_prompt"][i].to(dev).unsqueeze(0)
+                        if batch["point_coords"][i] is not None:
+                            entry["point_coords"] = batch["point_coords"][i].to(dev).unsqueeze(0)
+                            entry["point_labels"] = batch["point_labels"][i].to(dev).unsqueeze(0)
 
-                        log.info(
-                            f"[PROMPT] ep{ep}_step{step} id={ids[i]}, "
-                            f"orig={entry['original_size']}, "
-                            f"box={boxes}, "
-                            f"pt0={pt0}"
+                        batched_input.append(entry)
+
+                    with autocast(
+                        dtype=torch.bfloat16 if tr_cfg.get("bf16", False) else torch.float16
+                    ):
+                        out = student(batched_input=batched_input, multimask_output=True)
+
+                        mask_list = []
+                        iou_list = []
+                        for o in out:
+                            mask_up = F.interpolate(
+                                o["masks"].to(torch.float32),
+                                size=masks.shape[-2:],
+                                mode="bilinear",
+                                align_corners=False,
+                            ).squeeze(0)
+                            mask_list.append(mask_up)
+                            iou_list.append(o["iou_predictions"].squeeze(0).to(torch.float32))
+
+                        pred_masks = torch.stack(mask_list, dim=0)
+                        pred_ious = torch.stack(iou_list, dim=0)
+
+                        best_indices = pred_ious.argmax(dim=1)
+                        sel_masks = pred_masks[torch.arange(len(pred_masks)), best_indices]
+                        sel_masks = sel_masks.unsqueeze(1)
+
+                        bce = F.binary_cross_entropy_with_logits(sel_masks, masks)
+                        focal = sigmoid_focal_loss(sel_masks, masks, reduction="mean")
+
+                        prob = torch.sigmoid(sel_masks)
+                        num = (prob * masks).sum((-2, -1)) * 2
+                        den = prob.sum((-2, -1)) + masks.sum((-2, -1))
+                        dice_loss = 1 - (num / (den + 1e-6)).mean()
+                        task_loss = bce + 0.5 * focal + dice_loss
+
+                        with torch.no_grad():
+                            gt_bin = masks > 0.5
+                            ious = []
+                            for b in range(pred_masks.shape[0]):
+                                preds_bin = (torch.sigmoid(pred_masks[b]) > 0.5).float()
+                                inter = (preds_bin * gt_bin[b]).sum((-2, -1))
+                                union = preds_bin.sum((-2, -1)) + gt_bin[b].sum((-2, -1)) - inter
+                                ious.append(inter / (union + 1e-6))
+                            gt_ious = torch.stack(ious, dim=0)
+
+                        iou_loss = F.mse_loss(pred_ious, gt_ious)
+                else:
+                    gt_masks = batch["gt_masks"]
+                    point_coords = batch["point_coords"]
+                    pred_masks_all = []
+                    pred_ious_all = []
+                    for bi in range(len(imgs)):
+                        pm, pi = predict_from_grid(
+                            student,
+                            imgs[bi],
+                            point_coords[bi].to(dev),
+                            (int(osz[bi][0]), int(osz[bi][1])),
                         )
+                        pred_masks_all.append(pm)
+                        pred_ious_all.append(pi)
 
-                    batched_input.append(entry)
+                    bce = torch.tensor(0.0, device=dev)
+                    focal = torch.tensor(0.0, device=dev)
+                    dice_loss = torch.tensor(0.0, device=dev)
+                    iou_loss = torch.tensor(0.0, device=dev)
 
-                with autocast(dtype=torch.bfloat16 if tr_cfg.get("bf16", False) else torch.float16):
-                    out = student(batched_input=batched_input, multimask_output=True)
+                    for bi in range(len(imgs)):
+                        gt = gt_masks[bi].to(dev)  # [K,1,S,S]
+                        preds = pred_masks_all[bi].reshape(-1, gt.shape[-2], gt.shape[-1])
+                        ious_pred = pred_ious_all[bi].reshape(-1)
+                        gt_flat = gt.squeeze(1)
+                        pred_bin = (torch.sigmoid(preds) > 0.5).float()
+                        inter = (pred_bin.unsqueeze(1) * gt_flat.unsqueeze(0)).sum((-2, -1))
+                        union = (
+                            pred_bin.unsqueeze(1).sum((-2, -1))
+                            + gt_flat.unsqueeze(0).sum((-2, -1))
+                            - inter
+                        )
+                        iou_mat = inter / (union + 1e-6)
+                        best_iou, best_gt = iou_mat.max(dim=1)
+                        for j in range(preds.shape[0]):
+                            target = (
+                                gt[best_gt[j]] if best_iou[j] >= 0.8 else torch.zeros_like(gt[0])
+                            )
+                            logit = preds[j].unsqueeze(0)
+                            target_exp = target.unsqueeze(0)
+                            bce += F.binary_cross_entropy_with_logits(logit, target_exp)
+                            focal += sigmoid_focal_loss(logit, target_exp, reduction="mean")
+                            prob = torch.sigmoid(logit)
+                            num = (prob * target_exp).sum((-2, -1)) * 2
+                            den = prob.sum((-2, -1)) + target_exp.sum((-2, -1))
+                            dice_loss += 1 - (num / (den + 1e-6))
+                            iou_loss += F.mse_loss(ious_pred[j], best_iou[j])
 
-                    mask_list = []
-                    iou_list = []
-                    for o in out:
-                        mask_up = F.interpolate(
-                            o["masks"].to(torch.float32),
-                            size=masks.shape[-2:],
-                            mode="bilinear",
-                            align_corners=False,
-                        ).squeeze(0)
-                        mask_list.append(mask_up)
-                        iou_list.append(o["iou_predictions"].squeeze(0).to(torch.float32))
-
-                    pred_masks = torch.stack(mask_list, dim=0)
-                    pred_ious = torch.stack(iou_list, dim=0)
-
-                    best_indices = pred_ious.argmax(dim=1)
-                    sel_masks = pred_masks[torch.arange(len(pred_masks)), best_indices]
-                    sel_masks = sel_masks.unsqueeze(1)
-
-                    bce = F.binary_cross_entropy_with_logits(sel_masks, masks)
-                    focal = sigmoid_focal_loss(sel_masks, masks, reduction="mean")
-
-                    prob = torch.sigmoid(sel_masks)
-                    num = (prob * masks).sum((-2, -1)) * 2
-                    den = prob.sum((-2, -1)) + masks.sum((-2, -1))
-                    dice_loss = 1 - (num / (den + 1e-6)).mean()
+                    n_pred = sum(p.reshape(-1).shape[0] for p in pred_masks_all)
                     task_loss = bce + 0.5 * focal + dice_loss
-
-                    with torch.no_grad():
-                        gt_bin = masks > 0.5
-                        ious = []
-                        for b in range(pred_masks.shape[0]):
-                            preds_bin = (torch.sigmoid(pred_masks[b]) > 0.5).float()
-                            inter = (preds_bin * gt_bin[b]).sum((-2, -1))
-                            union = preds_bin.sum((-2, -1)) + gt_bin[b].sum((-2, -1)) - inter
-                            ious.append(inter / (union + 1e-6))
-                        gt_ious = torch.stack(ious, dim=0)
-
-                    iou_loss = F.mse_loss(pred_ious, gt_ious)
+                    task_loss = task_loss / max(1, n_pred)
+                    iou_loss = iou_loss / max(1, n_pred)
 
                     dist_loss = torch.tensor(0.0, device=dev)
                     if use_distillation and hook_handles:
