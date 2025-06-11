@@ -403,9 +403,12 @@ def main():
         global_step = 0
         for ep in range(tr_cfg["epochs"]):
             if ep == unfreeze_epoch:
-                log.info(f"Unfreeze image_encoder at epoch {ep}")
+                log.info(f"Unfreeze all modules at epoch {ep}")
                 student.image_encoder.requires_grad_(True)
-                opt.param_groups[1]["lr"] = tr_cfg["lr"] * 0.2
+                student.prompt_encoder.requires_grad_(True)
+                student.mask_decoder.requires_grad_(True)
+                if len(opt.param_groups) > 1:
+                    opt.param_groups[1]["lr"] = tr_cfg["lr"] * 0.2
 
             if ep > 0:
                 feature_cache.clear()
@@ -514,6 +517,7 @@ def main():
                     focal = torch.tensor(0.0, device=dev)
                     dice_loss = torch.tensor(0.0, device=dev)
                     iou_loss = torch.tensor(0.0, device=dev)
+                    matched_cnt = 0
 
                     for bi in range(len(imgs)):
                         gt = gt_masks[bi].to(dev)  # [K,1,S,S]
@@ -529,10 +533,10 @@ def main():
                         )
                         iou_mat = inter / (union + 1e-6)
                         best_iou, best_gt = iou_mat.max(dim=1)
-                        for j in range(preds.shape[0]):
-                            target = (
-                                gt[best_gt[j]] if best_iou[j] >= 0.5 else torch.zeros_like(gt[0])
-                            )
+                        match_mask = best_iou >= 0.5
+                        matched_cnt += match_mask.sum().item()
+                        for j in torch.nonzero(match_mask, as_tuple=False).flatten():
+                            target = gt[best_gt[j]]
                             logit = preds[j].unsqueeze(0).unsqueeze(0)
                             target_exp = target.unsqueeze(0)
                             bce += F.binary_cross_entropy_with_logits(logit, target_exp)
@@ -543,12 +547,11 @@ def main():
                             dice_loss += 1 - (num / (den + 1e-6)).mean()
                             iou_loss += F.mse_loss(ious_pred[j], best_iou[j])
 
-                    # Average over the number of predicted masks rather than
-                    # the total number of pixels to avoid vanishing loss.
-                    n_pred = sum(p.shape[0] for p in pred_masks_all)
+                    # Average using only the matched predictions to avoid loss dilution.
+                    n_matched = matched_cnt
                     task_loss = w_bce * bce + w_focal * focal + w_dice * dice_loss
-                    task_loss = task_loss / max(1, n_pred)
-                    iou_loss = iou_loss / max(1, n_pred)
+                    task_loss = task_loss / max(1, n_matched)
+                    iou_loss = iou_loss / max(1, n_matched)
 
                     dist_loss = torch.tensor(0.0, device=dev)
                     if use_distillation and hook_handles:
@@ -782,7 +785,7 @@ def main():
                 tot_iou += iou_loss.item()
 
                 ga = tr_cfg.get("gradient_accumulation", 1)
-                norm = n_pred if dataset_mode == "everything" else 1
+                norm = n_matched if dataset_mode == "everything" else 1
                 bce_c = w_bce * bce.item() / max(1, norm) / ga
                 focal_c = w_focal * focal.item() / max(1, norm) / ga
                 dice_c = w_dice * dice_loss.item() / max(1, norm) / ga
@@ -1005,7 +1008,7 @@ def main():
                                         .clamp(0, 1)
                                         .cpu()
                                     )
-                                    best_masks = probs[best_pred].cpu()
+                                    best_masks = probs[row_ind].cpu()
                                     overlay_masks_on_image(
                                         image_tensor=img_denorm,
                                         masks=best_masks,

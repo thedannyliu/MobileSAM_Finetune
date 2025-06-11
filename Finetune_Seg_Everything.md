@@ -25,7 +25,7 @@ dataset/
    - For each candidate: `BCE * w_bce + Focal * w_focal + Dice * w_dice`.
    - IoU prediction is supervised with MSE (`w_iou`).
    - Distillation losses (encoder, decoder, attention, RKD) are weighted by the teacher specific weight and their own `weight` field then scaled by `lambda_coef`.
-   - The sum is divided by the number of predicted masks so that the magnitude stays consistent regardless of grid density.
+   - Losses are averaged over only the matched predictions so that unmatched background candidates do not dilute gradients.
 5. **Evaluation** — predictions are matched to ground-truth masks using the Hungarian algorithm for a one-to-one assignment before computing Dice and IoU.
 6. **Dynamic λ** — if enabled, `lambda_coef` is adjusted with a plateau scheduler based on the validation score.
 
@@ -40,6 +40,8 @@ Edit `configs/mobileSAM_se.json` and ensure `dataset.mode` is set to `"everythin
 ```bash
 python train.py --config configs/mobileSAM_se.json
 ```
+
+All model components are trained from the beginning (no frozen layers).  The configuration sets `freeze.*` flags to `false` and `unfreeze_epoch` to `0` so that the image encoder, prompt encoder and mask decoder are updated from epoch 0.
 
 Training requires substantial GPU memory because thousands of candidate masks may be generated per image.  Increase `grid_points`, reduce the image size, or lower the prediction batch size in `predict_from_grid` if out-of-memory errors occur.
 

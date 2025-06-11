@@ -44,7 +44,7 @@
     "freeze_image_encoder": false,
     "freeze_prompt_encoder": false,
     "freeze_mask_decoder": false,
-    "unfreeze_epoch": 10
+    "unfreeze_epoch": 0
   },
   "distillation": {
     "enable": true,
