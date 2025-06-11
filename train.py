@@ -29,6 +29,7 @@ from finetune_utils.distill_losses import (
 from finetune_utils.feature_hooks import pop_features, register_hooks
 from finetune_utils.visualization import overlay_mask_on_image, overlay_masks_on_image
 from pathlib import Path
+from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 
 # ─────────────────── logging ───────────────────
@@ -530,7 +531,7 @@ def main():
                         best_iou, best_gt = iou_mat.max(dim=1)
                         for j in range(preds.shape[0]):
                             target = (
-                                gt[best_gt[j]] if best_iou[j] >= 0.8 else torch.zeros_like(gt[0])
+                                gt[best_gt[j]] if best_iou[j] >= 0.5 else torch.zeros_like(gt[0])
                             )
                             logit = preds[j].unsqueeze(0).unsqueeze(0)
                             target_exp = target.unsqueeze(0)
@@ -974,15 +975,15 @@ def main():
                                 )
                                 iou_mat = inter / (union + 1e-6)
 
-                                best_pred = iou_mat.argmax(dim=0)
-                                for g_idx in range(gt.shape[0]):
-                                    p_idx = best_pred[g_idx]
-                                    prob_i = probs[p_idx]
-                                    gt_i = gt[g_idx]
+                                cost = (-iou_mat).cpu().numpy()
+                                row_ind, col_ind = linear_sum_assignment(cost)
+                                for r, c in zip(row_ind, col_ind):
+                                    prob_i = probs[r]
+                                    gt_i = gt[c]
                                     num_soft = (prob_i * gt_i).sum() * 2
                                     den_soft = prob_i.sum() + gt_i.sum()
                                     dice_val = (num_soft / (den_soft + 1e-6)).item()
-                                    iou_val = iou_mat[p_idx, g_idx].item()
+                                    iou_val = iou_mat[r, c].item()
                                     dices.append(dice_val)
                                     ious.append(iou_val)
 

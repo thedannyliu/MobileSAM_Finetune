@@ -20,13 +20,14 @@ dataset/
 
 1. **SegmentEverythingDataset** — loads all masks of an image and the grid prompts.
 2. **Prediction** — for every grid point the model predicts three candidate masks (`multimask_output=True`).
-3. **Matching** — the IoU of each candidate against every ground-truth mask is computed.  If the best IoU is above `0.8` the candidate is matched to that mask, otherwise it is treated as background.
+3. **Matching** — the IoU of each candidate against every ground-truth mask is computed.  If the best IoU is above `0.5` the candidate is matched to that mask, otherwise it is treated as background.
 4. **Loss**
    - For each candidate: `BCE * w_bce + Focal * w_focal + Dice * w_dice`.
    - IoU prediction is supervised with MSE (`w_iou`).
    - Distillation losses (encoder, decoder, attention, RKD) are weighted by the teacher specific weight and their own `weight` field then scaled by `lambda_coef`.
    - The sum is divided by the number of predicted masks so that the magnitude stays consistent regardless of grid density.
-5. **Dynamic λ** — if enabled, `lambda_coef` is adjusted with a plateau scheduler based on the validation score.
+5. **Evaluation** — predictions are matched to ground-truth masks using the Hungarian algorithm for a one-to-one assignment before computing Dice and IoU.
+6. **Dynamic λ** — if enabled, `lambda_coef` is adjusted with a plateau scheduler based on the validation score.
 
 ## Visualisation
 
