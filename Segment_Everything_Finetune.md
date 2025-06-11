@@ -23,14 +23,15 @@ objects within an image simultaneously.
 - When `dataset.mode` in the config is set to `"everything"` the training script
   switches to this dataset and calls a custom prediction routine that evaluates a
   batch of grid prompts for every image.
-- Each grid point produces three candidate masks (`multimask_output=True`).  For
-  every candidate the IoU with each ground truth mask is computed.  If the best
-  IoU is larger than 0.8 the candidate is matched to that object, otherwise it is
-  treated as background.
+ - Each grid point produces three candidate masks (`multimask_output=True`).  For
+   every candidate the IoU with each ground truth mask is computed.  If the best
+   IoU is larger than 0.5 the candidate is matched to that object, otherwise it is
+   treated as background.
 - Loss per candidate = **BCE + 0.5·Focal + Dice**.  The IoU prediction head is
   supervised with MSE against the measured IoU.
-- For unmatched ground truth masks the candidate with highest IoU is also used
-  for supervision.
+ - For unmatched ground truth masks the candidate with highest IoU is also used
+   for supervision.  During evaluation a Hungarian assignment is performed on the
+   IoU matrix to pair predictions and ground truths one-to-one.
 - Distillation losses are disabled in this mode for simplicity, but the rest of
   the training pipeline (optimizer, scheduler, etc.) remains unchanged.
 
