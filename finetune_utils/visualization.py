@@ -1,25 +1,25 @@
 # finetune_utils/visualization.py
 
-from pathlib import Path
-from typing import Optional, Tuple
-
 import numpy as np
 import torch
-from PIL import Image, ImageDraw
 from torchvision.transforms.functional import to_pil_image
+
+from pathlib import Path
+from PIL import Image, ImageDraw
+from typing import Optional, Tuple
 
 
 def overlay_mask_on_image(
-    image_tensor: torch.Tensor,                 # C×H×W, float [0,1] or uint8
-    mask_tensor: torch.Tensor,                  # H×W or 1×H×W (sigmoid output)
-    bbox_tensor: Optional[torch.Tensor] = None, # [xmin, ymin, xmax, ymax] in orig coords
-    point_coords: Optional[torch.Tensor] = None,# N×2 (x,y) in orig coords
-    point_labels: Optional[torch.Tensor] = None,# N, 1=positive, 0=negative, -1=ignore
+    image_tensor: torch.Tensor,  # C×H×W, float [0,1] or uint8
+    mask_tensor: torch.Tensor,  # H×W or 1×H×W (sigmoid output)
+    bbox_tensor: Optional[torch.Tensor] = None,  # [xmin, ymin, xmax, ymax] in orig coords
+    point_coords: Optional[torch.Tensor] = None,  # N×2 (x,y) in orig coords
+    point_labels: Optional[torch.Tensor] = None,  # N, 1=positive, 0=negative, -1=ignore
     *,
     original_size: Optional[Tuple[int, int]] = None,  # (H_raw, W_raw)
     threshold: float = 0.5,
     save_dir: str | Path = "./images",
-    filename_info: str = "vis"
+    filename_info: str = "vis",
 ):
     """Render overlay and save to {save_dir}/{filename_info}.jpg.
 
@@ -48,9 +48,7 @@ def overlay_mask_on_image(
 
     if mask_2d.shape != (h_rs, w_rs):
         mask_2d = torch.nn.functional.interpolate(
-            mask_2d.unsqueeze(0).unsqueeze(0),  # 1×1×h'×w'
-            size=(h_rs, w_rs),
-            mode="nearest"
+            mask_2d.unsqueeze(0).unsqueeze(0), size=(h_rs, w_rs), mode="nearest"  # 1×1×h'×w'
         ).squeeze()
 
     mask_bin = (mask_2d > threshold).cpu().numpy().astype(np.uint8) * 255
@@ -102,3 +100,49 @@ def overlay_mask_on_image(
     final_rgb = canvas.convert("RGB")
     final_rgb.save(out_path)
     return final_rgb
+
+
+def overlay_masks_on_image(
+    image_tensor: torch.Tensor,
+    masks: torch.Tensor,
+    *,
+    threshold: float = 0.5,
+    save_dir: str | Path = "./images",
+    filename_info: str = "se_vis",
+) -> Image.Image:
+    """Overlay multiple masks with distinct colors."""
+
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    out_path = save_dir / f"{filename_info}.jpg"
+
+    if image_tensor.dtype == torch.uint8:
+        base = to_pil_image(image_tensor, mode="RGB")
+    else:
+        base = to_pil_image((image_tensor.clamp(0, 1) * 255).byte(), mode="RGB")
+
+    base = base.convert("RGBA")
+
+    if masks.ndim == 4:
+        masks = masks.squeeze(1)
+    colors = [
+        (255, 0, 0, 80),
+        (0, 255, 0, 80),
+        (0, 0, 255, 80),
+        (255, 255, 0, 80),
+        (255, 0, 255, 80),
+        (0, 255, 255, 80),
+    ]
+
+    for idx, m in enumerate(masks):
+        m_bin = (m > threshold).cpu().numpy().astype(np.uint8) * 255
+        if m_bin.max() == 0:
+            continue
+        color = colors[idx % len(colors)]
+        mask_pil = Image.fromarray(m_bin, mode="L")
+        layer = Image.new("RGBA", base.size, color)
+        base.paste(layer, mask=mask_pil)
+
+    final_img = base.convert("RGB")
+    final_img.save(out_path)
+    return final_img

@@ -27,8 +27,9 @@ from finetune_utils.distill_losses import (
     rkd_loss,
 )
 from finetune_utils.feature_hooks import pop_features, register_hooks
-from finetune_utils.visualization import overlay_mask_on_image
+from finetune_utils.visualization import overlay_mask_on_image, overlay_masks_on_image
 from pathlib import Path
+from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 
 # ─────────────────── logging ───────────────────
@@ -240,6 +241,7 @@ def main():
 
     dist_cfg = cfg.get("distillation", {})
     use_distillation = dist_cfg.get("enable", False) and dataset_mode == "single"
+    lambda_coef = dist_cfg.get("lambda_coef", 1.0)
     hook_handles = []
 
     def _build_pot(model_type: str):
@@ -274,7 +276,12 @@ def main():
     if use_distillation:
         enabled_losses = [
             n
-            for n in ("encoder_matching", "decoder_matching", "attention_matching", "relational_KD")
+            for n in (
+                "encoder_matching",
+                "decoder_matching",
+                "attention_matching",
+                "relational_KD",
+            )
             if dist_cfg.get(n, {}).get("enable")
         ]
         log.info(
@@ -373,10 +380,16 @@ def main():
         min_ratio=tr_cfg.get("min_lr_ratio", 0.0),
     )
 
+    loss_weights = tr_cfg.get("loss_weights", {})
+    w_bce = loss_weights.get("bce", 1.0)
+    w_focal = loss_weights.get("focal", 0.5)
+    w_dice = loss_weights.get("dice", 1.0)
+    w_iou = loss_weights.get("iou", 1.0)
+    w_cls = loss_weights.get("cls", 1.0)
+
     scaler = GradScaler(enabled=not tr_cfg.get("bf16", False))
     writer = SummaryWriter(Path(m_cfg.get("save_path", "logs")) / "tb")
 
-    lambda_coef = 1.0
     dyn_wait = 0
     best_score, stop_counter = -1, 0
     patience = tr_cfg.get("early_stop_patience", 20)
@@ -391,9 +404,12 @@ def main():
         global_step = 0
         for ep in range(tr_cfg["epochs"]):
             if ep == unfreeze_epoch:
-                log.info(f"Unfreeze image_encoder at epoch {ep}")
+                log.info(f"Unfreeze all modules at epoch {ep}")
                 student.image_encoder.requires_grad_(True)
-                opt.param_groups[1]["lr"] = tr_cfg["lr"] * 0.2
+                student.prompt_encoder.requires_grad_(True)
+                student.mask_decoder.requires_grad_(True)
+                if len(opt.param_groups) > 1:
+                    opt.param_groups[1]["lr"] = tr_cfg["lr"] * 0.2
 
             if ep > 0:
                 feature_cache.clear()
@@ -401,7 +417,7 @@ def main():
                 log_gpu_memory(f"Epoch {ep} start (after cache clear)")
 
             student.train()
-            tot_task, tot_dist, tot_iou = 0.0, 0.0, 0.0
+            tot_task, tot_dist, tot_iou, tot_cls = 0.0, 0.0, 0.0, 0.0
             pbar = tqdm(tr_loader, desc=f"Train {ep}")
             opt.zero_grad()
 
@@ -415,6 +431,7 @@ def main():
                 dec_loss_val = torch.tensor(0.0, device=dev)
                 attn_loss_val = torch.tensor(0.0, device=dev)
                 rkd_loss_val = torch.tensor(0.0, device=dev)
+                cls_loss_val = torch.tensor(0.0, device=dev)
                 task_loss = torch.tensor(0.0, device=dev)
                 loss = torch.tensor(0.0, device=dev)
                 #
@@ -470,7 +487,16 @@ def main():
                         num = (prob * masks).sum((-2, -1)) * 2
                         den = prob.sum((-2, -1)) + masks.sum((-2, -1))
                         dice_loss = 1 - (num / (den + 1e-6)).mean()
-                        task_loss = bce + 0.5 * focal + dice_loss
+                        best_conf = pred_ious.gather(1, best_indices.unsqueeze(1)).squeeze(1)
+                        cls_loss_val += F.binary_cross_entropy(
+                            best_conf, torch.ones_like(best_conf), reduction="mean"
+                        )
+                        task_loss = (
+                            w_bce * bce
+                            + w_focal * focal
+                            + w_dice * dice_loss
+                            + w_cls * cls_loss_val
+                        )
 
                         with torch.no_grad():
                             gt_bin = masks > 0.5
@@ -493,7 +519,7 @@ def main():
                             student,
                             imgs[bi],
                             point_coords[bi].to(dev),
-                            (int(osz[bi][0]), int(osz[bi][1])),
+                            (int(imgs[bi].shape[-2]), int(imgs[bi].shape[-1])),
                         )
                         pred_masks_all.append(pm)
                         pred_ious_all.append(pi)
@@ -502,6 +528,8 @@ def main():
                     focal = torch.tensor(0.0, device=dev)
                     dice_loss = torch.tensor(0.0, device=dev)
                     iou_loss = torch.tensor(0.0, device=dev)
+                    cls_total = 0
+                    matched_cnt = 0
 
                     for bi in range(len(imgs)):
                         gt = gt_masks[bi].to(dev)  # [K,1,S,S]
@@ -517,24 +545,32 @@ def main():
                         )
                         iou_mat = inter / (union + 1e-6)
                         best_iou, best_gt = iou_mat.max(dim=1)
-                        for j in range(preds.shape[0]):
-                            target = (
-                                gt[best_gt[j]] if best_iou[j] >= 0.8 else torch.zeros_like(gt[0])
-                            )
-                            logit = preds[j].unsqueeze(0)
+                        match_mask = best_iou >= 0.5
+                        cls_loss_val += F.binary_cross_entropy(
+                            ious_pred, match_mask.float(), reduction="sum"
+                        )
+                        cls_total += match_mask.numel()
+                        matched_cnt += match_mask.sum().item()
+                        for j in torch.nonzero(match_mask, as_tuple=False).flatten():
+                            target = gt[best_gt[j]]
+                            logit = preds[j].unsqueeze(0).unsqueeze(0)
                             target_exp = target.unsqueeze(0)
                             bce += F.binary_cross_entropy_with_logits(logit, target_exp)
                             focal += sigmoid_focal_loss(logit, target_exp, reduction="mean")
                             prob = torch.sigmoid(logit)
                             num = (prob * target_exp).sum((-2, -1)) * 2
                             den = prob.sum((-2, -1)) + target_exp.sum((-2, -1))
-                            dice_loss += 1 - (num / (den + 1e-6))
+                            dice_loss += 1 - (num / (den + 1e-6)).mean()
                             iou_loss += F.mse_loss(ious_pred[j], best_iou[j])
 
-                    n_pred = sum(p.reshape(-1).shape[0] for p in pred_masks_all)
-                    task_loss = bce + 0.5 * focal + dice_loss
-                    task_loss = task_loss / max(1, n_pred)
-                    iou_loss = iou_loss / max(1, n_pred)
+                    # Average using only the matched predictions to avoid loss dilution.
+                    n_matched = matched_cnt
+                    cls_loss_val = cls_loss_val / max(1, cls_total)
+                    task_loss = (
+                        w_bce * bce + w_focal * focal + w_dice * dice_loss + w_cls * cls_loss_val
+                    )
+                    task_loss = task_loss / max(1, n_matched)
+                    iou_loss = iou_loss / max(1, n_matched)
 
                     dist_loss = torch.tensor(0.0, device=dev)
                     if use_distillation and hook_handles:
@@ -552,7 +588,8 @@ def main():
                             for tinfo in teacher_models:
                                 with torch.no_grad():
                                     _ = tinfo["model"](
-                                        batched_input=batched_input, multimask_output=False
+                                        batched_input=batched_input,
+                                        multimask_output=False,
                                     )
                                 teacher_feats[tinfo["name"]] = pop_features() or {}
                             if step % 20 == 0:
@@ -589,7 +626,11 @@ def main():
 
                                         if use_precomputed:
                                             feat_teacher = load_cached_npy_features(
-                                                base_dir, tname, "train", ids, selected_enc_keys_t
+                                                base_dir,
+                                                tname,
+                                                "train",
+                                                ids,
+                                                selected_enc_keys_t,
                                             )
                                         else:
                                             feat_teacher = [
@@ -603,7 +644,10 @@ def main():
                                             **_get_loss_params(dist_cfg["encoder_matching"]),
                                             n_layers=num_layers_to_compare,
                                         )
-                                        enc_loss_val += weight * enc_loss
+                                        w_enc = dist_cfg.get("encoder_matching", {}).get(
+                                            "weight", 1.0
+                                        )
+                                        enc_loss_val += weight * w_enc * enc_loss
                                         if step % 20 == 0:
                                             log.info(f"enc_loss[{tname}]={enc_loss.item():.4f}")
                                     except Exception as e:
@@ -626,7 +670,11 @@ def main():
                                     try:
                                         if use_precomputed:
                                             feat_teacher = load_cached_npy_features(
-                                                base_dir, tname, "train", ids, dec_keys_t
+                                                base_dir,
+                                                tname,
+                                                "train",
+                                                ids,
+                                                dec_keys_t,
                                             )[0]
                                         else:
                                             feat_teacher = teacher_feats[tname][dec_keys_t[0]][0]
@@ -636,7 +684,10 @@ def main():
                                             feat_teacher,
                                             **_get_loss_params(dist_cfg["decoder_matching"]),
                                         )
-                                        dec_loss_val += weight * dec_loss
+                                        w_dec = dist_cfg.get("decoder_matching", {}).get(
+                                            "weight", 1.0
+                                        )
+                                        dec_loss_val += weight * w_dec * dec_loss
                                         if step % 20 == 0:
                                             log.info(f"dec_loss[{tname}]={dec_loss.item():.4f}")
                                     except Exception as e:
@@ -659,7 +710,11 @@ def main():
 
                                         if use_precomputed:
                                             attn_teacher = load_cached_npy_features(
-                                                base_dir, tname, "train", ids, selected_attn_keys_t
+                                                base_dir,
+                                                tname,
+                                                "train",
+                                                ids,
+                                                selected_attn_keys_t,
                                             )
                                         else:
                                             attn_teacher = [
@@ -676,7 +731,10 @@ def main():
                                             ),
                                             n_layers=num_layers_to_compare,
                                         )
-                                        attn_loss_val += weight * attn_loss
+                                        w_attn = dist_cfg.get("attention_matching", {}).get(
+                                            "weight", 1.0
+                                        )
+                                        attn_loss_val += weight * w_attn * attn_loss
                                         if step % 20 == 0:
                                             log.info(f"attn_loss[{tname}]={attn_loss.item():.4f}")
                                     except Exception as e:
@@ -708,17 +766,19 @@ def main():
                                             feat_student[rk_keys_s[0]][0],
                                             feat_teacher,
                                             **_get_loss_params(
-                                                dist_cfg["relational_KD"], {"lambda": "lambda_rkd"}
+                                                dist_cfg["relational_KD"],
+                                                {"lambda": "lambda_rkd"},
                                             ),
                                         )
-                                        rkd_loss_val += weight * rk_loss
+                                        w_rkd = dist_cfg.get("relational_KD", {}).get("weight", 1.0)
+                                        rkd_loss_val += weight * w_rkd * rk_loss
                                         if step % 20 == 0:
                                             log.info(f"rkd_loss[{tname}]={rk_loss.item():.4f}")
                                     except Exception as e:
                                         log.warning(f"RKD error for teacher {tname}: {e}")
 
                     dist_loss = enc_loss_val + dec_loss_val + attn_loss_val + rkd_loss_val
-                    loss = (task_loss + iou_loss + lambda_coef * dist_loss) / tr_cfg.get(
+                    loss = (task_loss + w_iou * iou_loss + lambda_coef * dist_loss) / tr_cfg.get(
                         "gradient_accumulation", 1
                     )
 
@@ -742,17 +802,32 @@ def main():
                 tot_task += task_loss.item()
                 tot_dist += dist_loss.item()
                 tot_iou += iou_loss.item()
+                tot_cls += cls_loss_val.item()
+
+                ga = tr_cfg.get("gradient_accumulation", 1)
+                norm = n_matched if dataset_mode == "everything" else 1
+                bce_c = w_bce * bce.item() / max(1, norm) / ga
+                focal_c = w_focal * focal.item() / max(1, norm) / ga
+                dice_c = w_dice * dice_loss.item() / max(1, norm) / ga
+                iou_c = w_iou * iou_loss.item() / ga
+                cls_c = w_cls * cls_loss_val.item() / ga
+                enc_c = lambda_coef * enc_loss_val.item() / ga
+                dec_c = lambda_coef * dec_loss_val.item() / ga
+                attn_c = lambda_coef * attn_loss_val.item() / ga
+                rkd_c = lambda_coef * rkd_loss_val.item() / ga
+                dist_c = lambda_coef * dist_loss.item() / ga
 
                 pbar.set_postfix(
-                    bce=f"{bce.item():.3f}",
-                    focal=f"{focal.item():.3f}",
-                    dice=f"{dice_loss.item():.3f}",
-                    iou=f"{iou_loss.item():.3f}",
-                    enc=f"{enc_loss_val.item():.3f}",
-                    dec=f"{dec_loss_val.item():.3f}",
-                    attn=f"{attn_loss_val.item():.3f}",
-                    rkd=f"{rkd_loss_val.item():.3f}",
-                    dist=f"{dist_loss.item():.3f}",
+                    bce=f"{bce_c:.3f}",
+                    focal=f"{focal_c:.3f}",
+                    dice=f"{dice_c:.3f}",
+                    iou=f"{iou_c:.3f}",
+                    cls=f"{cls_c:.3f}",
+                    enc=f"{enc_c:.3f}",
+                    dec=f"{dec_c:.3f}",
+                    attn=f"{attn_c:.3f}",
+                    rkd=f"{rkd_c:.3f}",
+                    dist=f"{dist_c:.3f}",
                     total=f"{loss.item():.3f}",
                     lr=f"{scheduler.get_last_lr()[0]:.2e}",
                 )
@@ -763,6 +838,7 @@ def main():
             writer.add_scalar("train/task_loss", tot_task / len(tr_loader), ep)
             writer.add_scalar("train/dist_loss", tot_dist / len(tr_loader), ep)
             writer.add_scalar("train/iou_loss", tot_iou / len(tr_loader), ep)
+            writer.add_scalar("train/cls_loss", tot_cls / len(tr_loader), ep)
             writer.add_scalar("train/lambda_coef", lambda_coef, ep)
             for i, g in enumerate(opt.param_groups):
                 writer.add_scalar(f"lr/group{i}", g["lr"], ep)
@@ -777,125 +853,192 @@ def main():
                 for bi, vb in enumerate(va_loader):
                     try:
                         imgs = vb["image"].to(dev)
-                        masks = vb["mask"].to(dev)
                         original_sizes = vb["original_size"]
 
-                        vinp = []
-                        for i in range(len(imgs)):
-                            entry = {
-                                "image": imgs[i],
-                                "original_size": (
-                                    int(original_sizes[i][0]),
-                                    int(original_sizes[i][1]),
-                                ),
-                            }
-                            if vb["box_prompt"][i] is not None:
-                                entry["boxes"] = vb["box_prompt"][i].to(dev).unsqueeze(0)  # (1,4)
-                            if vb["point_coords"][i] is not None:
-                                entry["point_coords"] = (
-                                    vb["point_coords"][i].to(dev).unsqueeze(0)
-                                )  # (1,K,2)
-                                entry["point_labels"] = (
-                                    vb["point_labels"][i].to(dev).unsqueeze(0)
-                                )  # (1,K)
-                            vinp.append(entry)
-                        vo = student(batched_input=vinp, multimask_output=True)
+                        if dataset_mode == "single":
+                            masks = vb["mask"].to(dev)
 
-                        mask_list = []
-                        iou_list = []
-                        for o in vo:
-                            mask_up = F.interpolate(
-                                o["masks"].to(torch.float32),
-                                size=masks.shape[-2:],
-                                mode="bilinear",
-                                align_corners=False,
-                            ).squeeze(0)
-                            mask_list.append(mask_up)
-                            iou_list.append(o["iou_predictions"].squeeze(0).to(torch.float32))
+                            vinp = []
+                            for i in range(len(imgs)):
+                                entry = {
+                                    "image": imgs[i],
+                                    "original_size": (
+                                        int(original_sizes[i][0]),
+                                        int(original_sizes[i][1]),
+                                    ),
+                                }
+                                if vb["box_prompt"][i] is not None:
+                                    entry["boxes"] = (
+                                        vb["box_prompt"][i].to(dev).unsqueeze(0)
+                                    )  # (1,4)
+                                if vb["point_coords"][i] is not None:
+                                    entry["point_coords"] = (
+                                        vb["point_coords"][i].to(dev).unsqueeze(0)
+                                    )  # (1,K,2)
+                                    entry["point_labels"] = (
+                                        vb["point_labels"][i].to(dev).unsqueeze(0)
+                                    )  # (1,K)
+                                vinp.append(entry)
+                            vo = student(batched_input=vinp, multimask_output=True)
 
-                        pred_masks = torch.stack(mask_list, dim=0)
-                        pred_ious = torch.stack(iou_list, dim=0)
+                            mask_list = []
+                            iou_list = []
+                            for o in vo:
+                                mask_up = F.interpolate(
+                                    o["masks"].to(torch.float32),
+                                    size=masks.shape[-2:],
+                                    mode="bilinear",
+                                    align_corners=False,
+                                ).squeeze(0)
+                                mask_list.append(mask_up)
+                                iou_list.append(o["iou_predictions"].squeeze(0).to(torch.float32))
 
-                        best_indices = pred_ious.argmax(dim=1)
-                        probs = torch.sigmoid(
-                            pred_masks[torch.arange(len(pred_masks)), best_indices].unsqueeze(1)
-                        )
+                            pred_masks = torch.stack(mask_list, dim=0)
+                            pred_ious = torch.stack(iou_list, dim=0)
 
-                        for i in range(len(imgs)):
-                            prob_i = probs[i]  # [1,1024,1024]
-                            gt_i = masks[i]  # [1,1024,1024]
+                            best_indices = pred_ious.argmax(dim=1)
+                            probs = torch.sigmoid(
+                                pred_masks[torch.arange(len(pred_masks)), best_indices].unsqueeze(1)
+                            )
 
-                            # Soft Dice for loss logging
-                            num_soft = (prob_i * gt_i).sum((-2, -1)) * 2
-                            den_soft = prob_i.sum((-2, -1)) + gt_i.sum((-2, -1))
-                            soft_dice = (num_soft / (den_soft + 1e-6)).item()
+                            for i in range(len(imgs)):
+                                prob_i = probs[i]
+                                gt_i = masks[i]
 
-                            # Binary metrics
-                            pred_bin = (prob_i >= 0.5).float()
-                            num_bin = (pred_bin * gt_i).sum((-2, -1)) * 2
-                            den_bin = pred_bin.sum((-2, -1)) + gt_i.sum((-2, -1))
-                            bin_dice = (num_bin / (den_bin + 1e-6)).item()
+                                # Soft Dice for loss logging
+                                num_soft = (prob_i * gt_i).sum((-2, -1)) * 2
+                                den_soft = prob_i.sum((-2, -1)) + gt_i.sum((-2, -1))
+                                soft_dice = (num_soft / (den_soft + 1e-6)).item()
 
-                            union = pred_bin + gt_i - pred_bin * gt_i
-                            bin_iou = (
-                                (pred_bin * gt_i).sum((-2, -1)) / (union.sum((-2, -1)) + 1e-6)
-                            ).item()
+                                # Binary metrics
+                                pred_bin = (prob_i >= 0.5).float()
+                                num_bin = (pred_bin * gt_i).sum((-2, -1)) * 2
+                                den_bin = pred_bin.sum((-2, -1)) + gt_i.sum((-2, -1))
+                                bin_dice = (num_bin / (den_bin + 1e-6)).item()
 
-                            dices.append(bin_dice)
-                            ious.append(bin_iou)
+                                union = pred_bin + gt_i - pred_bin * gt_i
+                                bin_iou = (
+                                    (pred_bin * gt_i).sum((-2, -1)) / (union.sum((-2, -1)) + 1e-6)
+                                ).item()
 
-                            # 印 debug: 第一張
-                            if bi == 0 and i == 0:
-                                log.info(
-                                    f"[VAL] id={vb['id'][i]}, "
-                                    f"soft_dice={soft_dice:.3f}, "
-                                    f"bin_dice={bin_dice:.3f}, bin_iou={bin_iou:.3f}, "
-                                    f"gt_sum={gt_i.sum().item():.0f}, "
-                                    f"pred_sum={pred_bin.sum().item():.0f}"
+                                dices.append(bin_dice)
+                                ious.append(bin_iou)
+
+                                # 印 debug: 第一張
+                                if bi == 0 and i == 0:
+                                    log.info(
+                                        f"[VAL] id={vb['id'][i]}, "
+                                        f"soft_dice={soft_dice:.3f}, "
+                                        f"bin_dice={bin_dice:.3f}, bin_iou={bin_iou:.3f}, "
+                                        f"gt_sum={gt_i.sum().item():.0f}, "
+                                        f"pred_sum={pred_bin.sum().item():.0f}"
+                                    )
+
+                                # Visualization
+                                if (
+                                    bi == 0
+                                    and cfg["visual"].get("status", False)
+                                    and (
+                                        ep % cfg["visual"].get("save_every_n_epochs", 10) == 0
+                                        or ((np.mean(dices) + np.mean(ious)) / 2) > best_score
+                                    )
+                                ):
+                                    cur_path = Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
+                                    cur_path.mkdir(parents=True, exist_ok=True)
+                                    img_denorm = (
+                                        imgs[i] * torch.tensor(STD, device=dev)[:, None, None]
+                                        + torch.tensor(MEAN, device=dev)[:, None, None]
+                                    )
+                                    img_denorm = img_denorm.clamp(0, 1).cpu()
+
+                                    pred_mask = probs[i].squeeze(0).cpu()
+
+                                    box = vb["box_prompt"][i]
+                                    pts = vb["point_coords"][i]
+                                    lbl = vb["point_labels"][i]
+                                    if box is not None:
+                                        box = box.to(torch.float32)
+                                    if pts is not None:
+                                        pts = pts.to(torch.float32)
+                                    if lbl is not None:
+                                        lbl = lbl.to(torch.long)
+
+                                    overlay_mask_on_image(
+                                        image_tensor=img_denorm,
+                                        mask_tensor=pred_mask,
+                                        bbox_tensor=box.cpu() if box is not None else None,
+                                        point_coords=pts.cpu() if pts is not None else None,
+                                        point_labels=lbl.cpu() if lbl is not None else None,
+                                        original_size=None,
+                                        threshold=cfg["visual"].get("IOU_threshold", 0.5),
+                                        save_dir=str(cur_path),
+                                        filename_info=(f"ep{ep}_id{vb['id'][i]}_b{bi}_s{i}"),
+                                    )
+                        else:
+                            # Segment-everything validation
+                            gt_masks = vb["gt_masks"]
+                            point_coords = vb["point_coords"]
+
+                            for i in range(len(imgs)):
+                                pm, _ = predict_from_grid(
+                                    student,
+                                    imgs[i],
+                                    point_coords[i].to(dev),
+                                    (int(imgs[i].shape[-2]), int(imgs[i].shape[-1])),
                                 )
 
-                            # Visualization
-                            if (
-                                bi == 0
-                                and cfg["visual"].get("status", False)
-                                and (
-                                    ep % cfg["visual"].get("save_every_n_epochs", 10) == 0
-                                    or ((np.mean(dices) + np.mean(ious)) / 2) > best_score
-                                )
-                            ):
-                                cur_path = Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
-                                cur_path.mkdir(parents=True, exist_ok=True)
-                                img_denorm = (
-                                    imgs[i] * torch.tensor(STD, device=dev)[:, None, None]
-                                    + torch.tensor(MEAN, device=dev)[:, None, None]
-                                )
-                                img_denorm = img_denorm.clamp(0, 1).cpu()
+                                preds = pm.reshape(-1, gt_masks[i].shape[-2], gt_masks[i].shape[-1])
+                                probs = torch.sigmoid(preds)
+                                gt = gt_masks[i].to(dev)
+                                gt_bin = gt.squeeze(1)
+                                pred_bin = (probs >= 0.5).float()
 
-                                pred_mask = probs[i].squeeze(0).cpu()
-
-                                box = vb["box_prompt"][i]
-                                pts = vb["point_coords"][i]
-                                lbl = vb["point_labels"][i]
-                                if box is not None:
-                                    box = box.to(torch.float32)
-                                if pts is not None:
-                                    pts = pts.to(torch.float32)
-                                if lbl is not None:
-                                    lbl = lbl.to(torch.long)
-                                # orig_h, orig_w = int(original_sizes[i][0]), int(original_sizes[i][1])
-
-                                overlay_mask_on_image(
-                                    image_tensor=img_denorm,
-                                    mask_tensor=pred_mask,
-                                    bbox_tensor=box.cpu() if box is not None else None,
-                                    point_coords=pts.cpu() if pts is not None else None,
-                                    point_labels=lbl.cpu() if lbl is not None else None,
-                                    # original_size=(orig_h, orig_w),
-                                    original_size=None,
-                                    threshold=cfg["visual"].get("IOU_threshold", 0.5),
-                                    save_dir=str(cur_path),
-                                    filename_info=(f"ep{ep}_id{vb['id'][i]}_b{bi}_s{i}"),
+                                inter = (pred_bin.unsqueeze(1) * gt_bin.unsqueeze(0)).sum((-2, -1))
+                                union = (
+                                    pred_bin.unsqueeze(1).sum((-2, -1))
+                                    + gt_bin.unsqueeze(0).sum((-2, -1))
+                                    - inter
                                 )
+                                iou_mat = inter / (union + 1e-6)
+
+                                cost = (-iou_mat).cpu().numpy()
+                                row_ind, col_ind = linear_sum_assignment(cost)
+                                for r, c in zip(row_ind, col_ind):
+                                    prob_i = probs[r]
+                                    gt_i = gt[c]
+                                    num_soft = (prob_i * gt_i).sum() * 2
+                                    den_soft = prob_i.sum() + gt_i.sum()
+                                    dice_val = (num_soft / (den_soft + 1e-6)).item()
+                                    iou_val = iou_mat[r, c].item()
+                                    dices.append(dice_val)
+                                    ious.append(iou_val)
+
+                                if (
+                                    bi == 0
+                                    and cfg["visual"].get("status", False)
+                                    and (
+                                        ep % cfg["visual"].get("save_every_n_epochs", 10) == 0
+                                        or ((np.mean(dices) + np.mean(ious)) / 2) > best_score
+                                    )
+                                ):
+                                    cur_path = Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
+                                    cur_path.mkdir(parents=True, exist_ok=True)
+                                    img_denorm = (
+                                        (
+                                            imgs[i] * torch.tensor(STD, device=dev)[:, None, None]
+                                            + torch.tensor(MEAN, device=dev)[:, None, None]
+                                        )
+                                        .clamp(0, 1)
+                                        .cpu()
+                                    )
+                                    best_masks = probs[row_ind].cpu()
+                                    overlay_masks_on_image(
+                                        image_tensor=img_denorm,
+                                        masks=best_masks,
+                                        threshold=cfg["visual"].get("IOU_threshold", 0.5),
+                                        save_dir=str(cur_path),
+                                        filename_info=f"ep{ep}_id{vb['id'][i]}_b{bi}",
+                                    )
                     except Exception as e:
                         log.error(f"Error in validation step {bi}: {e}")
                         clear_gpu_cache()
