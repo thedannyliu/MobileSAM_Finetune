@@ -781,9 +781,10 @@ def main():
                 tot_iou += iou_loss.item()
 
                 ga = tr_cfg.get("gradient_accumulation", 1)
-                bce_c = w_bce * bce.item() / ga
-                focal_c = w_focal * focal.item() / ga
-                dice_c = w_dice * dice_loss.item() / ga
+                norm = n_pred if dataset_mode == "everything" else 1
+                bce_c = w_bce * bce.item() / max(1, norm) / ga
+                focal_c = w_focal * focal.item() / max(1, norm) / ga
+                dice_c = w_dice * dice_loss.item() / max(1, norm) / ga
                 iou_c = w_iou * iou_loss.item() / ga
                 enc_c = lambda_coef * enc_loss_val.item() / ga
                 dec_c = lambda_coef * dec_loss_val.item() / ga
