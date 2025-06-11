@@ -27,7 +27,7 @@ from finetune_utils.distill_losses import (
     rkd_loss,
 )
 from finetune_utils.feature_hooks import pop_features, register_hooks
-from finetune_utils.visualization import overlay_mask_on_image
+from finetune_utils.visualization import overlay_mask_on_image, overlay_masks_on_image
 from pathlib import Path
 from tqdm import tqdm
 
@@ -240,6 +240,7 @@ def main():
 
     dist_cfg = cfg.get("distillation", {})
     use_distillation = dist_cfg.get("enable", False) and dataset_mode == "single"
+    lambda_coef = dist_cfg.get("lambda_coef", 1.0)
     hook_handles = []
 
     def _build_pot(model_type: str):
@@ -378,10 +379,15 @@ def main():
         min_ratio=tr_cfg.get("min_lr_ratio", 0.0),
     )
 
+    loss_weights = tr_cfg.get("loss_weights", {})
+    w_bce = loss_weights.get("bce", 1.0)
+    w_focal = loss_weights.get("focal", 0.5)
+    w_dice = loss_weights.get("dice", 1.0)
+    w_iou = loss_weights.get("iou", 1.0)
+
     scaler = GradScaler(enabled=not tr_cfg.get("bf16", False))
     writer = SummaryWriter(Path(m_cfg.get("save_path", "logs")) / "tb")
 
-    lambda_coef = 1.0
     dyn_wait = 0
     best_score, stop_counter = -1, 0
     patience = tr_cfg.get("early_stop_patience", 20)
@@ -475,7 +481,7 @@ def main():
                         num = (prob * masks).sum((-2, -1)) * 2
                         den = prob.sum((-2, -1)) + masks.sum((-2, -1))
                         dice_loss = 1 - (num / (den + 1e-6)).mean()
-                        task_loss = bce + 0.5 * focal + dice_loss
+                        task_loss = w_bce * bce + w_focal * focal + w_dice * dice_loss
 
                         with torch.no_grad():
                             gt_bin = masks > 0.5
@@ -539,7 +545,7 @@ def main():
                     # Average over the number of predicted masks rather than
                     # the total number of pixels to avoid vanishing loss.
                     n_pred = sum(p.shape[0] for p in pred_masks_all)
-                    task_loss = bce + 0.5 * focal + dice_loss
+                    task_loss = w_bce * bce + w_focal * focal + w_dice * dice_loss
                     task_loss = task_loss / max(1, n_pred)
                     iou_loss = iou_loss / max(1, n_pred)
 
@@ -615,7 +621,10 @@ def main():
                                             **_get_loss_params(dist_cfg["encoder_matching"]),
                                             n_layers=num_layers_to_compare,
                                         )
-                                        enc_loss_val += weight * enc_loss
+                                        w_enc = dist_cfg.get("encoder_matching", {}).get(
+                                            "weight", 1.0
+                                        )
+                                        enc_loss_val += weight * w_enc * enc_loss
                                         if step % 20 == 0:
                                             log.info(f"enc_loss[{tname}]={enc_loss.item():.4f}")
                                     except Exception as e:
@@ -652,7 +661,10 @@ def main():
                                             feat_teacher,
                                             **_get_loss_params(dist_cfg["decoder_matching"]),
                                         )
-                                        dec_loss_val += weight * dec_loss
+                                        w_dec = dist_cfg.get("decoder_matching", {}).get(
+                                            "weight", 1.0
+                                        )
+                                        dec_loss_val += weight * w_dec * dec_loss
                                         if step % 20 == 0:
                                             log.info(f"dec_loss[{tname}]={dec_loss.item():.4f}")
                                     except Exception as e:
@@ -696,7 +708,10 @@ def main():
                                             ),
                                             n_layers=num_layers_to_compare,
                                         )
-                                        attn_loss_val += weight * attn_loss
+                                        w_attn = dist_cfg.get("attention_matching", {}).get(
+                                            "weight", 1.0
+                                        )
+                                        attn_loss_val += weight * w_attn * attn_loss
                                         if step % 20 == 0:
                                             log.info(f"attn_loss[{tname}]={attn_loss.item():.4f}")
                                     except Exception as e:
@@ -732,14 +747,15 @@ def main():
                                                 {"lambda": "lambda_rkd"},
                                             ),
                                         )
-                                        rkd_loss_val += weight * rk_loss
+                                        w_rkd = dist_cfg.get("relational_KD", {}).get("weight", 1.0)
+                                        rkd_loss_val += weight * w_rkd * rk_loss
                                         if step % 20 == 0:
                                             log.info(f"rkd_loss[{tname}]={rk_loss.item():.4f}")
                                     except Exception as e:
                                         log.warning(f"RKD error for teacher {tname}: {e}")
 
                     dist_loss = enc_loss_val + dec_loss_val + attn_loss_val + rkd_loss_val
-                    loss = (task_loss + iou_loss + lambda_coef * dist_loss) / tr_cfg.get(
+                    loss = (task_loss + w_iou * iou_loss + lambda_coef * dist_loss) / tr_cfg.get(
                         "gradient_accumulation", 1
                     )
 
@@ -764,16 +780,27 @@ def main():
                 tot_dist += dist_loss.item()
                 tot_iou += iou_loss.item()
 
+                ga = tr_cfg.get("gradient_accumulation", 1)
+                bce_c = w_bce * bce.item() / ga
+                focal_c = w_focal * focal.item() / ga
+                dice_c = w_dice * dice_loss.item() / ga
+                iou_c = w_iou * iou_loss.item() / ga
+                enc_c = lambda_coef * enc_loss_val.item() / ga
+                dec_c = lambda_coef * dec_loss_val.item() / ga
+                attn_c = lambda_coef * attn_loss_val.item() / ga
+                rkd_c = lambda_coef * rkd_loss_val.item() / ga
+                dist_c = lambda_coef * dist_loss.item() / ga
+
                 pbar.set_postfix(
-                    bce=f"{bce.item():.3f}",
-                    focal=f"{focal.item():.3f}",
-                    dice=f"{dice_loss.item():.3f}",
-                    iou=f"{iou_loss.item():.3f}",
-                    enc=f"{enc_loss_val.item():.3f}",
-                    dec=f"{dec_loss_val.item():.3f}",
-                    attn=f"{attn_loss_val.item():.3f}",
-                    rkd=f"{rkd_loss_val.item():.3f}",
-                    dist=f"{dist_loss.item():.3f}",
+                    bce=f"{bce_c:.3f}",
+                    focal=f"{focal_c:.3f}",
+                    dice=f"{dice_c:.3f}",
+                    iou=f"{iou_c:.3f}",
+                    enc=f"{enc_c:.3f}",
+                    dec=f"{dec_c:.3f}",
+                    attn=f"{attn_c:.3f}",
+                    rkd=f"{rkd_c:.3f}",
+                    dist=f"{dist_c:.3f}",
                     total=f"{loss.item():.3f}",
                     lr=f"{scheduler.get_last_lr()[0]:.2e}",
                 )
@@ -957,6 +984,33 @@ def main():
                                     iou_val = iou_mat[p_idx, g_idx].item()
                                     dices.append(dice_val)
                                     ious.append(iou_val)
+
+                                if (
+                                    bi == 0
+                                    and cfg["visual"].get("status", False)
+                                    and (
+                                        ep % cfg["visual"].get("save_every_n_epochs", 10) == 0
+                                        or ((np.mean(dices) + np.mean(ious)) / 2) > best_score
+                                    )
+                                ):
+                                    cur_path = Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
+                                    cur_path.mkdir(parents=True, exist_ok=True)
+                                    img_denorm = (
+                                        (
+                                            imgs[i] * torch.tensor(STD, device=dev)[:, None, None]
+                                            + torch.tensor(MEAN, device=dev)[:, None, None]
+                                        )
+                                        .clamp(0, 1)
+                                        .cpu()
+                                    )
+                                    best_masks = probs[best_pred].cpu()
+                                    overlay_masks_on_image(
+                                        image_tensor=img_denorm,
+                                        masks=best_masks,
+                                        threshold=cfg["visual"].get("IOU_threshold", 0.5),
+                                        save_dir=str(cur_path),
+                                        filename_info=f"ep{ep}_id{vb['id'][i]}_b{bi}",
+                                    )
                     except Exception as e:
                         log.error(f"Error in validation step {bi}: {e}")
                         clear_gpu_cache()
