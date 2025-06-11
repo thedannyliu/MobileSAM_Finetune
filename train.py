@@ -493,7 +493,7 @@ def main():
                             student,
                             imgs[bi],
                             point_coords[bi].to(dev),
-                            (int(osz[bi][0]), int(osz[bi][1])),
+                            (int(imgs[bi].shape[-2]), int(imgs[bi].shape[-1])),
                         )
                         pred_masks_all.append(pm)
                         pred_ious_all.append(pi)
@@ -521,14 +521,14 @@ def main():
                             target = (
                                 gt[best_gt[j]] if best_iou[j] >= 0.8 else torch.zeros_like(gt[0])
                             )
-                            logit = preds[j].unsqueeze(0)
+                            logit = preds[j].unsqueeze(0).unsqueeze(0)
                             target_exp = target.unsqueeze(0)
                             bce += F.binary_cross_entropy_with_logits(logit, target_exp)
                             focal += sigmoid_focal_loss(logit, target_exp, reduction="mean")
                             prob = torch.sigmoid(logit)
                             num = (prob * target_exp).sum((-2, -1)) * 2
                             den = prob.sum((-2, -1)) + target_exp.sum((-2, -1))
-                            dice_loss += 1 - (num / (den + 1e-6))
+                            dice_loss += 1 - (num / (den + 1e-6)).mean()
                             iou_loss += F.mse_loss(ious_pred[j], best_iou[j])
 
                     n_pred = sum(p.reshape(-1).shape[0] for p in pred_masks_all)
