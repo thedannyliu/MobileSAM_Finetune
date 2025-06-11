@@ -44,9 +44,7 @@ def log_gpu_memory(step_name=""):
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1024**3
         cached = torch.cuda.memory_reserved() / 1024**3
-        log.info(
-            f"{step_name} GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB"
-        )
+        log.info(f"{step_name} GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB")
 
 
 def clear_gpu_cache():
@@ -69,8 +67,7 @@ class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
         prog = (cur - self.warmup) / max(1, (self.total - self.warmup))
         cos = 0.5 * (1 + np.cos(np.pi * prog))
         return [
-            base_lr * (self.min_ratio + (1 - self.min_ratio) * cos)
-            for base_lr in self.base_lrs
+            base_lr * (self.min_ratio + (1 - self.min_ratio) * cos) for base_lr in self.base_lrs
         ]
 
 
@@ -110,9 +107,7 @@ def load_cached_npy_features(
     stacked = {k: [] for k in keys}
     for stem in stems:
         for k in keys:
-            fname = (
-                f"{stem}_{k.replace('.', '_').replace('[', '_').replace(']', '')}.npy"
-            )
+            fname = f"{stem}_{k.replace('.', '_').replace('[', '_').replace(']', '')}.npy"
             stacked[k].append(feature_cache.get(base / teacher / split / fname))
     return [torch.stack(stacked[k]) for k in keys]
 
@@ -321,9 +316,7 @@ def main():
             if not use_precomputed:
                 ckpt = t.get("checkpoint")
                 if not ckpt or not os.path.exists(ckpt):
-                    log.warning(
-                        f"Teacher checkpoint {ckpt} not found; skip {t['name']}"
-                    )
+                    log.warning(f"Teacher checkpoint {ckpt} not found; skip {t['name']}")
                     continue
                 builder = sam_model_registry.get(mtype)
                 if builder is None:
@@ -352,9 +345,7 @@ def main():
                         "type": mtype,
                     }
                 )
-                log.info(
-                    f"Loaded teacher {t['name']} ({mtype}) with weight {t['weight']}"
-                )
+                log.info(f"Loaded teacher {t['name']} ({mtype}) with weight {t['weight']}")
             else:
                 log.info(f"Using precomputed features for teacher {t['name']}")
     else:
@@ -448,23 +439,15 @@ def main():
                         if batch["box_prompt"][i] is not None:
                             entry["boxes"] = batch["box_prompt"][i].to(dev).unsqueeze(0)
                         if batch["point_coords"][i] is not None:
-                            entry["point_coords"] = (
-                                batch["point_coords"][i].to(dev).unsqueeze(0)
-                            )
-                            entry["point_labels"] = (
-                                batch["point_labels"][i].to(dev).unsqueeze(0)
-                            )
+                            entry["point_coords"] = batch["point_coords"][i].to(dev).unsqueeze(0)
+                            entry["point_labels"] = batch["point_labels"][i].to(dev).unsqueeze(0)
 
                         batched_input.append(entry)
 
                     with autocast(
-                        dtype=torch.bfloat16
-                        if tr_cfg.get("bf16", False)
-                        else torch.float16
+                        dtype=torch.bfloat16 if tr_cfg.get("bf16", False) else torch.float16
                     ):
-                        out = student(
-                            batched_input=batched_input, multimask_output=True
-                        )
+                        out = student(batched_input=batched_input, multimask_output=True)
 
                         mask_list = []
                         iou_list = []
@@ -476,17 +459,13 @@ def main():
                                 align_corners=False,
                             ).squeeze(0)
                             mask_list.append(mask_up)
-                            iou_list.append(
-                                o["iou_predictions"].squeeze(0).to(torch.float32)
-                            )
+                            iou_list.append(o["iou_predictions"].squeeze(0).to(torch.float32))
 
                         pred_masks = torch.stack(mask_list, dim=0)
                         pred_ious = torch.stack(iou_list, dim=0)
 
                         best_indices = pred_ious.argmax(dim=1)
-                        sel_masks = pred_masks[
-                            torch.arange(len(pred_masks)), best_indices
-                        ]
+                        sel_masks = pred_masks[torch.arange(len(pred_masks)), best_indices]
                         sel_masks = sel_masks.unsqueeze(1)
 
                         bce = F.binary_cross_entropy_with_logits(sel_masks, masks)
@@ -504,11 +483,7 @@ def main():
                             for b in range(pred_masks.shape[0]):
                                 preds_bin = (torch.sigmoid(pred_masks[b]) > 0.5).float()
                                 inter = (preds_bin * gt_bin[b]).sum((-2, -1))
-                                union = (
-                                    preds_bin.sum((-2, -1))
-                                    + gt_bin[b].sum((-2, -1))
-                                    - inter
-                                )
+                                union = preds_bin.sum((-2, -1)) + gt_bin[b].sum((-2, -1)) - inter
                                 ious.append(inter / (union + 1e-6))
                             gt_ious = torch.stack(ious, dim=0)
 
@@ -535,15 +510,11 @@ def main():
 
                     for bi in range(len(imgs)):
                         gt = gt_masks[bi].to(dev)  # [K,1,S,S]
-                        preds = pred_masks_all[bi].reshape(
-                            -1, gt.shape[-2], gt.shape[-1]
-                        )
+                        preds = pred_masks_all[bi].reshape(-1, gt.shape[-2], gt.shape[-1])
                         ious_pred = pred_ious_all[bi].reshape(-1)
                         gt_flat = gt.squeeze(1)
                         pred_bin = (torch.sigmoid(preds) > 0.5).float()
-                        inter = (pred_bin.unsqueeze(1) * gt_flat.unsqueeze(0)).sum(
-                            (-2, -1)
-                        )
+                        inter = (pred_bin.unsqueeze(1) * gt_flat.unsqueeze(0)).sum((-2, -1))
                         union = (
                             pred_bin.unsqueeze(1).sum((-2, -1))
                             + gt_flat.unsqueeze(0).sum((-2, -1))
@@ -553,16 +524,12 @@ def main():
                         best_iou, best_gt = iou_mat.max(dim=1)
                         for j in range(preds.shape[0]):
                             target = (
-                                gt[best_gt[j]]
-                                if best_iou[j] >= 0.8
-                                else torch.zeros_like(gt[0])
+                                gt[best_gt[j]] if best_iou[j] >= 0.8 else torch.zeros_like(gt[0])
                             )
                             logit = preds[j].unsqueeze(0).unsqueeze(0)
                             target_exp = target.unsqueeze(0)
                             bce += F.binary_cross_entropy_with_logits(logit, target_exp)
-                            focal += sigmoid_focal_loss(
-                                logit, target_exp, reduction="mean"
-                            )
+                            focal += sigmoid_focal_loss(logit, target_exp, reduction="mean")
                             prob = torch.sigmoid(logit)
                             num = (prob * target_exp).sum((-2, -1)) * 2
                             den = prob.sum((-2, -1)) + target_exp.sum((-2, -1))
@@ -584,9 +551,7 @@ def main():
                                 f"Student features: { {k: [tuple(t.shape) for t in v] for k, v in feat_student.items()} }"
                             )
 
-                        use_precomputed = dist_cfg.get(
-                            "use_precomputed_features", False
-                        )
+                        use_precomputed = dist_cfg.get("use_precomputed_features", False)
                         base_dir = Path(dist_cfg.get("precomputed_root", "precomputed"))
                         teacher_feats = {}
 
@@ -610,11 +575,7 @@ def main():
                             tpot = teacher_pots.get(tname, pot)
 
                             def _get_loss_params(config_dict, rename_map=None):
-                                params = {
-                                    k: v
-                                    for k, v in config_dict.items()
-                                    if k != "enable"
-                                }
+                                params = {k: v for k, v in config_dict.items() if k != "enable"}
                                 if rename_map:
                                     for old_key, new_key in rename_map.items():
                                         if old_key in params:
@@ -632,9 +593,7 @@ def main():
                                 ):
                                     try:
                                         num_layers_to_compare = len(enc_keys_s)
-                                        selected_enc_keys_t = enc_keys_t[
-                                            -num_layers_to_compare:
-                                        ]
+                                        selected_enc_keys_t = enc_keys_t[-num_layers_to_compare:]
 
                                         if use_precomputed:
                                             feat_teacher = load_cached_npy_features(
@@ -653,16 +612,12 @@ def main():
                                         enc_loss = encoder_matching_loss(
                                             [feat_student[k][0] for k in enc_keys_s],
                                             feat_teacher,
-                                            **_get_loss_params(
-                                                dist_cfg["encoder_matching"]
-                                            ),
+                                            **_get_loss_params(dist_cfg["encoder_matching"]),
                                             n_layers=num_layers_to_compare,
                                         )
                                         enc_loss_val += weight * enc_loss
                                         if step % 20 == 0:
-                                            log.info(
-                                                f"enc_loss[{tname}]={enc_loss.item():.4f}"
-                                            )
+                                            log.info(f"enc_loss[{tname}]={enc_loss.item():.4f}")
                                     except Exception as e:
                                         log.warning(
                                             f"Encoder matching error for teacher {tname}: {e}"
@@ -690,22 +645,16 @@ def main():
                                                 dec_keys_t,
                                             )[0]
                                         else:
-                                            feat_teacher = teacher_feats[tname][
-                                                dec_keys_t[0]
-                                            ][0]
+                                            feat_teacher = teacher_feats[tname][dec_keys_t[0]][0]
 
                                         dec_loss = decoder_matching_loss(
                                             feat_student[dec_keys_s[0]][0],
                                             feat_teacher,
-                                            **_get_loss_params(
-                                                dist_cfg["decoder_matching"]
-                                            ),
+                                            **_get_loss_params(dist_cfg["decoder_matching"]),
                                         )
                                         dec_loss_val += weight * dec_loss
                                         if step % 20 == 0:
-                                            log.info(
-                                                f"dec_loss[{tname}]={dec_loss.item():.4f}"
-                                            )
+                                            log.info(f"dec_loss[{tname}]={dec_loss.item():.4f}")
                                     except Exception as e:
                                         log.warning(
                                             f"Decoder matching error for teacher {tname}: {e}"
@@ -722,9 +671,7 @@ def main():
                                 ):
                                     try:
                                         num_layers_to_compare = len(attn_keys_s)
-                                        selected_attn_keys_t = attn_keys_t[
-                                            -num_layers_to_compare:
-                                        ]
+                                        selected_attn_keys_t = attn_keys_t[-num_layers_to_compare:]
 
                                         if use_precomputed:
                                             attn_teacher = load_cached_npy_features(
@@ -751,9 +698,7 @@ def main():
                                         )
                                         attn_loss_val += weight * attn_loss
                                         if step % 20 == 0:
-                                            log.info(
-                                                f"attn_loss[{tname}]={attn_loss.item():.4f}"
-                                            )
+                                            log.info(f"attn_loss[{tname}]={attn_loss.item():.4f}")
                                     except Exception as e:
                                         log.warning(
                                             f"Attention matching error for teacher {tname}: {e}"
@@ -777,9 +722,7 @@ def main():
                                                 base_dir, tname, "train", ids, rk_keys_t
                                             )[0]
                                         else:
-                                            feat_teacher = teacher_feats[tname][
-                                                rk_keys_t[0]
-                                            ][0]
+                                            feat_teacher = teacher_feats[tname][rk_keys_t[0]][0]
 
                                         rk_loss = rkd_loss(
                                             feat_student[rk_keys_s[0]][0],
@@ -791,29 +734,23 @@ def main():
                                         )
                                         rkd_loss_val += weight * rk_loss
                                         if step % 20 == 0:
-                                            log.info(
-                                                f"rkd_loss[{tname}]={rk_loss.item():.4f}"
-                                            )
+                                            log.info(f"rkd_loss[{tname}]={rk_loss.item():.4f}")
                                     except Exception as e:
-                                        log.warning(
-                                            f"RKD error for teacher {tname}: {e}"
-                                        )
+                                        log.warning(f"RKD error for teacher {tname}: {e}")
 
-                    dist_loss = (
-                        enc_loss_val + dec_loss_val + attn_loss_val + rkd_loss_val
+                    dist_loss = enc_loss_val + dec_loss_val + attn_loss_val + rkd_loss_val
+                    loss = (task_loss + iou_loss + lambda_coef * dist_loss) / tr_cfg.get(
+                        "gradient_accumulation", 1
                     )
-                    loss = (
-                        task_loss + iou_loss + lambda_coef * dist_loss
-                    ) / tr_cfg.get("gradient_accumulation", 1)
 
                 scaler.scale(loss).backward()
                 # del low_res_logits, tmp, logit_up, prob, focal, dice_loss
                 if use_distillation and "feat_student" in locals():
                     del feat_student
 
-                if (step + 1) % tr_cfg.get("gradient_accumulation", 1) == 0 or (
-                    step + 1
-                ) == len(tr_loader):
+                if (step + 1) % tr_cfg.get("gradient_accumulation", 1) == 0 or (step + 1) == len(
+                    tr_loader
+                ):
                     scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
                     scaler.step(opt)
@@ -866,135 +803,122 @@ def main():
                         if dataset_mode == "single":
                             masks = vb["mask"].to(dev)
 
-                        vinp = []
-                        for i in range(len(imgs)):
-                            entry = {
-                                "image": imgs[i],
-                                "original_size": (
-                                    int(original_sizes[i][0]),
-                                    int(original_sizes[i][1]),
-                                ),
-                            }
-                            if vb["box_prompt"][i] is not None:
-                                entry["boxes"] = (
-                                    vb["box_prompt"][i].to(dev).unsqueeze(0)
-                                )  # (1,4)
-                            if vb["point_coords"][i] is not None:
-                                entry["point_coords"] = (
-                                    vb["point_coords"][i].to(dev).unsqueeze(0)
-                                )  # (1,K,2)
-                                entry["point_labels"] = (
-                                    vb["point_labels"][i].to(dev).unsqueeze(0)
-                                )  # (1,K)
-                            vinp.append(entry)
-                        vo = student(batched_input=vinp, multimask_output=True)
+                            vinp = []
+                            for i in range(len(imgs)):
+                                entry = {
+                                    "image": imgs[i],
+                                    "original_size": (
+                                        int(original_sizes[i][0]),
+                                        int(original_sizes[i][1]),
+                                    ),
+                                }
+                                if vb["box_prompt"][i] is not None:
+                                    entry["boxes"] = (
+                                        vb["box_prompt"][i].to(dev).unsqueeze(0)
+                                    )  # (1,4)
+                                if vb["point_coords"][i] is not None:
+                                    entry["point_coords"] = (
+                                        vb["point_coords"][i].to(dev).unsqueeze(0)
+                                    )  # (1,K,2)
+                                    entry["point_labels"] = (
+                                        vb["point_labels"][i].to(dev).unsqueeze(0)
+                                    )  # (1,K)
+                                vinp.append(entry)
+                            vo = student(batched_input=vinp, multimask_output=True)
 
-                        mask_list = []
-                        iou_list = []
-                        for o in vo:
-                            mask_up = F.interpolate(
-                                o["masks"].to(torch.float32),
-                                size=masks.shape[-2:],
-                                mode="bilinear",
-                                align_corners=False,
-                            ).squeeze(0)
-                            mask_list.append(mask_up)
-                            iou_list.append(
-                                o["iou_predictions"].squeeze(0).to(torch.float32)
+                            mask_list = []
+                            iou_list = []
+                            for o in vo:
+                                mask_up = F.interpolate(
+                                    o["masks"].to(torch.float32),
+                                    size=masks.shape[-2:],
+                                    mode="bilinear",
+                                    align_corners=False,
+                                ).squeeze(0)
+                                mask_list.append(mask_up)
+                                iou_list.append(o["iou_predictions"].squeeze(0).to(torch.float32))
+
+                            pred_masks = torch.stack(mask_list, dim=0)
+                            pred_ious = torch.stack(iou_list, dim=0)
+
+                            best_indices = pred_ious.argmax(dim=1)
+                            probs = torch.sigmoid(
+                                pred_masks[torch.arange(len(pred_masks)), best_indices].unsqueeze(1)
                             )
 
-                        pred_masks = torch.stack(mask_list, dim=0)
-                        pred_ious = torch.stack(iou_list, dim=0)
+                            for i in range(len(imgs)):
+                                prob_i = probs[i]
+                                gt_i = masks[i]
 
-                        best_indices = pred_ious.argmax(dim=1)
-                        probs = torch.sigmoid(
-                            pred_masks[
-                                torch.arange(len(pred_masks)), best_indices
-                            ].unsqueeze(1)
-                        )
+                                # Soft Dice for loss logging
+                                num_soft = (prob_i * gt_i).sum((-2, -1)) * 2
+                                den_soft = prob_i.sum((-2, -1)) + gt_i.sum((-2, -1))
+                                soft_dice = (num_soft / (den_soft + 1e-6)).item()
 
-                        for i in range(len(imgs)):
-                            prob_i = probs[i]
-                            gt_i = masks[i]
+                                # Binary metrics
+                                pred_bin = (prob_i >= 0.5).float()
+                                num_bin = (pred_bin * gt_i).sum((-2, -1)) * 2
+                                den_bin = pred_bin.sum((-2, -1)) + gt_i.sum((-2, -1))
+                                bin_dice = (num_bin / (den_bin + 1e-6)).item()
 
-                            # Soft Dice for loss logging
-                            num_soft = (prob_i * gt_i).sum((-2, -1)) * 2
-                            den_soft = prob_i.sum((-2, -1)) + gt_i.sum((-2, -1))
-                            soft_dice = (num_soft / (den_soft + 1e-6)).item()
+                                union = pred_bin + gt_i - pred_bin * gt_i
+                                bin_iou = (
+                                    (pred_bin * gt_i).sum((-2, -1)) / (union.sum((-2, -1)) + 1e-6)
+                                ).item()
 
-                            # Binary metrics
-                            pred_bin = (prob_i >= 0.5).float()
-                            num_bin = (pred_bin * gt_i).sum((-2, -1)) * 2
-                            den_bin = pred_bin.sum((-2, -1)) + gt_i.sum((-2, -1))
-                            bin_dice = (num_bin / (den_bin + 1e-6)).item()
+                                dices.append(bin_dice)
+                                ious.append(bin_iou)
 
-                            union = pred_bin + gt_i - pred_bin * gt_i
-                            bin_iou = (
-                                (pred_bin * gt_i).sum((-2, -1))
-                                / (union.sum((-2, -1)) + 1e-6)
-                            ).item()
+                                # 印 debug: 第一張
+                                if bi == 0 and i == 0:
+                                    log.info(
+                                        f"[VAL] id={vb['id'][i]}, "
+                                        f"soft_dice={soft_dice:.3f}, "
+                                        f"bin_dice={bin_dice:.3f}, bin_iou={bin_iou:.3f}, "
+                                        f"gt_sum={gt_i.sum().item():.0f}, "
+                                        f"pred_sum={pred_bin.sum().item():.0f}"
+                                    )
 
-                            dices.append(bin_dice)
-                            ious.append(bin_iou)
+                                # Visualization
+                                if (
+                                    bi == 0
+                                    and cfg["visual"].get("status", False)
+                                    and (
+                                        ep % cfg["visual"].get("save_every_n_epochs", 10) == 0
+                                        or ((np.mean(dices) + np.mean(ious)) / 2) > best_score
+                                    )
+                                ):
+                                    cur_path = Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
+                                    cur_path.mkdir(parents=True, exist_ok=True)
+                                    img_denorm = (
+                                        imgs[i] * torch.tensor(STD, device=dev)[:, None, None]
+                                        + torch.tensor(MEAN, device=dev)[:, None, None]
+                                    )
+                                    img_denorm = img_denorm.clamp(0, 1).cpu()
 
-                            # 印 debug: 第一張
-                            if bi == 0 and i == 0:
-                                log.info(
-                                    f"[VAL] id={vb['id'][i]}, "
-                                    f"soft_dice={soft_dice:.3f}, "
-                                    f"bin_dice={bin_dice:.3f}, bin_iou={bin_iou:.3f}, "
-                                    f"gt_sum={gt_i.sum().item():.0f}, "
-                                    f"pred_sum={pred_bin.sum().item():.0f}"
-                                )
+                                    pred_mask = probs[i].squeeze(0).cpu()
 
-                            # Visualization
-                            if (
-                                bi == 0
-                                and cfg["visual"].get("status", False)
-                                and (
-                                    ep % cfg["visual"].get("save_every_n_epochs", 10)
-                                    == 0
-                                    or ((np.mean(dices) + np.mean(ious)) / 2)
-                                    > best_score
-                                )
-                            ):
-                                cur_path = (
-                                    Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
-                                )
-                                cur_path.mkdir(parents=True, exist_ok=True)
-                                img_denorm = (
-                                    imgs[i]
-                                    * torch.tensor(STD, device=dev)[:, None, None]
-                                    + torch.tensor(MEAN, device=dev)[:, None, None]
-                                )
-                                img_denorm = img_denorm.clamp(0, 1).cpu()
+                                    box = vb["box_prompt"][i]
+                                    pts = vb["point_coords"][i]
+                                    lbl = vb["point_labels"][i]
+                                    if box is not None:
+                                        box = box.to(torch.float32)
+                                    if pts is not None:
+                                        pts = pts.to(torch.float32)
+                                    if lbl is not None:
+                                        lbl = lbl.to(torch.long)
 
-                                pred_mask = probs[i].squeeze(0).cpu()
-
-                                box = vb["box_prompt"][i]
-                                pts = vb["point_coords"][i]
-                                lbl = vb["point_labels"][i]
-                                if box is not None:
-                                    box = box.to(torch.float32)
-                                if pts is not None:
-                                    pts = pts.to(torch.float32)
-                                if lbl is not None:
-                                    lbl = lbl.to(torch.long)
-                                # orig_h, orig_w = int(original_sizes[i][0]), int(original_sizes[i][1])
-
-                                overlay_mask_on_image(
-                                    image_tensor=img_denorm,
-                                    mask_tensor=pred_mask,
-                                    bbox_tensor=box.cpu() if box is not None else None,
-                                    point_coords=pts.cpu() if pts is not None else None,
-                                    point_labels=lbl.cpu() if lbl is not None else None,
-                                    original_size=None,
-                                    threshold=cfg["visual"].get("IOU_threshold", 0.5),
-                                    save_dir=str(cur_path),
-                                    filename_info=(
-                                        f"ep{ep}_id{vb['id'][i]}_b{bi}_s{i}"
-                                    ),
-                                )
+                                    overlay_mask_on_image(
+                                        image_tensor=img_denorm,
+                                        mask_tensor=pred_mask,
+                                        bbox_tensor=box.cpu() if box is not None else None,
+                                        point_coords=pts.cpu() if pts is not None else None,
+                                        point_labels=lbl.cpu() if lbl is not None else None,
+                                        original_size=None,
+                                        threshold=cfg["visual"].get("IOU_threshold", 0.5),
+                                        save_dir=str(cur_path),
+                                        filename_info=(f"ep{ep}_id{vb['id'][i]}_b{bi}_s{i}"),
+                                    )
                         else:
                             # Segment-everything validation
                             gt_masks = vb["gt_masks"]
@@ -1008,17 +932,13 @@ def main():
                                     (int(imgs[i].shape[-2]), int(imgs[i].shape[-1])),
                                 )
 
-                                preds = pm.reshape(
-                                    -1, gt_masks[i].shape[-2], gt_masks[i].shape[-1]
-                                )
+                                preds = pm.reshape(-1, gt_masks[i].shape[-2], gt_masks[i].shape[-1])
                                 probs = torch.sigmoid(preds)
                                 gt = gt_masks[i].to(dev)
                                 gt_bin = gt.squeeze(1)
                                 pred_bin = (probs >= 0.5).float()
 
-                                inter = (
-                                    pred_bin.unsqueeze(1) * gt_bin.unsqueeze(0)
-                                ).sum((-2, -1))
+                                inter = (pred_bin.unsqueeze(1) * gt_bin.unsqueeze(0)).sum((-2, -1))
                                 union = (
                                     pred_bin.unsqueeze(1).sum((-2, -1))
                                     + gt_bin.unsqueeze(0).sum((-2, -1))
