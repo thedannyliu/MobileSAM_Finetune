@@ -20,7 +20,7 @@ dataset/
 
 1. **SegmentEverythingDataset** — loads all masks of an image and the grid prompts.
 2. **Prediction** — for every grid point the model predicts three candidate masks (`multimask_output=True`).
-3. **Matching** — the IoU of each candidate against every ground-truth mask is computed.  If the best IoU is above `0.5` the candidate is matched to that mask, otherwise it is treated as background.
+3. **Matching** — the IoU of each candidate against every ground-truth mask is computed and a Hungarian assignment selects the best one-to-one pairs.  Assigned pairs with IoU ≥ `0.5` are treated as foreground while the rest are background.
 4. **Loss**
    - For each candidate: `BCE * w_bce + Focal * w_focal + Dice * w_dice`.
    - IoU prediction is supervised with MSE (`w_iou`).
@@ -29,7 +29,7 @@ dataset/
      `BCE(pred_iou, label)` weighted by `w_cls`.
    - Distillation losses (encoder, decoder, attention, RKD) are weighted by the teacher specific weight and their own `weight` field then scaled by `lambda_coef`.
    - Losses are averaged over only the matched predictions so that unmatched background candidates do not dilute gradients.
-5. **Evaluation** — predictions are matched to ground-truth masks using the Hungarian algorithm for a one-to-one assignment before computing Dice and IoU.
+5. **Evaluation** — the same Hungarian algorithm pairs predictions and ground-truth masks one-to-one before computing Dice and IoU.
 6. **Dynamic λ** — if enabled, `lambda_coef` is adjusted with a plateau scheduler based on the validation score.
 
 ## Visualisation

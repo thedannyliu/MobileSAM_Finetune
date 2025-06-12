@@ -536,6 +536,8 @@ def main():
                         preds = pred_masks_all[bi].reshape(-1, gt.shape[-2], gt.shape[-1])
                         ious_pred = pred_ious_all[bi].reshape(-1)
                         gt_flat = gt.squeeze(1)
+
+                        # IoU matrix for Hungarian matching
                         pred_bin = (torch.sigmoid(preds) > 0.5).float()
                         inter = (pred_bin.unsqueeze(1) * gt_flat.unsqueeze(0)).sum((-2, -1))
                         union = (
@@ -544,16 +546,28 @@ def main():
                             - inter
                         )
                         iou_mat = inter / (union + 1e-6)
-                        best_iou, best_gt = iou_mat.max(dim=1)
-                        match_mask = best_iou >= 0.5
-                        cls_loss_val += F.binary_cross_entropy(
-                            ious_pred, match_mask.float(), reduction="sum"
+
+                        cost = (-iou_mat).cpu().numpy()
+                        row_ind, col_ind = linear_sum_assignment(cost)
+
+                        labels = torch.zeros(preds.shape[0], device=dev)
+                        assigned_gt = torch.full(
+                            (preds.shape[0],), -1, device=dev, dtype=torch.long
                         )
-                        cls_total += match_mask.numel()
-                        matched_cnt += match_mask.sum().item()
-                        for j in torch.nonzero(match_mask, as_tuple=False).flatten():
-                            target = gt[best_gt[j]]
-                            logit = preds[j].unsqueeze(0).unsqueeze(0)
+                        for r, c in zip(row_ind, col_ind):
+                            labels[r] = 1.0 if iou_mat[r, c] >= 0.5 else 0.0
+                            if iou_mat[r, c] >= 0.5:
+                                assigned_gt[r] = c
+                                matched_cnt += 1
+
+                        cls_loss_val += F.binary_cross_entropy(ious_pred, labels, reduction="sum")
+                        cls_total += labels.numel()
+
+                        for r, c in zip(row_ind, col_ind):
+                            if iou_mat[r, c] < 0.5:
+                                continue
+                            target = gt[c]
+                            logit = preds[r].unsqueeze(0).unsqueeze(0)
                             target_exp = target.unsqueeze(0)
                             bce += F.binary_cross_entropy_with_logits(logit, target_exp)
                             focal += sigmoid_focal_loss(logit, target_exp, reduction="mean")
@@ -561,7 +575,7 @@ def main():
                             num = (prob * target_exp).sum((-2, -1)) * 2
                             den = prob.sum((-2, -1)) + target_exp.sum((-2, -1))
                             dice_loss += 1 - (num / (den + 1e-6)).mean()
-                            iou_loss += F.mse_loss(ious_pred[j], best_iou[j])
+                            iou_loss += F.mse_loss(ious_pred[r], iou_mat[r, c])
 
                     # Average using only the matched predictions to avoid loss dilution.
                     n_matched = matched_cnt
