@@ -549,6 +549,10 @@ def main():
 
                         cost = (-iou_mat).cpu().numpy()
                         row_ind, col_ind = linear_sum_assignment(cost)
+                        assert len(set(col_ind)) == len(col_ind), "GT matched more than once"
+                        assert len(set(row_ind)) == len(
+                            row_ind
+                        ), "Prediction matched more than once"
 
                         labels = torch.zeros(preds.shape[0], device=dev)
                         assigned_gt = torch.full(
@@ -1019,6 +1023,12 @@ def main():
 
                                 cost = (-iou_mat).cpu().numpy()
                                 row_ind, col_ind = linear_sum_assignment(cost)
+                                assert len(set(col_ind)) == len(
+                                    col_ind
+                                ), "GT matched more than once"
+                                assert len(set(row_ind)) == len(
+                                    row_ind
+                                ), "Prediction matched more than once"
                                 for r, c in zip(row_ind, col_ind):
                                     prob_i = probs[r]
                                     gt_i = gt[c]
@@ -1051,6 +1061,7 @@ def main():
                                     overlay_masks_on_image(
                                         image_tensor=img_denorm,
                                         masks=best_masks,
+                                        grid_points=point_coords[i].cpu(),
                                         threshold=cfg["visual"].get("IOU_threshold", 0.5),
                                         save_dir=str(cur_path),
                                         filename_info=f"ep{ep}_id{vb['id'][i]}_b{bi}",

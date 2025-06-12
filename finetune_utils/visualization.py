@@ -106,6 +106,7 @@ def overlay_masks_on_image(
     image_tensor: torch.Tensor,
     masks: torch.Tensor,
     *,
+    grid_points: Optional[torch.Tensor] = None,
     threshold: float = 0.5,
     save_dir: str | Path = "./images",
     filename_info: str = "se_vis",
@@ -122,6 +123,7 @@ def overlay_masks_on_image(
         base = to_pil_image((image_tensor.clamp(0, 1) * 255).byte(), mode="RGB")
 
     base = base.convert("RGBA")
+    draw = ImageDraw.Draw(base)
 
     if masks.ndim == 4:
         masks = masks.squeeze(1)
@@ -142,6 +144,17 @@ def overlay_masks_on_image(
         mask_pil = Image.fromarray(m_bin, mode="L")
         layer = Image.new("RGBA", base.size, color)
         base.paste(layer, mask=mask_pil)
+
+    if grid_points is not None and grid_points.numel() > 0:
+        pts = grid_points.float().cpu()
+        for x, y in pts.tolist():
+            if x < 0 or y < 0:
+                continue
+            draw.ellipse(
+                [(x - 2, y - 2), (x + 2, y + 2)],
+                fill="blue",
+                outline="black",
+            )
 
     final_img = base.convert("RGB")
     final_img.save(out_path)

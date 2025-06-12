@@ -34,7 +34,7 @@ dataset/
 
 ## Visualisation
 
-Validation can optionally save visualisations.  When using segment-everything the function `overlay_masks_on_image` draws all matched predictions with distinct colours.  Images are saved under `visual.save_path/epoch_<n>/` whenever a new best score is achieved or every `visual.save_every_n_epochs` epochs.
+Validation can optionally save visualisations.  When using segment-everything the function `overlay_masks_on_image` draws all matched predictions with distinct colours and also shows the grid points.  Images are saved under `visual.save_path/epoch_<n>/` whenever a new best score is achieved or every `visual.save_every_n_epochs` epochs.
 
 ## Running
 
