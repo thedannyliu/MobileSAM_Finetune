@@ -32,8 +32,9 @@ objects within an image simultaneously.
   - For unmatched ground truth masks the candidate with highest IoU is also used
     for supervision.  Hungarian assignment is used in both training and validation
     to pair predictions and ground truths one-to-one.
-- Distillation losses are disabled in this mode for simplicity, but the rest of
-  the training pipeline (optimizer, scheduler, etc.) remains unchanged.
+  - Knowledge distillation is supported.  Teacher features must be extracted
+    with the same grid prompts using `scripts/extract_teacher_features.py --mode everything --grid_points <step>`.
+    Encoder, decoder, attention and RKD losses can all be enabled.
 
 ## Usage
 In `configs/mobileSAM.json` set

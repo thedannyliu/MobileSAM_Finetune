@@ -240,7 +240,7 @@ def main():
         student.mask_decoder.requires_grad_(False)
 
     dist_cfg = cfg.get("distillation", {})
-    use_distillation = dist_cfg.get("enable", False) and dataset_mode == "single"
+    use_distillation = dist_cfg.get("enable", False)
     lambda_coef = dist_cfg.get("lambda_coef", 1.0)
     hook_handles = []
 
@@ -487,9 +487,9 @@ def main():
                         num = (prob * masks).sum((-2, -1)) * 2
                         den = prob.sum((-2, -1)) + masks.sum((-2, -1))
                         dice_loss = 1 - (num / (den + 1e-6)).mean()
-                        best_conf = pred_ious.gather(1, best_indices.unsqueeze(1)).squeeze(1)
-                        cls_loss_val += F.binary_cross_entropy(
-                            best_conf, torch.ones_like(best_conf), reduction="mean"
+                        best_conf_logits = pred_ious.gather(1, best_indices.unsqueeze(1)).squeeze(1)
+                        cls_loss_val += F.binary_cross_entropy_with_logits(
+                            best_conf_logits, torch.ones_like(best_conf_logits), reduction="mean"
                         )
                         task_loss = (
                             w_bce * bce
@@ -508,7 +508,7 @@ def main():
                                 ious.append(inter / (union + 1e-6))
                             gt_ious = torch.stack(ious, dim=0)
 
-                        iou_loss = F.mse_loss(pred_ious, gt_ious)
+                        iou_loss = F.mse_loss(torch.sigmoid(pred_ious), gt_ious)
                 else:
                     gt_masks = batch["gt_masks"]
                     point_coords = batch["point_coords"]
@@ -560,7 +560,9 @@ def main():
                                 assigned_gt[r] = c
                                 matched_cnt += 1
 
-                        cls_loss_val += F.binary_cross_entropy(ious_pred, labels, reduction="sum")
+                        cls_loss_val += F.binary_cross_entropy_with_logits(
+                            ious_pred, labels, reduction="sum"
+                        )
                         cls_total += labels.numel()
 
                         for r, c in zip(row_ind, col_ind):
@@ -575,7 +577,7 @@ def main():
                             num = (prob * target_exp).sum((-2, -1)) * 2
                             den = prob.sum((-2, -1)) + target_exp.sum((-2, -1))
                             dice_loss += 1 - (num / (den + 1e-6)).mean()
-                            iou_loss += F.mse_loss(ious_pred[r], iou_mat[r, c])
+                            iou_loss += F.mse_loss(torch.sigmoid(ious_pred[r]), iou_mat[r, c])
 
                     # Average using only the matched predictions to avoid loss dilution.
                     n_matched = matched_cnt

@@ -24,6 +24,9 @@ python scripts/extract_teacher_features.py \
     --dataset_base_dir ./datasets \
     --output_base_dir ./precomputed/MobileSAM_orig \
     --splits train val
+
+For segment-everything training, add `--mode everything` and optionally
+`--grid_points <step>` to match the training configuration.
 """
 
 import numpy as np
@@ -74,6 +77,8 @@ def process_images_in_dir(
     capture_targets: list,
     transform: T.Compose,
     device: str,
+    mode: str = "single",
+    grid_points: int = 32,
 ):
     """
     Processes all images in a directory, extracts features, and saves them.
@@ -109,16 +114,53 @@ def process_images_in_dir(
             if next(model.parameters()).dtype == torch.float16:
                 img_tensor = img_tensor.half()
 
-            batched_item = {
-                "image": img_tensor,  # Do NOT add batch dimension, model.forward will do it.
-                "original_size": (original_h, original_w),
-            }
+            if mode == "single":
+                batched_item = {
+                    "image": img_tensor,
+                    "original_size": (original_h, original_w),
+                }
 
-            with torch.no_grad():
-                # The model's internal preprocessor will handle resizing.
-                # We only need to provide a normalized tensor.
-                # For feature extraction, we don't need prompts or multimask output.
-                _ = model(batched_input=[batched_item], multimask_output=False)
+                with torch.no_grad():
+                    _ = model(batched_input=[batched_item], multimask_output=False)
+            else:
+                step = grid_points
+                x_points = torch.linspace(
+                    0.5 * step, original_w - 0.5 * step, int(original_w / step)
+                )
+                y_points = torch.linspace(
+                    0.5 * step, original_h - 0.5 * step, int(original_h / step)
+                )
+                grid = torch.stack(torch.meshgrid(y_points, x_points, indexing="ij"), dim=-1).view(
+                    -1, 2
+                )
+                grid = grid[:, [1, 0]]  # (x, y)
+                scale_x = img_tensor.shape[-1] / original_w
+                scale_y = img_tensor.shape[-2] / original_h
+                grid[:, 0] *= scale_x
+                grid[:, 1] *= scale_y
+
+                from mobile_sam.utils.amg import batch_iterator
+
+                inp = model.preprocess(img_tensor.unsqueeze(0))
+                embedding = model.image_encoder(inp)
+                dense_pe = model.prompt_encoder.get_dense_pe()
+
+                with torch.no_grad():
+                    for (pts,) in batch_iterator(64, grid):
+                        coords = torch.as_tensor(pts, dtype=torch.float, device=device)
+                        labels = torch.ones(coords.shape[0], dtype=torch.int, device=device)
+                        sparse, dense = model.prompt_encoder(
+                            points=(coords.unsqueeze(0), labels.unsqueeze(0)),
+                            boxes=None,
+                            masks=None,
+                        )
+                        _ = model.mask_decoder(
+                            image_embeddings=embedding,
+                            image_pe=dense_pe,
+                            sparse_prompt_embeddings=sparse,
+                            dense_prompt_embeddings=dense,
+                            multimask_output=True,
+                        )
 
             feats = pop_features()
             if not feats:
@@ -204,6 +246,18 @@ def main():
         action="store_true",
         help="Use half-precision (FP16) for inference to reduce memory usage.",
     )
+    ap.add_argument(
+        "--mode",
+        choices=["single", "everything"],
+        default="single",
+        help="Dataset mode used during training. If 'everything', grid prompts are generated.",
+    )
+    ap.add_argument(
+        "--grid_points",
+        type=int,
+        default=32,
+        help="Grid size (in pixels) used when mode is 'everything'.",
+    )
     args = ap.parse_args()
 
     with open(args.teacher_cfg, "r") as f:
@@ -266,6 +320,8 @@ def main():
             capture_targets=capture_targets,
             transform=transform,
             device=args.device,
+            mode=args.mode,
+            grid_points=args.grid_points,
         )
 
     print(f"\n✅ Feature extraction process completed for teacher '{args.teacher_name}'.")
