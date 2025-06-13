@@ -15,7 +15,7 @@ class ComponentDataset(Dataset):
     """
     SAM Fine-tune 多物件資料集 (Option B)
     • 保留原始尺寸，先在原圖上計算 prompt (box / point)，
-      再縮放到 1024×1024，並回傳原始尺寸給 SAM。
+      再將圖片等比縮放到長邊 ``image_size``，並回傳原始尺寸給 SAM。
     """
 
     def __init__(
@@ -218,8 +218,8 @@ class ComponentDataset(Dataset):
             )
 
         return {
-            "image": img_tensor,  # [3,1024,1024]
-            "mask": msk_tensor,  # [1,1024,1024]
+            "image": img_tensor,  # [3, H_resized, W_resized]
+            "mask": msk_tensor,  # [1, H_resized, W_resized]
             "box_prompt": box_prompt if cur_type == "box" else None,
             "point_coords": point_coords if cur_type == "point" else None,
             "point_labels": point_labels if cur_type == "point" else None,
