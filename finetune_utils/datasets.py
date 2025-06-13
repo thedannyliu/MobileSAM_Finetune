@@ -4,6 +4,8 @@ import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
 
+from mobile_sam.utils.transforms import ResizeLongestSide
+
 import random
 from pathlib import Path
 from PIL import Image
@@ -62,13 +64,8 @@ class ComponentDataset(Dataset):
 
         print(f"ComponentDataset: {len(self.samples)} samples, prompt={self.prompt_mode}")
 
-        # 用於後續 Resize
-        self.img_resize = transforms.Resize(
-            (image_size, image_size), transforms.InterpolationMode.BILINEAR
-        )
-        self.msk_resize = transforms.Resize(
-            (image_size, image_size), transforms.InterpolationMode.NEAREST
-        )
+        # 用於後續 Resize - match SamPredictor behaviour
+        self.resizer = ResizeLongestSide(image_size)
 
     @staticmethod
     def _morph_close(mask_tensor: torch.Tensor, k: int = 3):
@@ -174,17 +171,18 @@ class ComponentDataset(Dataset):
         else:
             point_coords_raw, point_labels_raw = self.compute_point_prompts_raw(msk_raw)
 
-        # 2. Resize image & mask to image_size × image_size
-        img_resized = self.img_resize(img_pil)
-        msk_resized = self.msk_resize(msk_pil)
+        # 2. Resize using ResizeLongestSide (keep aspect ratio)
+        new_h, new_w = self.resizer.get_preprocess_shape(orig_h, orig_w, self.image_size)
+        img_resized = img_pil.resize((new_w, new_h), Image.BILINEAR)
+        msk_resized = msk_pil.resize((new_w, new_h), Image.NEAREST)
 
-        img_tensor = self.transform_image(img_resized)  # [3, 1024,1024]
-        msk_tensor = self.transform_mask(msk_resized)  # [1,1024,1024]
+        img_tensor = self.transform_image(img_resized)
+        msk_tensor = self.transform_mask(msk_resized)
         msk_tensor = (msk_tensor > 0.5).float()
 
-        # 3. 把 raw prompt 縮放到 1024×1024
-        scale_x = self.image_size / orig_w
-        scale_y = self.image_size / orig_h
+        # 3. 把 raw prompt 縮放到 resize 後的尺寸
+        scale_x = new_w / orig_w
+        scale_y = new_h / orig_h
 
         if cur_type == "box":
             if box_prompt_raw.sum() != 0:
@@ -278,12 +276,7 @@ class SegmentEverythingDataset(Dataset):
 
         print(f"SegmentEverythingDataset: {len(self.samples)} images, grid={self.grid_points}")
 
-        self.img_resize = transforms.Resize(
-            (image_size, image_size), transforms.InterpolationMode.BILINEAR
-        )
-        self.msk_resize = transforms.Resize(
-            (image_size, image_size), transforms.InterpolationMode.NEAREST
-        )
+        self.resizer = ResizeLongestSide(image_size)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -298,13 +291,15 @@ class SegmentEverythingDataset(Dataset):
         msk_tensors = []
         for mp in meta["masks"]:
             m = Image.open(mp).convert("L")
-            m = self.msk_resize(m)
+            new_h, new_w = self.resizer.get_preprocess_shape(orig_h, orig_w, self.image_size)
+            m = m.resize((new_w, new_h), Image.NEAREST)
             m = self.transform_mask(m)
             m = (m > 0.5).float()
             msk_tensors.append(m)
-        gt_masks = torch.stack(msk_tensors)  # [K,1,S,S]
+        gt_masks = torch.stack(msk_tensors)
 
-        img_resized = self.img_resize(img_pil)
+        new_h, new_w = self.resizer.get_preprocess_shape(orig_h, orig_w, self.image_size)
+        img_resized = img_pil.resize((new_w, new_h), Image.BILINEAR)
         img_tensor = self.transform_image(img_resized)
 
         # Build grid prompts on the original resolution then scale
@@ -314,8 +309,8 @@ class SegmentEverythingDataset(Dataset):
         grid = torch.stack(torch.meshgrid(y_points, x_points, indexing="ij"), dim=-1).view(-1, 2)
         # (y,x) -> (x,y)
         grid = grid[:, [1, 0]]
-        scale_x = self.image_size / orig_w
-        scale_y = self.image_size / orig_h
+        scale_x = new_w / orig_w
+        scale_y = new_h / orig_h
         grid[:, 0] *= scale_x
         grid[:, 1] *= scale_y
         labels = torch.ones(len(grid), dtype=torch.long)
