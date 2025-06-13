@@ -228,6 +228,15 @@ def main():
     )
 
     m_cfg = cfg["model"]
+    out_dir = Path(m_cfg.get("save_path", "./"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_file = out_dir / "training_log.txt"
+    file_handler = logging.FileHandler(log_file, mode="a")
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S")
+    )
+    log.addHandler(file_handler)
+
     student = sam_model_registry[m_cfg.get("type", "vit_t")](
         checkpoint=m_cfg.get("checkpoint_path")
     ).to(dev)
@@ -240,7 +249,7 @@ def main():
         student.mask_decoder.requires_grad_(False)
 
     dist_cfg = cfg.get("distillation", {})
-    use_distillation = dist_cfg.get("enable", False) and dataset_mode == "single"
+    use_distillation = dist_cfg.get("enable", False)
     lambda_coef = dist_cfg.get("lambda_coef", 1.0)
     hook_handles = []
 
@@ -487,9 +496,9 @@ def main():
                         num = (prob * masks).sum((-2, -1)) * 2
                         den = prob.sum((-2, -1)) + masks.sum((-2, -1))
                         dice_loss = 1 - (num / (den + 1e-6)).mean()
-                        best_conf = pred_ious.gather(1, best_indices.unsqueeze(1)).squeeze(1)
-                        cls_loss_val += F.binary_cross_entropy(
-                            best_conf, torch.ones_like(best_conf), reduction="mean"
+                        best_conf_logits = pred_ious.gather(1, best_indices.unsqueeze(1)).squeeze(1)
+                        cls_loss_val += F.binary_cross_entropy_with_logits(
+                            best_conf_logits, torch.ones_like(best_conf_logits), reduction="mean"
                         )
                         task_loss = (
                             w_bce * bce
@@ -508,7 +517,7 @@ def main():
                                 ious.append(inter / (union + 1e-6))
                             gt_ious = torch.stack(ious, dim=0)
 
-                        iou_loss = F.mse_loss(pred_ious, gt_ious)
+                        iou_loss = F.mse_loss(torch.sigmoid(pred_ious), gt_ious)
                 else:
                     gt_masks = batch["gt_masks"]
                     point_coords = batch["point_coords"]
@@ -549,6 +558,10 @@ def main():
 
                         cost = (-iou_mat).cpu().numpy()
                         row_ind, col_ind = linear_sum_assignment(cost)
+                        assert len(set(col_ind)) == len(col_ind), "GT matched more than once"
+                        assert len(set(row_ind)) == len(
+                            row_ind
+                        ), "Prediction matched more than once"
 
                         labels = torch.zeros(preds.shape[0], device=dev)
                         assigned_gt = torch.full(
@@ -560,7 +573,9 @@ def main():
                                 assigned_gt[r] = c
                                 matched_cnt += 1
 
-                        cls_loss_val += F.binary_cross_entropy(ious_pred, labels, reduction="sum")
+                        cls_loss_val += F.binary_cross_entropy_with_logits(
+                            ious_pred, labels, reduction="sum"
+                        )
                         cls_total += labels.numel()
 
                         for r, c in zip(row_ind, col_ind):
@@ -575,7 +590,7 @@ def main():
                             num = (prob * target_exp).sum((-2, -1)) * 2
                             den = prob.sum((-2, -1)) + target_exp.sum((-2, -1))
                             dice_loss += 1 - (num / (den + 1e-6)).mean()
-                            iou_loss += F.mse_loss(ious_pred[r], iou_mat[r, c])
+                            iou_loss += F.mse_loss(torch.sigmoid(ious_pred[r]), iou_mat[r, c])
 
                     # Average using only the matched predictions to avoid loss dilution.
                     n_matched = matched_cnt
@@ -856,6 +871,14 @@ def main():
             writer.add_scalar("train/lambda_coef", lambda_coef, ep)
             for i, g in enumerate(opt.param_groups):
                 writer.add_scalar(f"lr/group{i}", g["lr"], ep)
+            log.info(
+                (
+                    f"Epoch {ep} train: task={tot_task/len(tr_loader):.4f} "
+                    f"dist={tot_dist/len(tr_loader):.4f} "
+                    f"iou={tot_iou/len(tr_loader):.4f} "
+                    f"cls={tot_cls/len(tr_loader):.4f}"
+                )
+            )
             log_gpu_memory(f"Epoch {ep} training completed")
 
             if (ep + 1) % tr_cfg.get("val_freq", 1) != 0:
@@ -1017,6 +1040,12 @@ def main():
 
                                 cost = (-iou_mat).cpu().numpy()
                                 row_ind, col_ind = linear_sum_assignment(cost)
+                                assert len(set(col_ind)) == len(
+                                    col_ind
+                                ), "GT matched more than once"
+                                assert len(set(row_ind)) == len(
+                                    row_ind
+                                ), "Prediction matched more than once"
                                 for r, c in zip(row_ind, col_ind):
                                     prob_i = probs[r]
                                     gt_i = gt[c]
@@ -1049,6 +1078,7 @@ def main():
                                     overlay_masks_on_image(
                                         image_tensor=img_denorm,
                                         masks=best_masks,
+                                        grid_points=point_coords[i].cpu(),
                                         threshold=cfg["visual"].get("IOU_threshold", 0.5),
                                         save_dir=str(cur_path),
                                         filename_info=f"ep{ep}_id{vb['id'][i]}_b{bi}",

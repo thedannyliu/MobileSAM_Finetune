@@ -26,14 +26,17 @@ objects within an image simultaneously.
   - Each grid point produces three candidate masks (`multimask_output=True`).  For
     every candidate the IoU with each ground truth mask is computed.  A Hungarian
     assignment selects the best pairs and those with IoU ≥ 0.5 are considered foreground,
-    the rest are background.
+    the rest are background.  This ensures every ground truth is matched to at most one
+    candidate mask during both training and validation.
 - Loss per candidate = **BCE + 0.5·Focal + Dice + w_cls·BCE(confidence,label)**.
   The IoU prediction head is supervised with MSE against the measured IoU.
   - For unmatched ground truth masks the candidate with highest IoU is also used
     for supervision.  Hungarian assignment is used in both training and validation
     to pair predictions and ground truths one-to-one.
-- Distillation losses are disabled in this mode for simplicity, but the rest of
-  the training pipeline (optimizer, scheduler, etc.) remains unchanged.
+  - Knowledge distillation is supported.  Teacher features must be extracted
+    with the same grid prompts using `scripts/extract_teacher_features.py --mode everything --grid_points <step>`.
+    Encoder, decoder, attention and RKD losses can all be enabled.
+  - Validation visualisations show the matched masks and the grid points for reference.
 
 ## Usage
 In `configs/mobileSAM.json` set
@@ -47,3 +50,5 @@ In `configs/mobileSAM.json` set
 ```
 Running `python train.py --config configs/mobileSAM.json` will finetune MobileSAM
 with segment-everything supervision.
+
+Epoch summaries are logged to `training_log.txt` in the same directory as the saved weights.
