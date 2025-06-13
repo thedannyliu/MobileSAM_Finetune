@@ -50,3 +50,5 @@ In `configs/mobileSAM.json` set
 ```
 Running `python train.py --config configs/mobileSAM.json` will finetune MobileSAM
 with segment-everything supervision.
+
+Epoch summaries are logged to `training_log.txt` in the same directory as the saved weights.

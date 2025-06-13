@@ -228,6 +228,15 @@ def main():
     )
 
     m_cfg = cfg["model"]
+    out_dir = Path(m_cfg.get("save_path", "./"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_file = out_dir / "training_log.txt"
+    file_handler = logging.FileHandler(log_file, mode="a")
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S")
+    )
+    log.addHandler(file_handler)
+
     student = sam_model_registry[m_cfg.get("type", "vit_t")](
         checkpoint=m_cfg.get("checkpoint_path")
     ).to(dev)
@@ -862,6 +871,14 @@ def main():
             writer.add_scalar("train/lambda_coef", lambda_coef, ep)
             for i, g in enumerate(opt.param_groups):
                 writer.add_scalar(f"lr/group{i}", g["lr"], ep)
+            log.info(
+                (
+                    f"Epoch {ep} train: task={tot_task/len(tr_loader):.4f} "
+                    f"dist={tot_dist/len(tr_loader):.4f} "
+                    f"iou={tot_iou/len(tr_loader):.4f} "
+                    f"cls={tot_cls/len(tr_loader):.4f}"
+                )
+            )
             log_gpu_memory(f"Epoch {ep} training completed")
 
             if (ep + 1) % tr_cfg.get("val_freq", 1) != 0:

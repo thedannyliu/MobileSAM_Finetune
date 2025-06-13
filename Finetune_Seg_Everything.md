@@ -36,6 +36,8 @@ dataset/
 
 Validation can optionally save visualisations.  When using segment-everything the function `overlay_masks_on_image` draws all matched predictions with distinct colours and also shows the grid points.  Images are saved under `visual.save_path/epoch_<n>/` whenever a new best score is achieved or every `visual.save_every_n_epochs` epochs.
 
+All epoch losses are also appended to `training_log.txt` inside the same directory where model weights are saved.
+
 ## Running
 
 Edit `configs/mobileSAM_se.json` and ensure `dataset.mode` is set to `"everything"`.  Adjust `grid_points`, loss weights, and `lambda_coef` as needed.  Then run
