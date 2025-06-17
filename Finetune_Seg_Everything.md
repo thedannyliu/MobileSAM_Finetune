@@ -14,7 +14,9 @@ dataset/
 
 * Every image has a folder of ground-truth object masks under `mask/<id>/`.
 * All masks are resized to the training resolution (default `1024×1024`).
-* A regular grid of point prompts is generated on the original image.  The grid step size is controlled by `dataset.grid_points` (e.g. `32` creates a 32×32 grid on a 1024×1024 image).
+* A regular grid of point prompts is generated on the original image. The value
+  of `dataset.grid_points` sets the number of points **per side** (e.g. `32`
+  creates a 32×32 grid regardless of image resolution).
 
 ## Training Strategy
 

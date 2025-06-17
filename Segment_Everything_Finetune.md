@@ -14,8 +14,10 @@ objects within an image simultaneously.
     mask/xxx/obj_1.png
   ```
 - For each image all object masks under `mask/<id>/` are loaded and stacked.
-- A regular point grid is generated over the original image (default step
-  size = 32 px).  Points are scaled to the network resolution (1024×1024).
+- A regular point grid is generated over the original image. The value of
+  `grid_points` specifies how many points are sampled per side (e.g. `32`
+  produces a 32×32 grid regardless of image resolution). Points are scaled to
+  the network resolution (1024×1024).
 
 ## Training Changes
 - New dataset class **`SegmentEverythingDataset`** provides the stacked ground

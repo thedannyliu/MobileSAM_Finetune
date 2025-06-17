@@ -34,6 +34,7 @@ import torch
 import torchvision.transforms as T
 
 from mobile_sam import sam_model_registry
+from mobile_sam.utils.transforms import ResizeLongestSide
 
 import argparse
 import pathlib
@@ -75,7 +76,8 @@ def process_images_in_dir(
     image_dir_path: pathlib.Path,
     output_dir: pathlib.Path,
     capture_targets: list,
-    transform: T.Compose,
+    preprocess,
+    resizer,
     device: str,
     mode: str = "single",
     grid_points: int = 32,
@@ -108,7 +110,7 @@ def process_images_in_dir(
             original_h, original_w = pil_img.height, pil_img.width
 
             # Use the same preprocessing as in training
-            img_tensor = transform(pil_img).to(device)
+            img_tensor = preprocess(pil_img).to(device)
 
             # If model is in half-precision, input tensor must also be converted.
             if next(model.parameters()).dtype == torch.float16:
@@ -123,21 +125,12 @@ def process_images_in_dir(
                 with torch.no_grad():
                     _ = model(batched_input=[batched_item], multimask_output=False)
             else:
-                step = grid_points
-                x_points = torch.linspace(
-                    0.5 * step, original_w - 0.5 * step, int(original_w / step)
-                )
-                y_points = torch.linspace(
-                    0.5 * step, original_h - 0.5 * step, int(original_h / step)
-                )
-                grid = torch.stack(torch.meshgrid(y_points, x_points, indexing="ij"), dim=-1).view(
-                    -1, 2
-                )
-                grid = grid[:, [1, 0]]  # (x, y)
-                scale_x = img_tensor.shape[-1] / original_w
-                scale_y = img_tensor.shape[-2] / original_h
-                grid[:, 0] *= scale_x
-                grid[:, 1] *= scale_y
+                from mobile_sam.utils.amg import build_point_grid
+
+                grid = torch.from_numpy(build_point_grid(grid_points)).float()
+                grid[:, 0] *= original_w
+                grid[:, 1] *= original_h
+                grid = resizer.apply_coords_torch(grid, (original_h, original_w))
 
                 from mobile_sam.utils.amg import batch_iterator
 
@@ -303,7 +296,18 @@ def main():
     # Resize images to the same size used during training to ensure that
     # precomputed features match the online pipeline.
     img_size = model_config_dict.get("image_size", 1024)
-    transform = T.Compose([T.Resize((img_size, img_size)), T.ToTensor()])
+    resizer = ResizeLongestSide(img_size)
+
+    def preprocess_pil(img: Image.Image) -> torch.Tensor:
+        h, w = img.height, img.width
+        new_h, new_w = resizer.get_preprocess_shape(h, w, img_size)
+        img_resized = img.resize((new_w, new_h), Image.BILINEAR)
+        t = T.ToTensor()(img_resized)
+        if new_h != img_size or new_w != img_size:
+            pad_r = img_size - new_w
+            pad_b = img_size - new_h
+            t = torch.nn.functional.pad(t, (0, pad_r, 0, pad_b))
+        return t
 
     # The output directory will be named after the teacher
     output_root_path = args.output_base_dir
@@ -318,7 +322,8 @@ def main():
             image_dir_path=image_dir_path,
             output_dir=split_output_dir,
             capture_targets=capture_targets,
-            transform=transform,
+            preprocess=preprocess_pil,
+            resizer=resizer,
             device=args.device,
             mode=args.mode,
             grid_points=args.grid_points,

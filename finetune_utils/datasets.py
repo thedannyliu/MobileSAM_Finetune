@@ -4,6 +4,7 @@ import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
 
+from mobile_sam.utils.amg import build_point_grid
 from mobile_sam.utils.transforms import ResizeLongestSide
 
 import random
@@ -240,8 +241,8 @@ class SegmentEverythingDataset(Dataset):
     Each sample returns an image with *all* of its object masks stacked
     together. Images and masks are resized with ``ResizeLongestSide`` and
     padded back to a square ``image_size`` for batching. Prompts are generated
-    using a regular point grid over the entire image, mimicking
-    ``SamAutomaticMaskGenerator``.
+    using a regular point grid with ``grid_points`` points per side,
+    mimicking ``SamAutomaticMaskGenerator``.
     """
 
     def __init__(
@@ -318,17 +319,12 @@ class SegmentEverythingDataset(Dataset):
             pad_b = self.image_size - new_h
             img_tensor = torch.nn.functional.pad(img_tensor, (0, pad_r, 0, pad_b))
 
-        # Build grid prompts on the original resolution then scale
-        step = self.grid_points
-        x_points = torch.linspace(0.5 * step, orig_w - 0.5 * step, int(orig_w / step))
-        y_points = torch.linspace(0.5 * step, orig_h - 0.5 * step, int(orig_h / step))
-        grid = torch.stack(torch.meshgrid(y_points, x_points, indexing="ij"), dim=-1).view(-1, 2)
-        # (y,x) -> (x,y)
-        grid = grid[:, [1, 0]]
-        scale_x = new_w / orig_w
-        scale_y = new_h / orig_h
-        grid[:, 0] *= scale_x
-        grid[:, 1] *= scale_y
+        # Build grid prompts on the original resolution then scale using
+        # ResizeLongestSide, matching SamAutomaticMaskGenerator
+        grid = torch.from_numpy(build_point_grid(self.grid_points)).float()
+        grid[:, 0] *= orig_w
+        grid[:, 1] *= orig_h
+        grid = self.resizer.apply_coords_torch(grid, (orig_h, orig_w))
         labels = torch.ones(len(grid), dtype=torch.long)
 
         return {
