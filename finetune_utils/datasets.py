@@ -16,6 +16,7 @@ class ComponentDataset(Dataset):
     SAM Fine-tune 多物件資料集 (Option B)
     • 保留原始尺寸，先在原圖上計算 prompt (box / point)，
       再將圖片等比縮放到長邊 ``image_size``，並回傳原始尺寸給 SAM。
+    • 縮放後若寬高不足 ``image_size``，會補零填成正方形以方便 batch。
     """
 
     def __init__(
@@ -237,8 +238,10 @@ class SegmentEverythingDataset(Dataset):
     """Dataset to train SAM in a segment-everything manner.
 
     Each sample returns an image with *all* of its object masks stacked
-    together. Prompts are generated using a regular point grid over the
-    entire image, mimicking ``SamAutomaticMaskGenerator``.
+    together. Images and masks are resized with ``ResizeLongestSide`` and
+    padded back to a square ``image_size`` for batching. Prompts are generated
+    using a regular point grid over the entire image, mimicking
+    ``SamAutomaticMaskGenerator``.
     """
 
     def __init__(
