@@ -1,9 +1,10 @@
-import os
-
-import gradio as gr
 import numpy as np
 import torch
+
 from mobile_sam import SamAutomaticMaskGenerator, SamPredictor, sam_model_registry
+
+import gradio as gr
+import os
 from PIL import ImageDraw
 from utils.tools import box_prompt, format_results, point_prompt
 from utils.tools_gradio import fast_process
@@ -28,10 +29,10 @@ title = "<center><strong><font size='8'>Faster Segment Anything(MobileSAM)<font>
 
 description_e = """This is a demo of [Faster Segment Anything(MobileSAM) Model](https://github.com/ChaoningZhang/MobileSAM).
 
-                   We will provide box mode soon. 
+                   We will provide box mode soon.
 
                    Enjoy!
-                
+
               """
 
 description_p = """ # Instructions for point mode
@@ -110,9 +111,7 @@ def segment_with_points(
     new_h = int(h * scale)
     image = image.resize((new_w, new_h))
 
-    scaled_points = np.array(
-        [[int(x * scale) for x in point] for point in global_points]
-    )
+    scaled_points = np.array([[int(x * scale) for x in point] for point in global_points])
     scaled_point_label = np.array(global_point_label)
 
     if scaled_points.size == 0 and scaled_point_label.size == 0:
@@ -132,9 +131,7 @@ def segment_with_points(
 
     results = format_results(masks, scores, logits, 0)
 
-    annotations, _ = point_prompt(
-        results, scaled_points, scaled_point_label, new_h, new_w
-    )
+    annotations, _ = point_prompt(results, scaled_points, scaled_point_label, new_h, new_w)
     annotations = np.array([annotations])
 
     fig = fast_process(
@@ -183,9 +180,7 @@ cond_img_e = gr.Image(label="Input", value=default_example[0], type="pil")
 cond_img_p = gr.Image(label="Input with points", value=default_example[0], type="pil")
 
 segm_img_e = gr.Image(label="Segmented Image", interactive=False, type="pil")
-segm_img_p = gr.Image(
-    label="Segmented Image with points", interactive=False, type="pil"
-)
+segm_img_p = gr.Image(label="Segmented Image with points", interactive=False, type="pil")
 
 global_points = []
 global_point_label = []
@@ -279,9 +274,7 @@ with gr.Blocks(css=css, title="Faster Segment Anything(MobileSAM)") as demo:
                     )
 
                     with gr.Column():
-                        segment_btn_p = gr.Button(
-                            "Start segmenting!", variant="primary"
-                        )
+                        segment_btn_p = gr.Button("Start segmenting!", variant="primary")
                         clear_btn_p = gr.Button("Restart", variant="secondary")
 
                 gr.Markdown("Try some of the examples below ⬇️")
@@ -312,9 +305,7 @@ with gr.Blocks(css=css, title="Faster Segment Anything(MobileSAM)") as demo:
     #     outputs=segm_img_e,
     # )
 
-    segment_btn_p.click(
-        segment_with_points, inputs=[cond_img_p], outputs=[segm_img_p, cond_img_p]
-    )
+    segment_btn_p.click(segment_with_points, inputs=[cond_img_p], outputs=[segm_img_p, cond_img_p])
 
     def clear():
         return None, None

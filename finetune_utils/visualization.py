@@ -12,7 +12,9 @@ from typing import Optional, Tuple
 def overlay_mask_on_image(
     image_tensor: torch.Tensor,  # C×H×W, float [0,1] or uint8
     mask_tensor: torch.Tensor,  # H×W or 1×H×W (sigmoid output)
-    bbox_tensor: Optional[torch.Tensor] = None,  # [xmin, ymin, xmax, ymax] in orig coords
+    bbox_tensor: Optional[
+        torch.Tensor
+    ] = None,  # [xmin, ymin, xmax, ymax] in orig coords
     point_coords: Optional[torch.Tensor] = None,  # N×2 (x,y) in orig coords
     point_labels: Optional[torch.Tensor] = None,  # N, 1=positive, 0=negative, -1=ignore
     *,
@@ -48,7 +50,9 @@ def overlay_mask_on_image(
 
     if mask_2d.shape != (h_rs, w_rs):
         mask_2d = torch.nn.functional.interpolate(
-            mask_2d.unsqueeze(0).unsqueeze(0), size=(h_rs, w_rs), mode="nearest"  # 1×1×h'×w'
+            mask_2d.unsqueeze(0).unsqueeze(0),
+            size=(h_rs, w_rs),
+            mode="nearest",  # 1×1×h'×w'
         ).squeeze()
 
     mask_bin = (mask_2d > threshold).cpu().numpy().astype(np.uint8) * 255
@@ -92,7 +96,9 @@ def overlay_mask_on_image(
                 continue
             r = 5
             if lbl == 1:  # positive
-                draw.ellipse([(x - r, y - r), (x + r, y + r)], fill="green", outline="black")
+                draw.ellipse(
+                    [(x - r, y - r), (x + r, y + r)], fill="green", outline="black"
+                )
             elif lbl == 0:  # negative
                 draw.line([(x - r, y - r), (x + r, y + r)], fill="red", width=2)
                 draw.line([(x - r, y + r), (x + r, y - r)], fill="red", width=2)
@@ -107,11 +113,26 @@ def overlay_masks_on_image(
     masks: torch.Tensor,
     *,
     grid_points: Optional[torch.Tensor] = None,
+    original_size: Optional[Tuple[int, int]] = None,
     threshold: float = 0.5,
     save_dir: str | Path = "./images",
     filename_info: str = "se_vis",
 ) -> Image.Image:
-    """Overlay multiple masks with distinct colors."""
+    """Overlay multiple masks with distinct colors.
+
+    Parameters
+    ----------
+    image_tensor: torch.Tensor
+        Base image in C×H×W format.
+    masks: torch.Tensor
+        Predicted masks at either the original size or the same size as the
+        image.  If different they will be resized automatically.
+    grid_points: Optional[torch.Tensor]
+        Grid prompts in original coordinates.  They will be scaled if
+        ``original_size`` is provided.
+    original_size: Optional[Tuple[int, int]]
+        Height and width of the original image used for prompt generation.
+    """
 
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -125,6 +146,29 @@ def overlay_masks_on_image(
     base = base.convert("RGBA")
     draw = ImageDraw.Draw(base)
 
+    b_w, b_h = base.size
+
+    def _resize_mask(t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 3 and t.shape[0] == 1:
+            t = t.squeeze(0)
+        if t.shape != (b_h, b_w):
+            t = torch.nn.functional.interpolate(
+                t.unsqueeze(0).unsqueeze(0),
+                size=(b_h, b_w),
+                mode="nearest",
+            ).squeeze()
+        return t
+
+    def _scale_points(pts: torch.Tensor) -> torch.Tensor:
+        if original_size is None:
+            return pts.clone()
+        h_raw, w_raw = original_size
+        sx, sy = b_w / w_raw, b_h / h_raw
+        out = pts.clone().float()
+        out[:, 0] *= sx
+        out[:, 1] *= sy
+        return out
+
     if masks.ndim == 4:
         masks = masks.squeeze(1)
     colors = [
@@ -137,7 +181,8 @@ def overlay_masks_on_image(
     ]
 
     for idx, m in enumerate(masks):
-        m_bin = (m > threshold).cpu().numpy().astype(np.uint8) * 255
+        m_resized = _resize_mask(m)
+        m_bin = (m_resized > threshold).cpu().numpy().astype(np.uint8) * 255
         if m_bin.max() == 0:
             continue
         color = colors[idx % len(colors)]
@@ -146,7 +191,7 @@ def overlay_masks_on_image(
         base.paste(layer, mask=mask_pil)
 
     if grid_points is not None and grid_points.numel() > 0:
-        pts = grid_points.float().cpu()
+        pts = _scale_points(grid_points)
         for x, y in pts.tolist():
             if x < 0 or y < 0:
                 continue
