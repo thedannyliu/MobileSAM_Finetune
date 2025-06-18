@@ -4,6 +4,8 @@ import numpy as np
 import torch
 from torchvision.transforms.functional import to_pil_image
 
+from mobile_sam.utils.transforms import ResizeLongestSide
+
 from pathlib import Path
 from PIL import Image, ImageDraw
 from typing import Optional, Tuple
@@ -30,13 +32,36 @@ def overlay_mask_on_image(
     save_dir.mkdir(parents=True, exist_ok=True)
     out_path = save_dir / f"{filename_info}.jpg"
 
-    # Prepare base image (RGB)
+    if original_size is not None:
+        h_raw, w_raw = int(original_size[0]), int(original_size[1])
+        resizer = ResizeLongestSide(max(image_tensor.shape[-2:]))
+        new_h, new_w = resizer.get_preprocess_shape(h_raw, w_raw, resizer.target_length)
+        image_tensor = image_tensor[:, :new_h, :new_w]
+        image_tensor = torch.nn.functional.interpolate(
+            image_tensor.unsqueeze(0),
+            size=(h_raw, w_raw),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+        if mask_tensor.shape[-2:] != (h_raw, w_raw):
+            mask_tensor = torch.nn.functional.interpolate(
+                mask_tensor.unsqueeze(0),
+                size=(h_raw, w_raw),
+                mode="nearest",
+            ).squeeze(0)
+
     if image_tensor.dtype == torch.uint8:
         pil_img = to_pil_image(image_tensor, mode="RGB")
     else:
         pil_img = to_pil_image((image_tensor.clamp(0, 1) * 255).byte(), mode="RGB")
+    w_rs, h_rs = pil_img.size
 
-    w_rs, h_rs = pil_img.size  # resized size (e.g. 1024×1024)
+    if mask_tensor.shape[-2:] != (h_rs, w_rs):
+        mask_tensor = torch.nn.functional.interpolate(
+            mask_tensor.unsqueeze(0),
+            size=(h_rs, w_rs),
+            mode="nearest",
+        ).squeeze(0)
 
     # Prepare predicted mask → binary
     if mask_tensor.ndim == 3 and mask_tensor.shape[0] == 1:
@@ -106,6 +131,7 @@ def overlay_masks_on_image(
     image_tensor: torch.Tensor,
     masks: torch.Tensor,
     *,
+    original_size: Optional[Tuple[int, int]] = None,
     grid_points: Optional[torch.Tensor] = None,
     threshold: float = 0.5,
     save_dir: str | Path = "./images",
@@ -116,6 +142,24 @@ def overlay_masks_on_image(
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     out_path = save_dir / f"{filename_info}.jpg"
+
+    if original_size is not None:
+        h_raw, w_raw = int(original_size[0]), int(original_size[1])
+        resizer = ResizeLongestSide(max(image_tensor.shape[-2:]))
+        new_h, new_w = resizer.get_preprocess_shape(h_raw, w_raw, resizer.target_length)
+        image_tensor = image_tensor[:, :new_h, :new_w]
+        image_tensor = torch.nn.functional.interpolate(
+            image_tensor.unsqueeze(0),
+            size=(h_raw, w_raw),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+        if masks.shape[-2:] != (h_raw, w_raw):
+            masks = torch.nn.functional.interpolate(
+                masks,
+                size=(h_raw, w_raw),
+                mode="nearest",
+            )
 
     if image_tensor.dtype == torch.uint8:
         base = to_pil_image(image_tensor, mode="RGB")

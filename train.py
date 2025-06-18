@@ -491,7 +491,7 @@ def main():
                             mask_orig_pred = o["masks"].to(torch.float32).squeeze(0)
 
                             best_idx = iou_pred.argmax()
-                            sel_logit = low_res[best_idx].unsqueeze(0).unsqueeze(0)
+                            sel_logit = low_res[best_idx].unsqueeze(0)
 
                             bce += F.binary_cross_entropy_with_logits(sel_logit, masks[i])
                             focal += sigmoid_focal_loss(sel_logit, masks[i], reduction="mean")
@@ -1072,6 +1072,10 @@ def main():
                                     overlay_masks_on_image(
                                         image_tensor=img_denorm,
                                         masks=best_masks,
+                                        original_size=(
+                                            int(original_sizes[i][0]),
+                                            int(original_sizes[i][1]),
+                                        ),
                                         grid_points=point_coords[i].cpu(),
                                         threshold=cfg["visual"].get("IOU_threshold", 0.5),
                                         save_dir=str(cur_path),
