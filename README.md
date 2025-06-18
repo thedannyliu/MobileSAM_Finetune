@@ -134,7 +134,9 @@ Finetuning is primarily controlled by `train.py` and configured using a JSON fil
 The finetuning script expects datasets in a simple image-mask pair format:
 * **Images:** Standard image files (e.g., JPG, PNG).
 * **Masks:** Grayscale or binary image files where each pixel value represents a class or a binary segmentation. The `SAMDataset` in `finetune_utils/datasets.py` loads these masks and converts them to binary format if necessary (values > 0 become 1).
-* The `SAMDataset` class handles loading images and masks, applying transformations (resizing, normalization), and generating bounding box prompts from the ground truth masks. These bounding boxes are then used as prompts during training.
+* The `SAMDataset` class handles loading images and masks, applying transformations (resizing, normalization), and generating bounding box or point prompts from the ground truth masks.
+* Masks are first resized using `ResizeLongestSide` and padded to a square matching the model's input size (1024×1024 by default). For training the mask decoder directly, the ground truth masks are further downsampled to 1/4 of this resolution (256×256) so the loss can be computed on the decoder's low resolution logits.
+* During validation and visualization all predicted masks are upsampled back to the original image size using the model's built‑in `postprocess_masks` to ensure proper pixel alignment.
 
 ### Training Script
 

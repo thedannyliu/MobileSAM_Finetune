@@ -126,6 +126,7 @@ def predict_from_grid(model, image, points, orig_size, batch_size=64):
 
     all_masks = []
     all_ious = []
+    all_lowres = []
     for (pts,) in batch_iterator(batch_size, points):
         coords = torch.as_tensor(pts, dtype=torch.float, device=device)
         labels = torch.ones(coords.shape[0], dtype=torch.int, device=device)
@@ -143,8 +144,9 @@ def predict_from_grid(model, image, points, orig_size, batch_size=64):
         )
         masks = model.postprocess_masks(low_res, image.shape[-2:], orig_size).squeeze(0)
         all_masks.append(masks)
+        all_lowres.append(low_res.squeeze(0))
         all_ious.append(iou_pred.squeeze(0))
-    return torch.cat(all_masks, dim=0), torch.cat(all_ious, dim=0)
+    return torch.cat(all_masks, dim=0), torch.cat(all_ious, dim=0), torch.cat(all_lowres, dim=0)
 
 
 def main():
@@ -201,7 +203,13 @@ def main():
         out = {}
         for k in batch[0].keys():
             vals = [d[k] for d in batch]
-            if k in ("gt_masks", "point_coords", "point_labels"):
+            if k in (
+                "gt_masks",
+                "gt_masks_original",
+                "mask_original",
+                "point_coords",
+                "point_labels",
+            ):
                 out[k] = vals  # keep list due to variable lengths
                 continue
             if isinstance(vals[0], torch.Tensor) and all(v is not None for v in vals):
@@ -449,7 +457,8 @@ def main():
                 osz = batch["original_size"]
 
                 if dataset_mode == "single":
-                    masks = batch["mask"].to(dev)
+                    masks = batch["mask"].to(dev)  # low-res GT (1/4)
+                    masks_orig = batch["mask_original"].to(dev)
 
                     batched_input = []
                     for i in range(len(imgs)):
@@ -470,67 +479,68 @@ def main():
                     ):
                         out = student(batched_input=batched_input, multimask_output=True)
 
-                        mask_list = []
-                        iou_list = []
-                        for o in out:
-                            mask_up = F.interpolate(
-                                o["masks"].to(torch.float32),
-                                size=masks.shape[-2:],
-                                mode="bilinear",
-                                align_corners=False,
-                            ).squeeze(0)
-                            mask_list.append(mask_up)
-                            iou_list.append(o["iou_predictions"].squeeze(0).to(torch.float32))
+                        bce = torch.tensor(0.0, device=dev)
+                        focal = torch.tensor(0.0, device=dev)
+                        dice_loss = torch.tensor(0.0, device=dev)
+                        cls_loss_val = torch.tensor(0.0, device=dev)
+                        iou_loss = torch.tensor(0.0, device=dev)
 
-                        pred_masks = torch.stack(mask_list, dim=0)
-                        pred_ious = torch.stack(iou_list, dim=0)
+                        for i, o in enumerate(out):
+                            low_res = o["low_res_logits"].to(torch.float32).squeeze(0)
+                            iou_pred = o["iou_predictions"].squeeze(0).to(torch.float32)
+                            mask_orig_pred = o["masks"].to(torch.float32).squeeze(0)
 
-                        best_indices = pred_ious.argmax(dim=1)
-                        sel_masks = pred_masks[torch.arange(len(pred_masks)), best_indices]
-                        sel_masks = sel_masks.unsqueeze(1)
+                            best_idx = iou_pred.argmax()
+                            sel_logit = low_res[best_idx].unsqueeze(0).unsqueeze(0)
 
-                        bce = F.binary_cross_entropy_with_logits(sel_masks, masks)
-                        focal = sigmoid_focal_loss(sel_masks, masks, reduction="mean")
+                            bce += F.binary_cross_entropy_with_logits(sel_logit, masks[i])
+                            focal += sigmoid_focal_loss(sel_logit, masks[i], reduction="mean")
+                            prob = torch.sigmoid(sel_logit)
+                            num = (prob * masks[i]).sum((-2, -1)) * 2
+                            den = prob.sum((-2, -1)) + masks[i].sum((-2, -1))
+                            dice_loss += 1 - (num / (den + 1e-6))
 
-                        prob = torch.sigmoid(sel_masks)
-                        num = (prob * masks).sum((-2, -1)) * 2
-                        den = prob.sum((-2, -1)) + masks.sum((-2, -1))
-                        dice_loss = 1 - (num / (den + 1e-6)).mean()
-                        best_conf_logits = pred_ious.gather(1, best_indices.unsqueeze(1)).squeeze(1)
-                        cls_loss_val += F.binary_cross_entropy_with_logits(
-                            best_conf_logits, torch.ones_like(best_conf_logits), reduction="mean"
-                        )
+                            best_conf = iou_pred[best_idx]
+                            cls_loss_val += F.binary_cross_entropy_with_logits(
+                                best_conf, torch.ones_like(best_conf)
+                            )
+
+                            with torch.no_grad():
+                                gt_bin = masks_orig[i] > 0.5
+                                ious = []
+                                for c in range(mask_orig_pred.shape[0]):
+                                    pred_bin = (mask_orig_pred[c] > 0.5).float()
+                                    inter = (pred_bin * gt_bin).sum()
+                                    union = pred_bin.sum() + gt_bin.sum() - inter
+                                    ious.append(inter / (union + 1e-6))
+                                gt_ious = torch.stack(ious)
+                            iou_loss += F.mse_loss(torch.sigmoid(iou_pred), gt_ious)
+
+                        bce = bce / len(out)
+                        focal = focal / len(out)
+                        dice_loss = dice_loss / len(out)
+                        cls_loss_val = cls_loss_val / len(out)
+                        iou_loss = iou_loss / len(out)
+
                         task_loss = (
                             w_bce * bce
                             + w_focal * focal
                             + w_dice * dice_loss
                             + w_cls * cls_loss_val
                         )
-
-                        with torch.no_grad():
-                            gt_bin = masks > 0.5
-                            ious = []
-                            for b in range(pred_masks.shape[0]):
-                                preds_bin = (torch.sigmoid(pred_masks[b]) > 0.5).float()
-                                inter = (preds_bin * gt_bin[b]).sum((-2, -1))
-                                union = preds_bin.sum((-2, -1)) + gt_bin[b].sum((-2, -1)) - inter
-                                ious.append(inter / (union + 1e-6))
-                            gt_ious = torch.stack(ious, dim=0)
-
-                        iou_loss = F.mse_loss(torch.sigmoid(pred_ious), gt_ious)
                 else:
                     gt_masks = batch["gt_masks"]
                     point_coords = batch["point_coords"]
-                    pred_masks_all = []
+                    pred_lowres_all = []
                     pred_ious_all = []
                     for bi in range(len(imgs)):
-                        pm, pi = predict_from_grid(
+                        pm, pi, lo = predict_from_grid(
                             student,
                             imgs[bi],
                             point_coords[bi].to(dev),
                             (int(imgs[bi].shape[-2]), int(imgs[bi].shape[-1])),
                         )
-                        pred_masks_all.append(pm)
+                        pred_lowres_all.append(lo)
                         pred_ious_all.append(pi)
 
                     bce = torch.tensor(0.0, device=dev)
@@ -542,7 +552,7 @@ def main():
 
                     for bi in range(len(imgs)):
                         gt = gt_masks[bi].to(dev)  # [K,1,S,S]
-                        preds = pred_masks_all[bi].reshape(-1, gt.shape[-2], gt.shape[-1])
+                        preds = pred_lowres_all[bi].reshape(-1, gt.shape[-2], gt.shape[-1])
                         ious_pred = pred_ious_all[bi].reshape(-1)
                         gt_flat = gt.squeeze(1)
 
@@ -894,6 +904,7 @@ def main():
 
                         if dataset_mode == "single":
                             masks = vb["mask"].to(dev)
+                            masks_orig = vb["mask_original"].to(dev)
 
                             vinp = []
                             for i in range(len(imgs)):
@@ -918,45 +929,27 @@ def main():
                                 vinp.append(entry)
                             vo = student(batched_input=vinp, multimask_output=True)
 
-                            mask_list = []
-                            iou_list = []
-                            for o in vo:
-                                mask_up = F.interpolate(
-                                    o["masks"].to(torch.float32),
-                                    size=masks.shape[-2:],
-                                    mode="bilinear",
-                                    align_corners=False,
-                                ).squeeze(0)
-                                mask_list.append(mask_up)
-                                iou_list.append(o["iou_predictions"].squeeze(0).to(torch.float32))
-
-                            pred_masks = torch.stack(mask_list, dim=0)
-                            pred_ious = torch.stack(iou_list, dim=0)
-
-                            best_indices = pred_ious.argmax(dim=1)
-                            probs = torch.sigmoid(
-                                pred_masks[torch.arange(len(pred_masks)), best_indices].unsqueeze(1)
-                            )
-
                             for i in range(len(imgs)):
-                                prob_i = probs[i]
-                                gt_i = masks[i]
+                                out_i = vo[i]
+                                preds_orig = out_i["masks"].to(torch.float32).squeeze(0)
+                                iou_pred = out_i["iou_predictions"].squeeze(0).to(torch.float32)
+                                best_idx = iou_pred.argmax()
+                                prob_i = torch.sigmoid(preds_orig[best_idx]).unsqueeze(0)
+                                gt_i = masks_orig[i]
 
                                 # Soft Dice for loss logging
-                                num_soft = (prob_i * gt_i).sum((-2, -1)) * 2
-                                den_soft = prob_i.sum((-2, -1)) + gt_i.sum((-2, -1))
+                                num_soft = (prob_i * gt_i).sum() * 2
+                                den_soft = prob_i.sum() + gt_i.sum()
                                 soft_dice = (num_soft / (den_soft + 1e-6)).item()
 
                                 # Binary metrics
                                 pred_bin = (prob_i >= 0.5).float()
-                                num_bin = (pred_bin * gt_i).sum((-2, -1)) * 2
-                                den_bin = pred_bin.sum((-2, -1)) + gt_i.sum((-2, -1))
+                                num_bin = (pred_bin * gt_i).sum() * 2
+                                den_bin = pred_bin.sum() + gt_i.sum()
                                 bin_dice = (num_bin / (den_bin + 1e-6)).item()
 
                                 union = pred_bin + gt_i - pred_bin * gt_i
-                                bin_iou = (
-                                    (pred_bin * gt_i).sum((-2, -1)) / (union.sum((-2, -1)) + 1e-6)
-                                ).item()
+                                bin_iou = ((pred_bin * gt_i).sum() / (union.sum() + 1e-6)).item()
 
                                 dices.append(bin_dice)
                                 ious.append(bin_iou)
@@ -988,8 +981,6 @@ def main():
                                     )
                                     img_denorm = img_denorm.clamp(0, 1).cpu()
 
-                                    pred_mask = probs[i].squeeze(0).cpu()
-
                                     box = vb["box_prompt"][i]
                                     pts = vb["point_coords"][i]
                                     lbl = vb["point_labels"][i]
@@ -1002,26 +993,29 @@ def main():
 
                                     overlay_mask_on_image(
                                         image_tensor=img_denorm,
-                                        mask_tensor=pred_mask,
+                                        mask_tensor=prob_i.squeeze(0).cpu(),
                                         bbox_tensor=box.cpu() if box is not None else None,
                                         point_coords=pts.cpu() if pts is not None else None,
                                         point_labels=lbl.cpu() if lbl is not None else None,
-                                        original_size=None,
+                                        original_size=(
+                                            int(original_sizes[i][0]),
+                                            int(original_sizes[i][1]),
+                                        ),
                                         threshold=cfg["visual"].get("IOU_threshold", 0.5),
                                         save_dir=str(cur_path),
                                         filename_info=(f"ep{ep}_id{vb['id'][i]}_b{bi}_s{i}"),
                                     )
                         else:
                             # Segment-everything validation
-                            gt_masks = vb["gt_masks"]
+                            gt_masks = vb["gt_masks_original"]
                             point_coords = vb["point_coords"]
 
                             for i in range(len(imgs)):
-                                pm, _ = predict_from_grid(
+                                pm, _, _ = predict_from_grid(
                                     student,
                                     imgs[i],
                                     point_coords[i].to(dev),
-                                    (int(imgs[i].shape[-2]), int(imgs[i].shape[-1])),
+                                    (int(original_sizes[i][0]), int(original_sizes[i][1])),
                                 )
 
                                 preds = pm.reshape(-1, gt_masks[i].shape[-2], gt_masks[i].shape[-1])
