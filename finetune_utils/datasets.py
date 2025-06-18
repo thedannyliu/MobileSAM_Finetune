@@ -223,6 +223,11 @@ class ComponentDataset(Dataset):
                 f"pt_scaled={(point_coords[:1].tolist() if cur_type=='point' else None)}"
             )
 
+        # 將 raw prompt 儲存以便可視化（避免因縮放後座標導致偏移）
+        box_prompt_vis = box_prompt_raw if cur_type == "box" else None
+        point_coords_vis = point_coords_raw if cur_type == "point" else None
+        point_labels_vis = point_labels_raw if cur_type == "point" else None
+
         return {
             "image": img_tensor,  # [3, image_size, image_size]
             "mask": msk_down,  # [1, image_size/4, image_size/4]
@@ -230,8 +235,13 @@ class ComponentDataset(Dataset):
             "box_prompt": box_prompt if cur_type == "box" else None,
             "point_coords": point_coords if cur_type == "point" else None,
             "point_labels": point_labels if cur_type == "point" else None,
+            # 原始尺寸 prompt（for visualization）
+            "box_prompt_raw": box_prompt_vis,
+            "point_coords_raw": point_coords_vis,
+            "point_labels_raw": point_labels_vis,
             "id": meta["id"],
             "original_size": raw_size,  # (H_raw, W_raw)
+            "input_size": torch.tensor([new_h, new_w], dtype=torch.int),
         }
 
 
@@ -335,10 +345,10 @@ class SegmentEverythingDataset(Dataset):
 
         # Build grid prompts on the original resolution then scale using
         # ResizeLongestSide, matching SamAutomaticMaskGenerator
-        grid = torch.from_numpy(build_point_grid(self.grid_points)).float()
-        grid[:, 0] *= orig_w
-        grid[:, 1] *= orig_h
-        grid = self.resizer.apply_coords_torch(grid, (orig_h, orig_w))
+        grid_raw = torch.from_numpy(build_point_grid(self.grid_points)).float()
+        grid_raw[:, 0] *= orig_w
+        grid_raw[:, 1] *= orig_h
+        grid = self.resizer.apply_coords_torch(grid_raw.clone(), (orig_h, orig_w))
         labels = torch.ones(len(grid), dtype=torch.long)
 
         return {
@@ -347,6 +357,8 @@ class SegmentEverythingDataset(Dataset):
             "gt_masks_original": gt_masks_orig,
             "point_coords": grid,
             "point_labels": labels,
+            "point_coords_raw": grid_raw,
             "id": meta["id"],
             "original_size": raw_size,
+            "input_size": torch.tensor([new_h, new_w], dtype=torch.int),
         }

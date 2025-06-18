@@ -2,7 +2,7 @@
   "dataset": {
     "train_dataset": "./datasets/train",
     "val_dataset": "./datasets/val",
-    "max_bbox_shift": 20,
+    "max_bbox_shift": 0,
     "num_workers": 4,
     "prompt_mode": "mixed",
     "min_points": 1,
@@ -15,7 +15,7 @@
     "save_path": "./logs"
   },
   "train": {
-    "epochs": 1,
+    "epochs": 100,
     "lr": 1e-5,
     "batch_size": 2,
     "val_freq": 1,
@@ -30,16 +30,16 @@
     "status": true,
     "save_path": "./images",
     "IOU_threshold": 0.5,
-    "save_every_n_epochs": 10
+    "save_every_n_epochs": 1
   },
   "freeze": {
     "freeze_image_encoder": false,
     "freeze_prompt_encoder": false,
     "freeze_mask_decoder": false,
-    "unfreeze_epoch": 10
+    "unfreeze_epoch": 0
   },
   "distillation": {
-    "enable": true,
+    "enable": false,
     "use_precomputed_features": true,
     "precomputed_root": "precomputed",
     "encoder_matching": {

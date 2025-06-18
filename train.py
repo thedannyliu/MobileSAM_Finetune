@@ -117,8 +117,10 @@ def _parse_hw(x):
     return (int(x[0]), int(x[1])) if isinstance(x, torch.Tensor) else tuple(map(int, x))
 
 
-def predict_from_grid(model, image, points, orig_size, batch_size=64):
-    """Run the SAM model on a grid of points and return masks and IoU preds."""
+def predict_from_grid(model, image, points, orig_size, input_size, batch_size=64):
+    """Run the SAM model on a grid of points and return masks and IoU preds.
+    input_size: (H_resized, W_resized) before padding, used to correctly crop padding.
+    """
     device = image.device
     inp = model.preprocess(image.unsqueeze(0))
     embedding = model.image_encoder(inp)
@@ -142,7 +144,7 @@ def predict_from_grid(model, image, points, orig_size, batch_size=64):
             dense_prompt_embeddings=dense,
             multimask_output=True,
         )
-        masks = model.postprocess_masks(low_res, image.shape[-2:], orig_size).squeeze(0)
+        masks = model.postprocess_masks(low_res, input_size, orig_size).squeeze(0)
         all_masks.append(masks)
         all_lowres.append(low_res.squeeze(0))
         all_ious.append(iou_pred.squeeze(0))
@@ -160,8 +162,14 @@ def main():
     if "lr" not in cfg["train"]:
         cfg["train"]["lr"] = 5e-5
 
-    MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-    tf_img = T.Compose([T.ToTensor(), T.Normalize(MEAN, STD)])
+    # ─────────────────── 影像前處理 ───────────────────
+    # SAM 的 `preprocess` 期望輸入像素範圍為 [0,255]，並且會自行減去
+    # ImageNet 平均值後再除以標準差。因此 DataLoader 端**不要**事先做
+    # Normalize；改成：
+    #   1. 將 PIL Image → tensor (0‥1)
+    #   2. 直接放大到 0‥255
+    # 以確保與 `preprocess` 對齊。
+    tf_img = T.Compose([T.ToTensor(), T.Lambda(lambda x: x * 255.0)])
     tf_msk = T.Compose([T.ToTensor()])
 
     ds_cfg = cfg["dataset"]
@@ -209,6 +217,9 @@ def main():
                 "mask_original",
                 "point_coords",
                 "point_labels",
+                "box_prompt_raw",
+                "point_coords_raw",
+                "point_labels_raw",
             ):
                 out[k] = vals  # keep list due to variable lengths
                 continue
@@ -245,9 +256,12 @@ def main():
     )
     log.addHandler(file_handler)
 
+    # ─────────────────── 建立 student 並確保參數可訓練 ───────────────────
     student = sam_model_registry[m_cfg.get("type", "vit_t")](
         checkpoint=m_cfg.get("checkpoint_path")
     ).to(dev)
+    # builder 內部會呼叫 .eval()，此舉不會改變 requires_grad，但保險起見先通通開啟
+    student.requires_grad_(True)
 
     if cfg["freeze"].get("freeze_image_encoder", True):
         student.image_encoder.requires_grad_(False)
@@ -440,17 +454,17 @@ def main():
 
             for step, batch in enumerate(pbar):
                 # ─────────── 先初始化所有可能 later 會被用到的 loss 變數 ───────────
-                bce = torch.tensor(0.0, device=dev)
-                focal = torch.tensor(0.0, device=dev)
-                dice_loss = torch.tensor(0.0, device=dev)
-                dist_loss = torch.tensor(0.0, device=dev)
-                enc_loss_val = torch.tensor(0.0, device=dev)
-                dec_loss_val = torch.tensor(0.0, device=dev)
-                attn_loss_val = torch.tensor(0.0, device=dev)
-                rkd_loss_val = torch.tensor(0.0, device=dev)
-                cls_loss_val = torch.tensor(0.0, device=dev)
-                task_loss = torch.tensor(0.0, device=dev)
-                loss = torch.tensor(0.0, device=dev)
+                bce = torch.tensor(0.0, device=dev, requires_grad=True)
+                focal = torch.tensor(0.0, device=dev, requires_grad=True)
+                dice_loss = torch.tensor(0.0, device=dev, requires_grad=True)
+                dist_loss = torch.tensor(0.0, device=dev, requires_grad=True)
+                enc_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
+                dec_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
+                attn_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
+                rkd_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
+                cls_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
+                task_loss = torch.tensor(0.0, device=dev, requires_grad=True)
+                loss = torch.tensor(0.0, device=dev, requires_grad=True)
                 #
                 imgs = batch["image"].to(dev)
                 ids = batch["id"]
@@ -471,6 +485,11 @@ def main():
                         if batch["point_coords"][i] is not None:
                             entry["point_coords"] = batch["point_coords"][i].to(dev).unsqueeze(0)
                             entry["point_labels"] = batch["point_labels"][i].to(dev).unsqueeze(0)
+                        if "input_size" in batch:
+                            entry["input_size"] = (
+                                int(batch["input_size"][i][0]),
+                                int(batch["input_size"][i][1]),
+                            )
 
                         batched_input.append(entry)
 
@@ -479,11 +498,11 @@ def main():
                     ):
                         out = student(batched_input=batched_input, multimask_output=True)
 
-                        bce = torch.tensor(0.0, device=dev)
-                        focal = torch.tensor(0.0, device=dev)
-                        dice_loss = torch.tensor(0.0, device=dev)
-                        cls_loss_val = torch.tensor(0.0, device=dev)
-                        iou_loss = torch.tensor(0.0, device=dev)
+                        bce = torch.tensor(0.0, device=dev, requires_grad=True)
+                        focal = torch.tensor(0.0, device=dev, requires_grad=True)
+                        dice_loss = torch.tensor(0.0, device=dev, requires_grad=True)
+                        cls_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
+                        iou_loss = torch.tensor(0.0, device=dev, requires_grad=True)
 
                         for i, o in enumerate(out):
                             low_res = o["low_res_logits"].to(torch.float32).squeeze(0)
@@ -493,15 +512,15 @@ def main():
                             best_idx = iou_pred.argmax()
                             sel_logit = low_res[best_idx].unsqueeze(0)
 
-                            bce += F.binary_cross_entropy_with_logits(sel_logit, masks[i])
-                            focal += sigmoid_focal_loss(sel_logit, masks[i], reduction="mean")
+                            bce = bce + F.binary_cross_entropy_with_logits(sel_logit, masks[i])
+                            focal = focal + sigmoid_focal_loss(sel_logit, masks[i], reduction="mean")
                             prob = torch.sigmoid(sel_logit)
                             num = (prob * masks[i]).sum((-2, -1)) * 2
                             den = prob.sum((-2, -1)) + masks[i].sum((-2, -1))
-                            dice_loss += 1 - (num / (den + 1e-6))
+                            dice_loss = dice_loss + (1 - (num / (den + 1e-6)).mean())
 
                             best_conf = iou_pred[best_idx]
-                            cls_loss_val += F.binary_cross_entropy_with_logits(
+                            cls_loss_val = cls_loss_val + F.binary_cross_entropy_with_logits(
                                 best_conf, torch.ones_like(best_conf)
                             )
 
@@ -514,7 +533,7 @@ def main():
                                     union = pred_bin.sum() + gt_bin.sum() - inter
                                     ious.append(inter / (union + 1e-6))
                                 gt_ious = torch.stack(ious)
-                            iou_loss += F.mse_loss(torch.sigmoid(iou_pred), gt_ious)
+                            iou_loss = iou_loss + F.mse_loss(torch.sigmoid(iou_pred), gt_ious)
 
                         bce = bce / len(out)
                         focal = focal / len(out)
@@ -534,19 +553,30 @@ def main():
                     pred_lowres_all = []
                     pred_ious_all = []
                     for bi in range(len(imgs)):
+                        raw_sz_tuple = (
+                            int(osz[bi][0]),
+                            int(osz[bi][1]),
+                        )
+                        in_sz_tuple = (
+                            int(batch["input_size"][bi][0])
+                            if "input_size" in batch else raw_sz_tuple[0],
+                            int(batch["input_size"][bi][1])
+                            if "input_size" in batch else raw_sz_tuple[1],
+                        )
                         pm, pi, lo = predict_from_grid(
                             student,
                             imgs[bi],
                             point_coords[bi].to(dev),
-                            (int(imgs[bi].shape[-2]), int(imgs[bi].shape[-1])),
+                            raw_sz_tuple,
+                            in_sz_tuple,
                         )
                         pred_lowres_all.append(lo)
                         pred_ious_all.append(pi)
 
-                    bce = torch.tensor(0.0, device=dev)
-                    focal = torch.tensor(0.0, device=dev)
-                    dice_loss = torch.tensor(0.0, device=dev)
-                    iou_loss = torch.tensor(0.0, device=dev)
+                    bce = torch.tensor(0.0, device=dev, requires_grad=True)
+                    focal = torch.tensor(0.0, device=dev, requires_grad=True)
+                    dice_loss = torch.tensor(0.0, device=dev, requires_grad=True)
+                    iou_loss = torch.tensor(0.0, device=dev, requires_grad=True)
                     cls_total = 0
                     matched_cnt = 0
 
@@ -583,7 +613,7 @@ def main():
                                 assigned_gt[r] = c
                                 matched_cnt += 1
 
-                        cls_loss_val += F.binary_cross_entropy_with_logits(
+                        cls_loss_val = cls_loss_val + F.binary_cross_entropy_with_logits(
                             ious_pred, labels, reduction="sum"
                         )
                         cls_total += labels.numel()
@@ -594,13 +624,13 @@ def main():
                             target = gt[c]
                             logit = preds[r].unsqueeze(0).unsqueeze(0)
                             target_exp = target.unsqueeze(0)
-                            bce += F.binary_cross_entropy_with_logits(logit, target_exp)
-                            focal += sigmoid_focal_loss(logit, target_exp, reduction="mean")
+                            bce = bce + F.binary_cross_entropy_with_logits(logit, target_exp)
+                            focal = focal + sigmoid_focal_loss(logit, target_exp, reduction="mean")
                             prob = torch.sigmoid(logit)
                             num = (prob * target_exp).sum((-2, -1)) * 2
                             den = prob.sum((-2, -1)) + target_exp.sum((-2, -1))
-                            dice_loss += 1 - (num / (den + 1e-6)).mean()
-                            iou_loss += F.mse_loss(torch.sigmoid(ious_pred[r]), iou_mat[r, c])
+                            dice_loss = dice_loss + (1 - (num / (den + 1e-6)).mean())
+                            iou_loss = iou_loss + F.mse_loss(torch.sigmoid(ious_pred[r]), iou_mat[r, c])
 
                     # Average using only the matched predictions to avoid loss dilution.
                     n_matched = matched_cnt
@@ -611,7 +641,7 @@ def main():
                     task_loss = task_loss / max(1, n_matched)
                     iou_loss = iou_loss / max(1, n_matched)
 
-                    dist_loss = torch.tensor(0.0, device=dev)
+                    dist_loss = torch.tensor(0.0, device=dev, requires_grad=True)
                     if use_distillation and hook_handles:
                         feat_student = pop_features() or {}
                         if step % 20 == 0:
@@ -817,9 +847,13 @@ def main():
                                         log.warning(f"RKD error for teacher {tname}: {e}")
 
                     dist_loss = enc_loss_val + dec_loss_val + attn_loss_val + rkd_loss_val
-                    loss = (task_loss + w_iou * iou_loss + lambda_coef * dist_loss) / tr_cfg.get(
-                        "gradient_accumulation", 1
-                    )
+
+                    # 確保總 loss 為 fp32 Tensor 且帶 grad
+                    loss = (
+                        task_loss.float()
+                        + w_iou * iou_loss.float()
+                        + lambda_coef * dist_loss.float()
+                    ) / tr_cfg.get("gradient_accumulation", 1)
 
                 scaler.scale(loss).backward()
                 # del low_res_logits, tmp, logit_up, prob, focal, dice_loss
@@ -844,12 +878,12 @@ def main():
                 tot_cls += cls_loss_val.item()
 
                 ga = tr_cfg.get("gradient_accumulation", 1)
-                norm = n_matched if dataset_mode == "everything" else 1
-                bce_c = w_bce * bce.item() / max(1, norm) / ga
-                focal_c = w_focal * focal.item() / max(1, norm) / ga
-                dice_c = w_dice * dice_loss.item() / max(1, norm) / ga
+                norm = 1 if dataset_mode == "single" else max(1, n_matched)
+                bce_c = w_bce * bce.item() / norm / ga
+                focal_c = w_focal * focal.item() / norm / ga
+                dice_c = w_dice * dice_loss.item() / norm / ga
                 iou_c = w_iou * iou_loss.item() / ga
-                cls_c = w_cls * cls_loss_val.item() / max(1, norm) / ga
+                cls_c = w_cls * cls_loss_val.item() / norm / ga
                 enc_c = lambda_coef * enc_loss_val.item() / ga
                 dec_c = lambda_coef * dec_loss_val.item() / ga
                 attn_c = lambda_coef * attn_loss_val.item() / ga
@@ -915,17 +949,16 @@ def main():
                                         int(original_sizes[i][1]),
                                     ),
                                 }
-                                if vb["box_prompt"][i] is not None:
-                                    entry["boxes"] = (
-                                        vb["box_prompt"][i].to(dev).unsqueeze(0)
-                                    )  # (1,4)
-                                if vb["point_coords"][i] is not None:
-                                    entry["point_coords"] = (
-                                        vb["point_coords"][i].to(dev).unsqueeze(0)
-                                    )  # (1,K,2)
-                                    entry["point_labels"] = (
-                                        vb["point_labels"][i].to(dev).unsqueeze(0)
-                                    )  # (1,K)
+                                if vb.get("box_prompt", [None]*len(imgs))[i] is not None:
+                                    entry["boxes"] = vb["box_prompt"][i].to(dev).unsqueeze(0)
+                                if vb.get("point_coords", [None]*len(imgs))[i] is not None:
+                                    entry["point_coords"] = vb["point_coords"][i].to(dev).unsqueeze(0)
+                                    entry["point_labels"] = vb["point_labels"][i].to(dev).unsqueeze(0)
+                                if "input_size" in vb:
+                                    entry["input_size"] = (
+                                        int(vb["input_size"][i][0]),
+                                        int(vb["input_size"][i][1]),
+                                    )
                                 vinp.append(entry)
                             vo = student(batched_input=vinp, multimask_output=True)
 
@@ -975,15 +1008,12 @@ def main():
                                 ):
                                     cur_path = Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
                                     cur_path.mkdir(parents=True, exist_ok=True)
-                                    img_denorm = (
-                                        imgs[i] * torch.tensor(STD, device=dev)[:, None, None]
-                                        + torch.tensor(MEAN, device=dev)[:, None, None]
-                                    )
-                                    img_denorm = img_denorm.clamp(0, 1).cpu()
+                                    # 還原到 0‥1 方便可視化
+                                    img_denorm = (imgs[i] / 255.0).clamp(0, 1).cpu()
 
-                                    box = vb["box_prompt"][i]
-                                    pts = vb["point_coords"][i]
-                                    lbl = vb["point_labels"][i]
+                                    box = vb.get("box_prompt", [None]*len(imgs))[i]
+                                    pts = vb.get("point_coords", [None]*len(imgs))[i]
+                                    lbl = vb.get("point_labels", [None]*len(imgs))[i]
                                     if box is not None:
                                         box = box.to(torch.float32)
                                     if pts is not None:
@@ -1011,14 +1041,25 @@ def main():
                             point_coords = vb["point_coords"]
 
                             for i in range(len(imgs)):
+                                raw_sz_tuple = (
+                                    int(original_sizes[i][0]),
+                                    int(original_sizes[i][1]),
+                                )
+                                in_sz_tuple = (
+                                    int(vb["input_size"][i][0])
+                                    if "input_size" in vb else raw_sz_tuple[0],
+                                    int(vb["input_size"][i][1])
+                                    if "input_size" in vb else raw_sz_tuple[1],
+                                )
                                 pm, _, _ = predict_from_grid(
                                     student,
                                     imgs[i],
                                     point_coords[i].to(dev),
-                                    (int(original_sizes[i][0]), int(original_sizes[i][1])),
+                                    raw_sz_tuple,
+                                    in_sz_tuple,
                                 )
 
-                                preds = pm.reshape(-1, gt_masks[i].shape[-2], gt_masks[i].shape[-1])
+                                preds = pm  # already BxHxW, where B = num prompts * 3
                                 probs = torch.sigmoid(preds)
                                 gt = gt_masks[i].to(dev)
                                 gt_bin = gt.squeeze(1)
@@ -1060,14 +1101,8 @@ def main():
                                 ):
                                     cur_path = Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
                                     cur_path.mkdir(parents=True, exist_ok=True)
-                                    img_denorm = (
-                                        (
-                                            imgs[i] * torch.tensor(STD, device=dev)[:, None, None]
-                                            + torch.tensor(MEAN, device=dev)[:, None, None]
-                                        )
-                                        .clamp(0, 1)
-                                        .cpu()
-                                    )
+                                    # 還原到 0‥1 方便可視化
+                                    img_denorm = (imgs[i] / 255.0).clamp(0, 1).cpu()
                                     best_masks = probs[row_ind].cpu()
                                     overlay_masks_on_image(
                                         image_tensor=img_denorm,
@@ -1076,7 +1111,7 @@ def main():
                                             int(original_sizes[i][0]),
                                             int(original_sizes[i][1]),
                                         ),
-                                        grid_points=point_coords[i].cpu(),
+                                        grid_points=vb.get("point_coords", point_coords)[i].cpu(),
                                         threshold=cfg["visual"].get("IOU_threshold", 0.5),
                                         save_dir=str(cur_path),
                                         filename_info=f"ep{ep}_id{vb['id'][i]}_b{bi}",

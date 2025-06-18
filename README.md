@@ -2,6 +2,26 @@
 
 This repository provides a comprehensive framework for finetuning the MobileSAM model, a lightweight version of the Segment Anything Model (SAM) designed for efficient execution on resource-constrained devices. The original MobileSAM leverages a TinyViT backbone, and this project enables further specialization of the model on custom datasets. It includes utilities for data loading, training, loss computation, and a Gradio-based demonstration application.
 
+# 影像前處理注意事項
+
+本專案自 2025-06 更新後，**訓練與推論流程全面改為「資料載入端僅將影像轉換成 Tensor 後乘上 `255`，不再做任何 Normalize」**。
+
+理由如下：
+
+* `mobile_sam.modeling.sam.Sam.preprocess()` 內部已會按 ImageNet 統計值 (mean=[123.675,116.28,103.53]，std=[58.395,57.12,57.375]) 進行標準化；若資料集先行 Normalize 會導致數值錯誤，模型難以收斂。
+* 保留 0‥255 範圍可與官方 **SamPredictor / SamAutomaticMaskGenerator** 流程 1:1 對齊，確保 prompt 與 mask 的對位以及後續 `postprocess_masks` 邏輯正確。
+
+因此，`train.py` 中的 `tf_img` 轉換已改為：
+
+```python
+T.Compose([
+    T.ToTensor(),          # 0‥1
+    T.Lambda(lambda x: x*255.0)   # → 0‥255
+])
+```
+
+若你自行撰寫 Dataset，請務必保持相同邏輯。
+
 ## Table of Contents
 
 1.  [Project Overview](#project-overview)
@@ -505,3 +525,25 @@ Please refer to `CONTRIBUTING.md` for guidelines on contributing to this project
 ## License
 
 The original Segment Anything Model (SAM) and MobileSAM are typically released under the Apache 2.0 License. This finetuning repository, if it builds upon that work, would likely also fall under a compatible open-source license. Please check the `LICENSE` file for specific details. (Note: A `LICENSE` file was not explicitly provided in the uploaded project structure, but it's standard practice).
+
+## 2025-06-18 更新
+
+### 🐞 Bug Fix – Prompt 座標在驗證階段錯置
+
+過去版本於 *validation* pipeline 內，誤將 **raw (原圖座標)** 的 `box_prompt_raw` / `point_coords_raw` 直接餵給 `Sam` 模型，導致
+
+* 模型接收到與 `batched_input[\"image\"]` 不同座標系統的 prompt。
+* 驗證 Dice / IoU 表現異常低落，容易誤判「訓練無法收斂」。
+
+此版本已統一：
+
+* **訓練與驗證** 一律使用 `box_prompt` / `point_coords` — 亦即 **經過 `ResizeLongestSide` 縮放後、再對應 padding** 的座標。
+* 視覺化 (`overlay_*`) 仍保留 raw prompt，以便能在原圖解析度下直接疊加顯示。
+
+主要修改檔：
+
+* `train.py`
+  * `Single-object` 訓練迴圈 (`batched_input` 構建) → 換用 `box_prompt` / `point_coords`。
+  * 驗證階段 `vinp` 同步改用縮放後座標。
+
+重新執行 `train.py --config configs/mobileSAM.json` 後，即可觀察到驗證指標的合理提升。

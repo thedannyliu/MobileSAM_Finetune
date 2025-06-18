@@ -115,9 +115,17 @@ class Sam(nn.Module):
                 dense_prompt_embeddings=dense_embeddings,
                 multimask_output=multimask_output,
             )
+            if "input_size" in image_record:
+                inp_val = image_record["input_size"]
+                if isinstance(inp_val, (list, tuple)):
+                    in_size = tuple(int(v) for v in inp_val)
+                else:
+                    in_size = tuple(int(v) for v in inp_val.tolist())
+            else:
+                in_size = image_record["image"].shape[-2:]
             masks = self.postprocess_masks(
                 low_res_masks,
-                input_size=image_record["image"].shape[-2:],
+                input_size=in_size,
                 original_size=image_record["original_size"],
             )
             outputs.append(

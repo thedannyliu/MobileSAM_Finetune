@@ -17,9 +17,9 @@
     "save_path": "./logs"
   },
   "train": {
-    "epochs": 3,
+    "epochs": 300,
     "lr": 0.00001,
-    "batch_size": 2,
+    "batch_size": 1,
     "val_freq": 1,
     "gradient_accumulation": 1,
     "bf16": true,
@@ -29,7 +29,7 @@
     "early_stop_patience": 20,
     "loss_weights": {
       "bce": 1.0,
-      "focal": 0.5,
+      "focal": 15,
       "dice": 1.0,
       "iou": 1.0,
       "cls": 1.0
@@ -39,7 +39,7 @@
     "status": true,
     "save_path": "./images",
     "IOU_threshold": 0.5,
-    "save_every_n_epochs": 10
+    "save_every_n_epochs": 1
   },
   "freeze": {
     "freeze_image_encoder": false,
@@ -48,7 +48,7 @@
     "unfreeze_epoch": 0
   },
   "distillation": {
-    "enable": true,
+    "enable": false,
     "lambda_coef": 1.0,
     "use_precomputed_features": true,
     "precomputed_root": "precomputed",
