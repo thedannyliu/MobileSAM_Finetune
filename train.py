@@ -453,17 +453,17 @@ def main():
 
             for step, batch in enumerate(pbar):
                 # ─────────── 先初始化所有可能 later 會被用到的 loss 變數 ───────────
-                bce = torch.tensor(0.0, device=dev)
-                focal = torch.tensor(0.0, device=dev)
-                dice_loss = torch.tensor(0.0, device=dev)
-                dist_loss = torch.tensor(0.0, device=dev)
-                enc_loss_val = torch.tensor(0.0, device=dev)
-                dec_loss_val = torch.tensor(0.0, device=dev)
-                attn_loss_val = torch.tensor(0.0, device=dev)
-                rkd_loss_val = torch.tensor(0.0, device=dev)
-                cls_loss_val = torch.tensor(0.0, device=dev)
-                task_loss = torch.tensor(0.0, device=dev)
-                loss = torch.tensor(0.0, device=dev)
+                bce = 0.0
+                focal = 0.0
+                dice_loss = 0.0
+                dist_loss = 0.0
+                enc_loss_val = 0.0
+                dec_loss_val = 0.0
+                attn_loss_val = 0.0
+                rkd_loss_val = 0.0
+                cls_loss_val = 0.0
+                task_loss = 0.0
+                loss = 0.0
                 #
                 imgs = batch["image"].to(dev)
                 ids = batch["id"]
@@ -500,11 +500,11 @@ def main():
                             batched_input=batched_input, multimask_output=True
                         )
 
-                        bce = torch.tensor(0.0, device=dev)
-                        focal = torch.tensor(0.0, device=dev)
-                        dice_loss = torch.tensor(0.0, device=dev)
-                        cls_loss_val = torch.tensor(0.0, device=dev)
-                        iou_loss = torch.tensor(0.0, device=dev)
+                        bce = 0.0
+                        focal = 0.0
+                        dice_loss = 0.0
+                        cls_loss_val = 0.0
+                        iou_loss = 0.0
 
                         for i, o in enumerate(out):
                             low_res = o["low_res_logits"].to(torch.float32).squeeze(0)
@@ -568,10 +568,10 @@ def main():
                         pred_lowres_all.append(lo)
                         pred_ious_all.append(pi)
 
-                    bce = torch.tensor(0.0, device=dev)
-                    focal = torch.tensor(0.0, device=dev)
-                    dice_loss = torch.tensor(0.0, device=dev)
-                    iou_loss = torch.tensor(0.0, device=dev)
+                    bce = 0.0
+                    focal = 0.0
+                    dice_loss = 0.0
+                    iou_loss = 0.0
                     cls_total = 0
                     matched_cnt = 0
 
@@ -649,7 +649,7 @@ def main():
                     task_loss = task_loss / max(1, n_matched)
                     iou_loss = iou_loss / max(1, n_matched)
 
-                    dist_loss = torch.tensor(0.0, device=dev)
+                    dist_loss = 0.0
                     if use_distillation and hook_handles:
                         feat_student = pop_features() or {}
                         if step % 20 == 0:
