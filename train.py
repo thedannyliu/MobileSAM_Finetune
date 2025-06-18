@@ -45,9 +45,7 @@ def log_gpu_memory(step_name=""):
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1024**3
         cached = torch.cuda.memory_reserved() / 1024**3
-        log.info(
-            f"{step_name} GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB"
-        )
+        log.info(f"{step_name} GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB")
 
 
 def clear_gpu_cache():
@@ -70,8 +68,7 @@ class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
         prog = (cur - self.warmup) / max(1, (self.total - self.warmup))
         cos = 0.5 * (1 + np.cos(np.pi * prog))
         return [
-            base_lr * (self.min_ratio + (1 - self.min_ratio) * cos)
-            for base_lr in self.base_lrs
+            base_lr * (self.min_ratio + (1 - self.min_ratio) * cos) for base_lr in self.base_lrs
         ]
 
 
@@ -111,9 +108,7 @@ def load_cached_npy_features(
     stacked = {k: [] for k in keys}
     for stem in stems:
         for k in keys:
-            fname = (
-                f"{stem}_{k.replace('.', '_').replace('[', '_').replace(']', '')}.npy"
-            )
+            fname = f"{stem}_{k.replace('.', '_').replace('[', '_').replace(']', '')}.npy"
             stacked[k].append(feature_cache.get(base / teacher / split / fname))
     return [torch.stack(stacked[k]) for k in keys]
 
@@ -344,9 +339,7 @@ def main():
             if not use_precomputed:
                 ckpt = t.get("checkpoint")
                 if not ckpt or not os.path.exists(ckpt):
-                    log.warning(
-                        f"Teacher checkpoint {ckpt} not found; skip {t['name']}"
-                    )
+                    log.warning(f"Teacher checkpoint {ckpt} not found; skip {t['name']}")
                     continue
                 builder = sam_model_registry.get(mtype)
                 if builder is None:
@@ -375,9 +368,7 @@ def main():
                         "type": mtype,
                     }
                 )
-                log.info(
-                    f"Loaded teacher {t['name']} ({mtype}) with weight {t['weight']}"
-                )
+                log.info(f"Loaded teacher {t['name']} ({mtype}) with weight {t['weight']}")
             else:
                 log.info(f"Using precomputed features for teacher {t['name']}")
     else:
@@ -453,17 +444,17 @@ def main():
 
             for step, batch in enumerate(pbar):
                 # ─────────── 先初始化所有可能 later 會被用到的 loss 變數 ───────────
-                bce = 0.0
-                focal = 0.0
-                dice_loss = 0.0
-                dist_loss = 0.0
-                enc_loss_val = 0.0
-                dec_loss_val = 0.0
-                attn_loss_val = 0.0
-                rkd_loss_val = 0.0
-                cls_loss_val = 0.0
-                task_loss = 0.0
-                loss = 0.0
+                bce = torch.tensor(0.0, device=dev)
+                focal = torch.tensor(0.0, device=dev)
+                dice_loss = torch.tensor(0.0, device=dev)
+                dist_loss = torch.tensor(0.0, device=dev)
+                enc_loss_val = torch.tensor(0.0, device=dev)
+                dec_loss_val = torch.tensor(0.0, device=dev)
+                attn_loss_val = torch.tensor(0.0, device=dev)
+                rkd_loss_val = torch.tensor(0.0, device=dev)
+                cls_loss_val = torch.tensor(0.0, device=dev)
+                task_loss = torch.tensor(0.0, device=dev)
+                loss = torch.tensor(0.0, device=dev)
                 #
                 imgs = batch["image"].to(dev)
                 ids = batch["id"]
@@ -482,29 +473,21 @@ def main():
                         if batch["box_prompt"][i] is not None:
                             entry["boxes"] = batch["box_prompt"][i].to(dev).unsqueeze(0)
                         if batch["point_coords"][i] is not None:
-                            entry["point_coords"] = (
-                                batch["point_coords"][i].to(dev).unsqueeze(0)
-                            )
-                            entry["point_labels"] = (
-                                batch["point_labels"][i].to(dev).unsqueeze(0)
-                            )
+                            entry["point_coords"] = batch["point_coords"][i].to(dev).unsqueeze(0)
+                            entry["point_labels"] = batch["point_labels"][i].to(dev).unsqueeze(0)
 
                         batched_input.append(entry)
 
                     with autocast(
-                        dtype=torch.bfloat16
-                        if tr_cfg.get("bf16", False)
-                        else torch.float16
+                        dtype=torch.bfloat16 if tr_cfg.get("bf16", False) else torch.float16
                     ):
-                        out = student(
-                            batched_input=batched_input, multimask_output=True
-                        )
+                        out = student(batched_input=batched_input, multimask_output=True)
 
-                        bce = 0.0
-                        focal = 0.0
-                        dice_loss = 0.0
-                        cls_loss_val = 0.0
-                        iou_loss = 0.0
+                        bce = torch.tensor(0.0, device=dev)
+                        focal = torch.tensor(0.0, device=dev)
+                        dice_loss = torch.tensor(0.0, device=dev)
+                        cls_loss_val = torch.tensor(0.0, device=dev)
+                        iou_loss = torch.tensor(0.0, device=dev)
 
                         for i, o in enumerate(out):
                             low_res = o["low_res_logits"].to(torch.float32).squeeze(0)
@@ -514,19 +497,17 @@ def main():
                             best_idx = iou_pred.argmax()
                             sel_logit = low_res[best_idx].unsqueeze(0)
 
-                            bce += F.binary_cross_entropy_with_logits(
-                                sel_logit, masks[i]
-                            )
-                            focal += sigmoid_focal_loss(
+                            bce = bce + F.binary_cross_entropy_with_logits(sel_logit, masks[i])
+                            focal = focal + sigmoid_focal_loss(
                                 sel_logit, masks[i], reduction="mean"
                             )
                             prob = torch.sigmoid(sel_logit)
                             num = (prob * masks[i]).sum((-2, -1)) * 2
                             den = prob.sum((-2, -1)) + masks[i].sum((-2, -1))
-                            dice_loss += (1 - num / (den + 1e-6)).mean()
+                            dice_loss = dice_loss + (1 - num / (den + 1e-6)).mean()
 
                             best_conf = iou_pred[best_idx]
-                            cls_loss_val += F.binary_cross_entropy_with_logits(
+                            cls_loss_val = cls_loss_val + F.binary_cross_entropy_with_logits(
                                 best_conf, torch.ones_like(best_conf)
                             )
 
@@ -539,7 +520,7 @@ def main():
                                     union = pred_bin.sum() + gt_bin.sum() - inter
                                     ious.append(inter / (union + 1e-6))
                                 gt_ious = torch.stack(ious)
-                            iou_loss += F.mse_loss(torch.sigmoid(iou_pred), gt_ious)
+                            iou_loss = iou_loss + F.mse_loss(torch.sigmoid(iou_pred), gt_ious)
 
                         bce = bce / len(out)
                         focal = focal / len(out)
@@ -568,26 +549,22 @@ def main():
                         pred_lowres_all.append(lo)
                         pred_ious_all.append(pi)
 
-                    bce = 0.0
-                    focal = 0.0
-                    dice_loss = 0.0
-                    iou_loss = 0.0
+                    bce = torch.tensor(0.0, device=dev)
+                    focal = torch.tensor(0.0, device=dev)
+                    dice_loss = torch.tensor(0.0, device=dev)
+                    iou_loss = torch.tensor(0.0, device=dev)
                     cls_total = 0
                     matched_cnt = 0
 
                     for bi in range(len(imgs)):
                         gt = gt_masks[bi].to(dev)  # [K,1,S,S]
-                        preds = pred_lowres_all[bi].reshape(
-                            -1, gt.shape[-2], gt.shape[-1]
-                        )
+                        preds = pred_lowres_all[bi].reshape(-1, gt.shape[-2], gt.shape[-1])
                         ious_pred = pred_ious_all[bi].reshape(-1)
                         gt_flat = gt.squeeze(1)
 
                         # IoU matrix for Hungarian matching
                         pred_bin = (torch.sigmoid(preds) > 0.5).float()
-                        inter = (pred_bin.unsqueeze(1) * gt_flat.unsqueeze(0)).sum(
-                            (-2, -1)
-                        )
+                        inter = (pred_bin.unsqueeze(1) * gt_flat.unsqueeze(0)).sum((-2, -1))
                         union = (
                             pred_bin.unsqueeze(1).sum((-2, -1))
                             + gt_flat.unsqueeze(0).sum((-2, -1))
@@ -597,9 +574,7 @@ def main():
 
                         cost = (-iou_mat).cpu().numpy()
                         row_ind, col_ind = linear_sum_assignment(cost)
-                        assert len(set(col_ind)) == len(
-                            col_ind
-                        ), "GT matched more than once"
+                        assert len(set(col_ind)) == len(col_ind), "GT matched more than once"
                         assert len(set(row_ind)) == len(
                             row_ind
                         ), "Prediction matched more than once"
@@ -614,7 +589,7 @@ def main():
                                 assigned_gt[r] = c
                                 matched_cnt += 1
 
-                        cls_loss_val += F.binary_cross_entropy_with_logits(
+                        cls_loss_val = cls_loss_val + F.binary_cross_entropy_with_logits(
                             ious_pred, labels, reduction="sum"
                         )
                         cls_total += labels.numel()
@@ -625,15 +600,13 @@ def main():
                             target = gt[c]
                             logit = preds[r].unsqueeze(0).unsqueeze(0)
                             target_exp = target.unsqueeze(0)
-                            bce += F.binary_cross_entropy_with_logits(logit, target_exp)
-                            focal += sigmoid_focal_loss(
-                                logit, target_exp, reduction="mean"
-                            )
+                            bce = bce + F.binary_cross_entropy_with_logits(logit, target_exp)
+                            focal = focal + sigmoid_focal_loss(logit, target_exp, reduction="mean")
                             prob = torch.sigmoid(logit)
                             num = (prob * target_exp).sum((-2, -1)) * 2
                             den = prob.sum((-2, -1)) + target_exp.sum((-2, -1))
-                            dice_loss += 1 - (num / (den + 1e-6)).mean()
-                            iou_loss += F.mse_loss(
+                            dice_loss = dice_loss + (1 - (num / (den + 1e-6)).mean())
+                            iou_loss = iou_loss + F.mse_loss(
                                 torch.sigmoid(ious_pred[r]), iou_mat[r, c]
                             )
 
@@ -641,15 +614,12 @@ def main():
                     n_matched = matched_cnt
                     cls_loss_val = cls_loss_val / max(1, cls_total)
                     task_loss = (
-                        w_bce * bce
-                        + w_focal * focal
-                        + w_dice * dice_loss
-                        + w_cls * cls_loss_val
+                        w_bce * bce + w_focal * focal + w_dice * dice_loss + w_cls * cls_loss_val
                     )
                     task_loss = task_loss / max(1, n_matched)
                     iou_loss = iou_loss / max(1, n_matched)
 
-                    dist_loss = 0.0
+                    dist_loss = torch.tensor(0.0, device=dev)
                     if use_distillation and hook_handles:
                         feat_student = pop_features() or {}
                         if step % 20 == 0:
@@ -657,9 +627,7 @@ def main():
                                 f"Student features: { {k: [tuple(t.shape) for t in v] for k, v in feat_student.items()} }"
                             )
 
-                        use_precomputed = dist_cfg.get(
-                            "use_precomputed_features", False
-                        )
+                        use_precomputed = dist_cfg.get("use_precomputed_features", False)
                         base_dir = Path(dist_cfg.get("precomputed_root", "precomputed"))
                         teacher_feats = {}
 
@@ -683,11 +651,7 @@ def main():
                             tpot = teacher_pots.get(tname, pot)
 
                             def _get_loss_params(config_dict, rename_map=None):
-                                params = {
-                                    k: v
-                                    for k, v in config_dict.items()
-                                    if k != "enable"
-                                }
+                                params = {k: v for k, v in config_dict.items() if k != "enable"}
                                 if rename_map:
                                     for old_key, new_key in rename_map.items():
                                         if old_key in params:
@@ -705,9 +669,7 @@ def main():
                                 ):
                                     try:
                                         num_layers_to_compare = len(enc_keys_s)
-                                        selected_enc_keys_t = enc_keys_t[
-                                            -num_layers_to_compare:
-                                        ]
+                                        selected_enc_keys_t = enc_keys_t[-num_layers_to_compare:]
 
                                         if use_precomputed:
                                             feat_teacher = load_cached_npy_features(
@@ -726,19 +688,15 @@ def main():
                                         enc_loss = encoder_matching_loss(
                                             [feat_student[k][0] for k in enc_keys_s],
                                             feat_teacher,
-                                            **_get_loss_params(
-                                                dist_cfg["encoder_matching"]
-                                            ),
+                                            **_get_loss_params(dist_cfg["encoder_matching"]),
                                             n_layers=num_layers_to_compare,
                                         )
-                                        w_enc = dist_cfg.get(
-                                            "encoder_matching", {}
-                                        ).get("weight", 1.0)
-                                        enc_loss_val += weight * w_enc * enc_loss
+                                        w_enc = dist_cfg.get("encoder_matching", {}).get(
+                                            "weight", 1.0
+                                        )
+                                        enc_loss_val = enc_loss_val + weight * w_enc * enc_loss
                                         if step % 20 == 0:
-                                            log.info(
-                                                f"enc_loss[{tname}]={enc_loss.item():.4f}"
-                                            )
+                                            log.info(f"enc_loss[{tname}]={enc_loss.item():.4f}")
                                     except Exception as e:
                                         log.warning(
                                             f"Encoder matching error for teacher {tname}: {e}"
@@ -766,25 +724,19 @@ def main():
                                                 dec_keys_t,
                                             )[0]
                                         else:
-                                            feat_teacher = teacher_feats[tname][
-                                                dec_keys_t[0]
-                                            ][0]
+                                            feat_teacher = teacher_feats[tname][dec_keys_t[0]][0]
 
                                         dec_loss = decoder_matching_loss(
                                             feat_student[dec_keys_s[0]][0],
                                             feat_teacher,
-                                            **_get_loss_params(
-                                                dist_cfg["decoder_matching"]
-                                            ),
+                                            **_get_loss_params(dist_cfg["decoder_matching"]),
                                         )
-                                        w_dec = dist_cfg.get(
-                                            "decoder_matching", {}
-                                        ).get("weight", 1.0)
-                                        dec_loss_val += weight * w_dec * dec_loss
+                                        w_dec = dist_cfg.get("decoder_matching", {}).get(
+                                            "weight", 1.0
+                                        )
+                                        dec_loss_val = dec_loss_val + weight * w_dec * dec_loss
                                         if step % 20 == 0:
-                                            log.info(
-                                                f"dec_loss[{tname}]={dec_loss.item():.4f}"
-                                            )
+                                            log.info(f"dec_loss[{tname}]={dec_loss.item():.4f}")
                                     except Exception as e:
                                         log.warning(
                                             f"Decoder matching error for teacher {tname}: {e}"
@@ -801,9 +753,7 @@ def main():
                                 ):
                                     try:
                                         num_layers_to_compare = len(attn_keys_s)
-                                        selected_attn_keys_t = attn_keys_t[
-                                            -num_layers_to_compare:
-                                        ]
+                                        selected_attn_keys_t = attn_keys_t[-num_layers_to_compare:]
 
                                         if use_precomputed:
                                             attn_teacher = load_cached_npy_features(
@@ -828,14 +778,12 @@ def main():
                                             ),
                                             n_layers=num_layers_to_compare,
                                         )
-                                        w_attn = dist_cfg.get(
-                                            "attention_matching", {}
-                                        ).get("weight", 1.0)
-                                        attn_loss_val += weight * w_attn * attn_loss
+                                        w_attn = dist_cfg.get("attention_matching", {}).get(
+                                            "weight", 1.0
+                                        )
+                                        attn_loss_val = attn_loss_val + weight * w_attn * attn_loss
                                         if step % 20 == 0:
-                                            log.info(
-                                                f"attn_loss[{tname}]={attn_loss.item():.4f}"
-                                            )
+                                            log.info(f"attn_loss[{tname}]={attn_loss.item():.4f}")
                                     except Exception as e:
                                         log.warning(
                                             f"Attention matching error for teacher {tname}: {e}"
@@ -859,9 +807,7 @@ def main():
                                                 base_dir, tname, "train", ids, rk_keys_t
                                             )[0]
                                         else:
-                                            feat_teacher = teacher_feats[tname][
-                                                rk_keys_t[0]
-                                            ][0]
+                                            feat_teacher = teacher_feats[tname][rk_keys_t[0]][0]
 
                                         rk_loss = rkd_loss(
                                             feat_student[rk_keys_s[0]][0],
@@ -871,34 +817,26 @@ def main():
                                                 {"lambda": "lambda_rkd"},
                                             ),
                                         )
-                                        w_rkd = dist_cfg.get("relational_KD", {}).get(
-                                            "weight", 1.0
-                                        )
-                                        rkd_loss_val += weight * w_rkd * rk_loss
+                                        w_rkd = dist_cfg.get("relational_KD", {}).get("weight", 1.0)
+                                        rkd_loss_val = rkd_loss_val + weight * w_rkd * rk_loss
                                         if step % 20 == 0:
-                                            log.info(
-                                                f"rkd_loss[{tname}]={rk_loss.item():.4f}"
-                                            )
+                                            log.info(f"rkd_loss[{tname}]={rk_loss.item():.4f}")
                                     except Exception as e:
-                                        log.warning(
-                                            f"RKD error for teacher {tname}: {e}"
-                                        )
+                                        log.warning(f"RKD error for teacher {tname}: {e}")
 
-                    dist_loss = (
-                        enc_loss_val + dec_loss_val + attn_loss_val + rkd_loss_val
+                    dist_loss = enc_loss_val + dec_loss_val + attn_loss_val + rkd_loss_val
+                    loss = (task_loss + w_iou * iou_loss + lambda_coef * dist_loss) / tr_cfg.get(
+                        "gradient_accumulation", 1
                     )
-                    loss = (
-                        task_loss + w_iou * iou_loss + lambda_coef * dist_loss
-                    ) / tr_cfg.get("gradient_accumulation", 1)
 
                 scaler.scale(loss).backward()
                 # del low_res_logits, tmp, logit_up, prob, focal, dice_loss
                 if use_distillation and "feat_student" in locals():
                     del feat_student
 
-                if (step + 1) % tr_cfg.get("gradient_accumulation", 1) == 0 or (
-                    step + 1
-                ) == len(tr_loader):
+                if (step + 1) % tr_cfg.get("gradient_accumulation", 1) == 0 or (step + 1) == len(
+                    tr_loader
+                ):
                     scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
                     scaler.step(opt)
@@ -1002,15 +940,9 @@ def main():
                             for i in range(len(imgs)):
                                 out_i = vo[i]
                                 preds_orig = out_i["masks"].to(torch.float32).squeeze(0)
-                                iou_pred = (
-                                    out_i["iou_predictions"]
-                                    .squeeze(0)
-                                    .to(torch.float32)
-                                )
+                                iou_pred = out_i["iou_predictions"].squeeze(0).to(torch.float32)
                                 best_idx = iou_pred.argmax()
-                                prob_i = torch.sigmoid(preds_orig[best_idx]).unsqueeze(
-                                    0
-                                )
+                                prob_i = torch.sigmoid(preds_orig[best_idx]).unsqueeze(0)
                                 gt_i = masks_orig[i]
 
                                 # Soft Dice for loss logging
@@ -1025,9 +957,7 @@ def main():
                                 bin_dice = (num_bin / (den_bin + 1e-6)).item()
 
                                 union = pred_bin + gt_i - pred_bin * gt_i
-                                bin_iou = (
-                                    (pred_bin * gt_i).sum() / (union.sum() + 1e-6)
-                                ).item()
+                                bin_iou = ((pred_bin * gt_i).sum() / (union.sum() + 1e-6)).item()
 
                                 dices.append(bin_dice)
                                 ious.append(bin_iou)
@@ -1047,20 +977,14 @@ def main():
                                     bi == 0
                                     and cfg["visual"].get("status", False)
                                     and (
-                                        ep
-                                        % cfg["visual"].get("save_every_n_epochs", 10)
-                                        == 0
-                                        or ((np.mean(dices) + np.mean(ious)) / 2)
-                                        > best_score
+                                        ep % cfg["visual"].get("save_every_n_epochs", 10) == 0
+                                        or ((np.mean(dices) + np.mean(ious)) / 2) > best_score
                                     )
                                 ):
-                                    cur_path = (
-                                        Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
-                                    )
+                                    cur_path = Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
                                     cur_path.mkdir(parents=True, exist_ok=True)
                                     img_denorm = (
-                                        imgs[i]
-                                        * torch.tensor(STD, device=dev)[:, None, None]
+                                        imgs[i] * torch.tensor(STD, device=dev)[:, None, None]
                                         + torch.tensor(MEAN, device=dev)[:, None, None]
                                     )
                                     img_denorm = img_denorm.clamp(0, 1).cpu()
@@ -1078,26 +1002,16 @@ def main():
                                     overlay_mask_on_image(
                                         image_tensor=img_denorm,
                                         mask_tensor=prob_i.squeeze(0).cpu(),
-                                        bbox_tensor=box.cpu()
-                                        if box is not None
-                                        else None,
-                                        point_coords=pts.cpu()
-                                        if pts is not None
-                                        else None,
-                                        point_labels=lbl.cpu()
-                                        if lbl is not None
-                                        else None,
+                                        bbox_tensor=box.cpu() if box is not None else None,
+                                        point_coords=pts.cpu() if pts is not None else None,
+                                        point_labels=lbl.cpu() if lbl is not None else None,
                                         original_size=(
                                             int(original_sizes[i][0]),
                                             int(original_sizes[i][1]),
                                         ),
-                                        threshold=cfg["visual"].get(
-                                            "IOU_threshold", 0.5
-                                        ),
+                                        threshold=cfg["visual"].get("IOU_threshold", 0.5),
                                         save_dir=str(cur_path),
-                                        filename_info=(
-                                            f"ep{ep}_id{vb['id'][i]}_b{bi}_s{i}"
-                                        ),
+                                        filename_info=(f"ep{ep}_id{vb['id'][i]}_b{bi}_s{i}"),
                                     )
                         else:
                             # Segment-everything validation
@@ -1115,17 +1029,13 @@ def main():
                                     ),
                                 )
 
-                                preds = pm.reshape(
-                                    -1, gt_masks[i].shape[-2], gt_masks[i].shape[-1]
-                                )
+                                preds = pm.reshape(-1, gt_masks[i].shape[-2], gt_masks[i].shape[-1])
                                 probs = torch.sigmoid(preds)
                                 gt = gt_masks[i].to(dev)
                                 gt_bin = gt.squeeze(1)
                                 pred_bin = (probs >= 0.5).float()
 
-                                inter = (
-                                    pred_bin.unsqueeze(1) * gt_bin.unsqueeze(0)
-                                ).sum((-2, -1))
+                                inter = (pred_bin.unsqueeze(1) * gt_bin.unsqueeze(0)).sum((-2, -1))
                                 union = (
                                     pred_bin.unsqueeze(1).sum((-2, -1))
                                     + gt_bin.unsqueeze(0).sum((-2, -1))
@@ -1155,26 +1065,16 @@ def main():
                                     bi == 0
                                     and cfg["visual"].get("status", False)
                                     and (
-                                        ep
-                                        % cfg["visual"].get("save_every_n_epochs", 10)
-                                        == 0
-                                        or ((np.mean(dices) + np.mean(ious)) / 2)
-                                        > best_score
+                                        ep % cfg["visual"].get("save_every_n_epochs", 10) == 0
+                                        or ((np.mean(dices) + np.mean(ious)) / 2) > best_score
                                     )
                                 ):
-                                    cur_path = (
-                                        Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
-                                    )
+                                    cur_path = Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
                                     cur_path.mkdir(parents=True, exist_ok=True)
                                     img_denorm = (
                                         (
-                                            imgs[i]
-                                            * torch.tensor(STD, device=dev)[
-                                                :, None, None
-                                            ]
-                                            + torch.tensor(MEAN, device=dev)[
-                                                :, None, None
-                                            ]
+                                            imgs[i] * torch.tensor(STD, device=dev)[:, None, None]
+                                            + torch.tensor(MEAN, device=dev)[:, None, None]
                                         )
                                         .clamp(0, 1)
                                         .cpu()
@@ -1188,9 +1088,7 @@ def main():
                                             int(original_sizes[i][0]),
                                             int(original_sizes[i][1]),
                                         ),
-                                        threshold=cfg["visual"].get(
-                                            "IOU_threshold", 0.5
-                                        ),
+                                        threshold=cfg["visual"].get("IOU_threshold", 0.5),
                                         save_dir=str(cur_path),
                                         filename_info=f"ep{ep}_id{vb['id'][i]}_b{bi}",
                                     )
