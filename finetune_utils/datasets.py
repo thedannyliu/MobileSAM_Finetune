@@ -187,26 +187,25 @@ class ComponentDataset(Dataset):
             img_tensor = torch.nn.functional.pad(img_tensor, (0, pad_r, 0, pad_b))
             msk_tensor = torch.nn.functional.pad(msk_tensor, (0, pad_r, 0, pad_b))
 
-        # 3. 把 raw prompt 縮放到 resize 後的尺寸
-        scale_x = new_w / orig_w
-        scale_y = new_h / orig_h
+        # Downsample GT mask to decoder resolution (1/4)
+        msk_down = torch.nn.functional.interpolate(
+            msk_tensor.unsqueeze(0),
+            size=(self.image_size // 4, self.image_size // 4),
+            mode="nearest",
+        ).squeeze(0)
 
+        # 3. 把 raw prompt 縮放到 resize 後的尺寸，使用 SAM 的 transforms
         if cur_type == "box":
             if box_prompt_raw.sum() != 0:
-                box_prompt = box_prompt_raw.clone()
-                box_prompt[0] = box_prompt_raw[0] * scale_x
-                box_prompt[1] = box_prompt_raw[1] * scale_y
-                box_prompt[2] = box_prompt_raw[2] * scale_x
-                box_prompt[3] = box_prompt_raw[3] * scale_y
+                box_prompt = self.resizer.apply_boxes_torch(
+                    box_prompt_raw.unsqueeze(0), (orig_h, orig_w)
+                ).squeeze(0)
             else:
                 box_prompt = torch.zeros(4, dtype=torch.float)
             point_coords, point_labels = None, None
         else:
             if (point_coords_raw >= 0).any():
-                pc = point_coords_raw.clone()
-                pc[:, 0] = point_coords_raw[:, 0] * scale_x
-                pc[:, 1] = point_coords_raw[:, 1] * scale_y
-                point_coords = pc
+                point_coords = self.resizer.apply_coords_torch(point_coords_raw, (orig_h, orig_w))
                 point_labels = point_labels_raw.clone()
             else:
                 point_coords = torch.full((self.max_points, 2), -1.0, dtype=torch.float)
@@ -226,7 +225,8 @@ class ComponentDataset(Dataset):
 
         return {
             "image": img_tensor,  # [3, image_size, image_size]
-            "mask": msk_tensor,  # [1, image_size, image_size]
+            "mask": msk_down,  # [1, image_size/4, image_size/4]
+            "mask_original": msk_raw,  # [1, H_raw, W_raw]
             "box_prompt": box_prompt if cur_type == "box" else None,
             "point_coords": point_coords if cur_type == "point" else None,
             "point_labels": point_labels if cur_type == "point" else None,
@@ -298,18 +298,32 @@ class SegmentEverythingDataset(Dataset):
 
         # Load all masks for this image
         msk_tensors = []
+        msk_tensors_orig = []
         for mp in meta["masks"]:
             m = Image.open(mp).convert("L")
+            m_orig = transforms.ToTensor()(m)
+            m_orig = (m_orig > 0.5).float()
+
             new_h, new_w = self.resizer.get_preprocess_shape(orig_h, orig_w, self.image_size)
-            m = m.resize((new_w, new_h), Image.NEAREST)
-            m = self.transform_mask(m)
-            m = (m > 0.5).float()
+            m_resized = m.resize((new_w, new_h), Image.NEAREST)
+            m_resized = self.transform_mask(m_resized)
+            m_resized = (m_resized > 0.5).float()
             if new_h != self.image_size or new_w != self.image_size:
                 pad_r = self.image_size - new_w
                 pad_b = self.image_size - new_h
-                m = torch.nn.functional.pad(m, (0, pad_r, 0, pad_b))
-            msk_tensors.append(m)
+                m_resized = torch.nn.functional.pad(m_resized, (0, pad_r, 0, pad_b))
+
+            m_down = torch.nn.functional.interpolate(
+                m_resized.unsqueeze(0),
+                size=(self.image_size // 4, self.image_size // 4),
+                mode="nearest",
+            ).squeeze(0)
+
+            msk_tensors.append(m_down)
+            msk_tensors_orig.append(m_orig)
+
         gt_masks = torch.stack(msk_tensors)
+        gt_masks_orig = torch.stack(msk_tensors_orig)
 
         new_h, new_w = self.resizer.get_preprocess_shape(orig_h, orig_w, self.image_size)
         img_resized = img_pil.resize((new_w, new_h), Image.BILINEAR)
@@ -330,6 +344,7 @@ class SegmentEverythingDataset(Dataset):
         return {
             "image": img_tensor,
             "gt_masks": gt_masks,
+            "gt_masks_original": gt_masks_orig,
             "point_coords": grid,
             "point_labels": labels,
             "id": meta["id"],
