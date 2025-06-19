@@ -454,17 +454,19 @@ def main():
 
             for step, batch in enumerate(pbar):
                 # ─────────── 先初始化所有可能 later 會被用到的 loss 變數 ───────────
-                bce = torch.tensor(0.0, device=dev, requires_grad=True)
-                focal = torch.tensor(0.0, device=dev, requires_grad=True)
-                dice_loss = torch.tensor(0.0, device=dev, requires_grad=True)
-                dist_loss = torch.tensor(0.0, device=dev, requires_grad=True)
-                enc_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
-                dec_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
-                attn_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
-                rkd_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
-                cls_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
-                task_loss = torch.tensor(0.0, device=dev, requires_grad=True)
-                loss = torch.tensor(0.0, device=dev, requires_grad=True)
+                # Initialize losses as regular tensors so gradients attach to
+                # actual computed values instead of a dummy leaf tensor.
+                bce = torch.tensor(0.0, device=dev)
+                focal = torch.tensor(0.0, device=dev)
+                dice_loss = torch.tensor(0.0, device=dev)
+                dist_loss = torch.tensor(0.0, device=dev)
+                enc_loss_val = torch.tensor(0.0, device=dev)
+                dec_loss_val = torch.tensor(0.0, device=dev)
+                attn_loss_val = torch.tensor(0.0, device=dev)
+                rkd_loss_val = torch.tensor(0.0, device=dev)
+                cls_loss_val = torch.tensor(0.0, device=dev)
+                task_loss = torch.tensor(0.0, device=dev)
+                loss = torch.tensor(0.0, device=dev)
                 #
                 imgs = batch["image"].to(dev)
                 ids = batch["id"]
@@ -498,11 +500,11 @@ def main():
                     ):
                         out = student(batched_input=batched_input, multimask_output=True)
 
-                        bce = torch.tensor(0.0, device=dev, requires_grad=True)
-                        focal = torch.tensor(0.0, device=dev, requires_grad=True)
-                        dice_loss = torch.tensor(0.0, device=dev, requires_grad=True)
-                        cls_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
-                        iou_loss = torch.tensor(0.0, device=dev, requires_grad=True)
+                        bce = torch.tensor(0.0, device=dev)
+                        focal = torch.tensor(0.0, device=dev)
+                        dice_loss = torch.tensor(0.0, device=dev)
+                        cls_loss_val = torch.tensor(0.0, device=dev)
+                        iou_loss = torch.tensor(0.0, device=dev)
 
                         for i, o in enumerate(out):
                             low_res = o["low_res_logits"].to(torch.float32).squeeze(0)
@@ -513,7 +515,9 @@ def main():
                             sel_logit = low_res[best_idx].unsqueeze(0)
 
                             bce = bce + F.binary_cross_entropy_with_logits(sel_logit, masks[i])
-                            focal = focal + sigmoid_focal_loss(sel_logit, masks[i], reduction="mean")
+                            focal = focal + sigmoid_focal_loss(
+                                sel_logit, masks[i], reduction="mean"
+                            )
                             prob = torch.sigmoid(sel_logit)
                             num = (prob * masks[i]).sum((-2, -1)) * 2
                             den = prob.sum((-2, -1)) + masks[i].sum((-2, -1))
@@ -559,9 +563,11 @@ def main():
                         )
                         in_sz_tuple = (
                             int(batch["input_size"][bi][0])
-                            if "input_size" in batch else raw_sz_tuple[0],
+                            if "input_size" in batch
+                            else raw_sz_tuple[0],
                             int(batch["input_size"][bi][1])
-                            if "input_size" in batch else raw_sz_tuple[1],
+                            if "input_size" in batch
+                            else raw_sz_tuple[1],
                         )
                         pm, pi, lo = predict_from_grid(
                             student,
@@ -573,10 +579,10 @@ def main():
                         pred_lowres_all.append(lo)
                         pred_ious_all.append(pi)
 
-                    bce = torch.tensor(0.0, device=dev, requires_grad=True)
-                    focal = torch.tensor(0.0, device=dev, requires_grad=True)
-                    dice_loss = torch.tensor(0.0, device=dev, requires_grad=True)
-                    iou_loss = torch.tensor(0.0, device=dev, requires_grad=True)
+                    bce = torch.tensor(0.0, device=dev)
+                    focal = torch.tensor(0.0, device=dev)
+                    dice_loss = torch.tensor(0.0, device=dev)
+                    iou_loss = torch.tensor(0.0, device=dev)
                     cls_total = 0
                     matched_cnt = 0
 
@@ -630,7 +636,9 @@ def main():
                             num = (prob * target_exp).sum((-2, -1)) * 2
                             den = prob.sum((-2, -1)) + target_exp.sum((-2, -1))
                             dice_loss = dice_loss + (1 - (num / (den + 1e-6)).mean())
-                            iou_loss = iou_loss + F.mse_loss(torch.sigmoid(ious_pred[r]), iou_mat[r, c])
+                            iou_loss = iou_loss + F.mse_loss(
+                                torch.sigmoid(ious_pred[r]), iou_mat[r, c]
+                            )
 
                     # Average using only the matched predictions to avoid loss dilution.
                     n_matched = matched_cnt
@@ -641,7 +649,7 @@ def main():
                     task_loss = task_loss / max(1, n_matched)
                     iou_loss = iou_loss / max(1, n_matched)
 
-                    dist_loss = torch.tensor(0.0, device=dev, requires_grad=True)
+                    dist_loss = torch.tensor(0.0, device=dev)
                     if use_distillation and hook_handles:
                         feat_student = pop_features() or {}
                         if step % 20 == 0:
@@ -949,11 +957,15 @@ def main():
                                         int(original_sizes[i][1]),
                                     ),
                                 }
-                                if vb.get("box_prompt", [None]*len(imgs))[i] is not None:
+                                if vb.get("box_prompt", [None] * len(imgs))[i] is not None:
                                     entry["boxes"] = vb["box_prompt"][i].to(dev).unsqueeze(0)
-                                if vb.get("point_coords", [None]*len(imgs))[i] is not None:
-                                    entry["point_coords"] = vb["point_coords"][i].to(dev).unsqueeze(0)
-                                    entry["point_labels"] = vb["point_labels"][i].to(dev).unsqueeze(0)
+                                if vb.get("point_coords", [None] * len(imgs))[i] is not None:
+                                    entry["point_coords"] = (
+                                        vb["point_coords"][i].to(dev).unsqueeze(0)
+                                    )
+                                    entry["point_labels"] = (
+                                        vb["point_labels"][i].to(dev).unsqueeze(0)
+                                    )
                                 if "input_size" in vb:
                                     entry["input_size"] = (
                                         int(vb["input_size"][i][0]),
@@ -1011,9 +1023,9 @@ def main():
                                     # 還原到 0‥1 方便可視化
                                     img_denorm = (imgs[i] / 255.0).clamp(0, 1).cpu()
 
-                                    box = vb.get("box_prompt", [None]*len(imgs))[i]
-                                    pts = vb.get("point_coords", [None]*len(imgs))[i]
-                                    lbl = vb.get("point_labels", [None]*len(imgs))[i]
+                                    box = vb.get("box_prompt_raw", [None] * len(imgs))[i]
+                                    pts = vb.get("point_coords_raw", [None] * len(imgs))[i]
+                                    lbl = vb.get("point_labels_raw", [None] * len(imgs))[i]
                                     if box is not None:
                                         box = box.to(torch.float32)
                                     if pts is not None:
@@ -1047,9 +1059,11 @@ def main():
                                 )
                                 in_sz_tuple = (
                                     int(vb["input_size"][i][0])
-                                    if "input_size" in vb else raw_sz_tuple[0],
+                                    if "input_size" in vb
+                                    else raw_sz_tuple[0],
                                     int(vb["input_size"][i][1])
-                                    if "input_size" in vb else raw_sz_tuple[1],
+                                    if "input_size" in vb
+                                    else raw_sz_tuple[1],
                                 )
                                 pm, _, _ = predict_from_grid(
                                     student,
@@ -1111,7 +1125,9 @@ def main():
                                             int(original_sizes[i][0]),
                                             int(original_sizes[i][1]),
                                         ),
-                                        grid_points=vb.get("point_coords", point_coords)[i].cpu(),
+                                        grid_points=vb.get("point_coords_raw", point_coords)[
+                                            i
+                                        ].cpu(),
                                         threshold=cfg["visual"].get("IOU_threshold", 0.5),
                                         save_dir=str(cur_path),
                                         filename_info=f"ep{ep}_id{vb['id'][i]}_b{bi}",
