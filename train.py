@@ -384,6 +384,30 @@ def main():
     else:
         log.info("Distillation disabled - no hooks registered")
 
+    # ─────────────────── Mask-teacher supervision (segment-everything) ───────────────────
+    mask_teacher_cfg = cfg.get("mask_teacher", {})
+    mask_teacher_enable = mask_teacher_cfg.get("enable", False)
+    mask_teacher_method = mask_teacher_cfg.get("method", "none").lower()
+    mask_teacher_model = None
+    soft_loss_type = (mask_teacher_cfg.get("soft_loss", {}) or {}).get("type", "l2").lower()
+    soft_loss_weight = (mask_teacher_cfg.get("soft_loss", {}) or {}).get("weight", 1.0)
+    mask_teacher_iou_thr = mask_teacher_cfg.get("iou_threshold", 0.3)
+    if dataset_mode == "everything" and mask_teacher_enable and mask_teacher_method in ("replace_gt", "dual_supervision"):
+        t_type = mask_teacher_cfg.get("teacher_type", "vit_h").lower()
+        t_ckpt = mask_teacher_cfg.get("checkpoint_path")
+        if t_type not in sam_model_registry:
+            log.warning(f"Unknown mask teacher type {t_type}; disable mask_teacher supervision.")
+            mask_teacher_enable = False
+        elif not t_ckpt or not os.path.exists(t_ckpt):
+            log.warning(f"Mask teacher checkpoint not found: {t_ckpt}; disable mask_teacher supervision.")
+            mask_teacher_enable = False
+        else:
+            mask_teacher_model = sam_model_registry[t_type](checkpoint=t_ckpt).to(dev).eval()
+            mask_teacher_model.requires_grad_(False)
+            log.info(f"Loaded mask teacher ({t_type}) from {t_ckpt} | method={mask_teacher_method}")
+    else:
+        mask_teacher_enable = False
+
     log_gpu_memory("After model loading")
 
     tr_cfg = cfg["train"]
@@ -560,6 +584,8 @@ def main():
                     point_coords = batch["point_coords"]
                     pred_lowres_all = []
                     pred_ious_all = []
+                    # ─────────────────── Teacher predictions (optional) ───────────────────
+                    teacher_lowres_all = []
                     for bi in range(len(imgs)):
                         raw_sz_tuple = (
                             int(osz[bi][0]),
@@ -581,18 +607,43 @@ def main():
                         pred_lowres_all.append(lo)
                         pred_ious_all.append(pi)
 
+                        # teacher inference (no grad)
+                        if mask_teacher_enable:
+                            with torch.no_grad():
+                                _pm_t, _pi_t, lo_t = predict_from_grid(
+                                    mask_teacher_model,
+                                    imgs[bi],
+                                    point_coords[bi].to(dev),
+                                    raw_sz_tuple,
+                                    in_sz_tuple,
+                                )
+                            teacher_lowres_all.append(lo_t)
+                        else:
+                            teacher_lowres_all.append(None)
+
                     bce = torch.tensor(0.0, device=dev, requires_grad=True)
                     focal = torch.tensor(0.0, device=dev, requires_grad=True)
                     dice_loss = torch.tensor(0.0, device=dev, requires_grad=True)
                     iou_loss = torch.tensor(0.0, device=dev, requires_grad=True)
                     cls_total = 0
                     matched_cnt = 0
+                    soft_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
+                    matched_soft = 0
 
                     for bi in range(len(imgs)):
-                        gt = gt_masks[bi].to(dev)  # [K,1,S,S]
-                        preds = pred_lowres_all[bi].reshape(-1, gt.shape[-2], gt.shape[-1])
+                        # ------------------- choose reference (GT or teacher) -------------------
+                        original_gt = gt_masks[bi].to(dev)  # [K,1,S,S]
+                        preds = pred_lowres_all[bi].reshape(-1, original_gt.shape[-2], original_gt.shape[-1])
                         ious_pred = pred_ious_all[bi].reshape(-1)
-                        gt_flat = gt.squeeze(1)
+
+                        if mask_teacher_enable and mask_teacher_method == "replace_gt" and teacher_lowres_all[bi] is not None:
+                            teacher_pred_flat = teacher_lowres_all[bi].reshape(-1, original_gt.shape[-2], original_gt.shape[-1]).detach()
+                            teacher_soft = torch.sigmoid(teacher_pred_flat)  # values in [0,1]
+                            gt = teacher_soft.unsqueeze(1)  # [K,1,S,S]
+                            gt_flat = teacher_soft  # [K,S,S]
+                        else:
+                            gt = original_gt
+                            gt_flat = gt.squeeze(1)
 
                         # IoU matrix for Hungarian matching
                         pred_bin = (torch.sigmoid(preds) > 0.5).float()
@@ -641,217 +692,42 @@ def main():
                             dice_loss = dice_loss + (1 - (num / (den + 1e-6)).mean())
                             iou_loss = iou_loss + F.mse_loss(torch.sigmoid(ious_pred[r]), iou_mat[r, c])
 
+                        # ---------- soft label supervision (teacher vs student logits) ----------
+                        if mask_teacher_enable and mask_teacher_method == "dual_supervision" and teacher_lowres_all[bi] is not None:
+                            teacher_pred_flat = teacher_lowres_all[bi].reshape(-1, preds.shape[-2], preds.shape[-1]).detach()
+                            teacher_bin = (torch.sigmoid(teacher_pred_flat) > 0.5).float()
+                            # Hungarian between student and teacher
+                            inter_st = (pred_bin.unsqueeze(1) * teacher_bin.unsqueeze(0)).sum((-2, -1))
+                            union_st = pred_bin.unsqueeze(1).sum((-2, -1)) + teacher_bin.unsqueeze(0).sum((-2, -1)) - inter_st
+                            iou_mat_st = inter_st / (union_st + 1e-6)
+                            cost_st = (-iou_mat_st).cpu().numpy()
+                            row_t, col_t = linear_sum_assignment(cost_st)
+                            for r_t, c_t in zip(row_t, col_t):
+                                if iou_mat_st[r_t, c_t] < THRESH_SE:
+                                    continue
+                                s_logit = preds[r_t].unsqueeze(0)
+                                t_logit = teacher_pred_flat[c_t].unsqueeze(0)
+                                if soft_loss_type == "kl":
+                                    s_prob = torch.sigmoid(s_logit)
+                                    t_prob = torch.sigmoid(t_logit)
+                                    soft_loss_val = soft_loss_val + F.kl_div(torch.log(s_prob + 1e-6), t_prob, reduction="batchmean")
+                                else:
+                                    soft_loss_val = soft_loss_val + F.mse_loss(s_logit, t_logit)
+                                matched_soft += 1
+
                     # Average using only the matched predictions to avoid loss dilution.
                     n_matched = matched_cnt
                     cls_loss_val = cls_loss_val / max(1, cls_total)
+                    if mask_teacher_enable and mask_teacher_method == "dual_supervision" and matched_soft > 0:
+                        soft_loss_val = soft_loss_val / matched_soft
+                    else:
+                        soft_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
                     task_loss = (
                         w_bce * bce + w_focal * focal + w_dice * dice_loss + w_cls * cls_loss_val
                     )
 
-                    dist_loss = torch.tensor(0.0, device=dev, requires_grad=True)
-                    if use_distillation and hook_handles:
-                        feat_student = pop_features() or {}
-                        if step % 20 == 0:
-                            log.info(
-                                f"Student features: { {k: [tuple(t.shape) for t in v] for k, v in feat_student.items()} }"
-                            )
-
-                        use_precomputed = dist_cfg.get("use_precomputed_features", False)
-                        base_dir = Path(dist_cfg.get("precomputed_root", "precomputed"))
-                        teacher_feats = {}
-
-                        if not use_precomputed:
-                            for tinfo in teacher_models:
-                                with torch.no_grad():
-                                    _ = tinfo["model"](
-                                        batched_input=batched_input,
-                                        multimask_output=False,
-                                    )
-                                teacher_feats[tinfo["name"]] = pop_features() or {}
-                            if step % 20 == 0:
-                                for tn, feats in teacher_feats.items():
-                                    log.info(
-                                        f"Teacher {tn} features: { {k: [tuple(t.shape) for t in v] for k, v in feats.items()} }"
-                                    )
-
-                        for t_cfg in teacher_cfgs:
-                            weight = t_cfg["weight"]
-                            tname = t_cfg["name"]
-                            tpot = teacher_pots.get(tname, pot)
-
-                            def _get_loss_params(config_dict, rename_map=None):
-                                params = {k: v for k, v in config_dict.items() if k != "enable"}
-                                if rename_map:
-                                    for old_key, new_key in rename_map.items():
-                                        if old_key in params:
-                                            params[new_key] = params.pop(old_key)
-                                return params
-
-                            if dist_cfg.get("encoder_matching", {}).get("enable"):
-                                enc_keys_s = pot.get("enc", [])
-                                enc_keys_t = tpot.get("enc", [])
-
-                                if (
-                                    enc_keys_s
-                                    and enc_keys_t
-                                    and all(k in feat_student for k in enc_keys_s)
-                                ):
-                                    try:
-                                        num_layers_to_compare = len(enc_keys_s)
-                                        selected_enc_keys_t = enc_keys_t[-num_layers_to_compare:]
-
-                                        if use_precomputed:
-                                            feat_teacher = load_cached_npy_features(
-                                                base_dir,
-                                                tname,
-                                                "train",
-                                                ids,
-                                                selected_enc_keys_t,
-                                            )
-                                        else:
-                                            feat_teacher = [
-                                                teacher_feats[tname][k][0]
-                                                for k in selected_enc_keys_t
-                                            ]
-
-                                        enc_loss = encoder_matching_loss(
-                                            [feat_student[k][0] for k in enc_keys_s],
-                                            feat_teacher,
-                                            **_get_loss_params(dist_cfg["encoder_matching"]),
-                                            n_layers=num_layers_to_compare,
-                                        )
-                                        w_enc = dist_cfg.get("encoder_matching", {}).get(
-                                            "weight", 1.0
-                                        )
-                                        enc_loss_val += weight * w_enc * enc_loss
-                                        if step % 20 == 0:
-                                            log.info(f"enc_loss[{tname}]={enc_loss.item():.4f}")
-                                    except Exception as e:
-                                        log.warning(
-                                            f"Encoder matching error for teacher {tname}: {e}"
-                                        )
-
-                            if dist_cfg.get("decoder_matching", {}).get("enable"):
-                                dec_keys_s = pot.get("dec", [])
-                                dec_keys_t = tpot.get("dec", [])
-                                if (
-                                    dec_keys_s
-                                    and dec_keys_t
-                                    and all(k in feat_student for k in dec_keys_s)
-                                    and (
-                                        use_precomputed
-                                        or dec_keys_t[0] in teacher_feats.get(tname, {})
-                                    )
-                                ):
-                                    try:
-                                        if use_precomputed:
-                                            feat_teacher = load_cached_npy_features(
-                                                base_dir,
-                                                tname,
-                                                "train",
-                                                ids,
-                                                dec_keys_t,
-                                            )[0]
-                                        else:
-                                            feat_teacher = teacher_feats[tname][dec_keys_t[0]][0]
-
-                                        dec_loss = decoder_matching_loss(
-                                            feat_student[dec_keys_s[0]][0],
-                                            feat_teacher,
-                                            **_get_loss_params(dist_cfg["decoder_matching"]),
-                                        )
-                                        w_dec = dist_cfg.get("decoder_matching", {}).get(
-                                            "weight", 1.0
-                                        )
-                                        dec_loss_val += weight * w_dec * dec_loss
-                                        if step % 20 == 0:
-                                            log.info(f"dec_loss[{tname}]={dec_loss.item():.4f}")
-                                    except Exception as e:
-                                        log.warning(
-                                            f"Decoder matching error for teacher {tname}: {e}"
-                                        )
-
-                            if dist_cfg.get("attention_matching", {}).get("enable"):
-                                attn_keys_s = pot.get("attn", [])
-                                attn_keys_t = tpot.get("attn", [])
-
-                                if (
-                                    attn_keys_s
-                                    and attn_keys_t
-                                    and all(k in feat_student for k in attn_keys_s)
-                                ):
-                                    try:
-                                        num_layers_to_compare = len(attn_keys_s)
-                                        selected_attn_keys_t = attn_keys_t[-num_layers_to_compare:]
-
-                                        if use_precomputed:
-                                            attn_teacher = load_cached_npy_features(
-                                                base_dir,
-                                                tname,
-                                                "train",
-                                                ids,
-                                                selected_attn_keys_t,
-                                            )
-                                        else:
-                                            attn_teacher = [
-                                                teacher_feats[tname][k][0]
-                                                for k in selected_attn_keys_t
-                                            ]
-
-                                        attn_loss = attention_matching_loss(
-                                            [feat_student[k][0] for k in attn_keys_s],
-                                            attn_teacher,
-                                            **_get_loss_params(
-                                                dist_cfg["attention_matching"],
-                                                {"lambda": "lambda_attn"},
-                                            ),
-                                            n_layers=num_layers_to_compare,
-                                        )
-                                        w_attn = dist_cfg.get("attention_matching", {}).get(
-                                            "weight", 1.0
-                                        )
-                                        attn_loss_val += weight * w_attn * attn_loss
-                                        if step % 20 == 0:
-                                            log.info(f"attn_loss[{tname}]={attn_loss.item():.4f}")
-                                    except Exception as e:
-                                        log.warning(
-                                            f"Attention matching error for teacher {tname}: {e}"
-                                        )
-
-                            if dist_cfg.get("relational_KD", {}).get("enable"):
-                                rk_keys_s = pot.get("rkd", [])
-                                rk_keys_t = tpot.get("rkd", [])
-                                if (
-                                    rk_keys_s
-                                    and rk_keys_t
-                                    and all(k in feat_student for k in rk_keys_s)
-                                    and (
-                                        use_precomputed
-                                        or rk_keys_t[0] in teacher_feats.get(tname, {})
-                                    )
-                                ):
-                                    try:
-                                        if use_precomputed:
-                                            feat_teacher = load_cached_npy_features(
-                                                base_dir, tname, "train", ids, rk_keys_t
-                                            )[0]
-                                        else:
-                                            feat_teacher = teacher_feats[tname][rk_keys_t[0]][0]
-
-                                        rk_loss = rkd_loss(
-                                            feat_student[rk_keys_s[0]][0],
-                                            feat_teacher,
-                                            **_get_loss_params(
-                                                dist_cfg["relational_KD"],
-                                                {"lambda": "lambda_rkd"},
-                                            ),
-                                        )
-                                        w_rkd = dist_cfg.get("relational_KD", {}).get("weight", 1.0)
-                                        rkd_loss_val += weight * w_rkd * rk_loss
-                                        if step % 20 == 0:
-                                            log.info(f"rkd_loss[{tname}]={rk_loss.item():.4f}")
-                                    except Exception as e:
-                                        log.warning(f"RKD error for teacher {tname}: {e}")
+                    if mask_teacher_enable and mask_teacher_method == "dual_supervision":
+                        task_loss = task_loss + soft_loss_weight * soft_loss_val
 
                     dist_loss = enc_loss_val + dec_loss_val + attn_loss_val + rkd_loss_val
 
@@ -880,13 +756,14 @@ def main():
                     scheduler.step()
                     torch.cuda.empty_cache()
 
-                tot_task += task_loss.item()
+                ga = tr_cfg.get("gradient_accumulation", 1)
+                norm = 1 if dataset_mode == "single" else max(1, n_matched)
+
+                tot_task += task_loss.item() / norm / ga
                 tot_dist += dist_loss.item()
                 tot_iou += iou_loss.item()
                 tot_cls += cls_loss_val.item()
 
-                ga = tr_cfg.get("gradient_accumulation", 1)
-                norm = 1 if dataset_mode == "single" else max(1, n_matched)
                 bce_c = w_bce * bce.item() / norm / ga
                 focal_c = w_focal * focal.item() / norm / ga
                 dice_c = w_dice * dice_loss.item() / norm / ga
@@ -896,7 +773,10 @@ def main():
                 dec_c = lambda_coef * dec_loss_val.item() / ga
                 attn_c = lambda_coef * attn_loss_val.item() / ga
                 rkd_c = lambda_coef * rkd_loss_val.item() / ga
+                soft_c = soft_loss_weight * soft_loss_val.item() / ga if mask_teacher_enable and mask_teacher_method == "dual_supervision" else 0.0
                 dist_c = lambda_coef * dist_loss.item() / ga
+
+                total_c = bce_c + focal_c + dice_c + cls_c + iou_c + dist_c + soft_c
 
                 pbar.set_postfix(
                     bce=f"{bce_c:.3f}",
@@ -908,8 +788,9 @@ def main():
                     dec=f"{dec_c:.3f}",
                     attn=f"{attn_c:.3f}",
                     rkd=f"{rkd_c:.3f}",
+                    soft=f"{soft_c:.3f}",
                     dist=f"{dist_c:.3f}",
-                    total=f"{loss.item():.3f}",
+                    total=f"{total_c:.3f}",
                     lr=f"{scheduler.get_last_lr()[0]:.2e}",
                 )
 

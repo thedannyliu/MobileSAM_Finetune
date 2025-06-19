@@ -99,5 +99,12 @@
       "checkpoint": "weights/mobile_sam.pt",
       "weight": 0.5
     }
-  ]
+  ],
+  "mask_teacher": {
+    "enable": true,
+    "method": "dual_supervision",
+    "teacher_type": "vit_h",
+    "checkpoint_path": "weights/sam_vit_h_4b8939.pth",
+    "iou_threshold": 0.3
+  }
 }
