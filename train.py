@@ -547,6 +547,14 @@ def main():
                             + w_dice * dice_loss
                             + w_cls * cls_loss_val
                         )
+
+                        # 計算總 loss（single-prompt 模式）
+                        dist_loss = torch.tensor(0.0, device=dev, requires_grad=True)
+                        loss = (
+                            task_loss.float()
+                            + w_iou * iou_loss.float()
+                            + lambda_coef * dist_loss.float()
+                        ) / tr_cfg.get("gradient_accumulation", 1)
                 else:
                     gt_masks = batch["gt_masks"]
                     point_coords = batch["point_coords"]
@@ -603,13 +611,14 @@ def main():
                             row_ind
                         ), "Prediction matched more than once"
 
+                        THRESH_SE = 0.3  # segment-everything positive threshold
                         labels = torch.zeros(preds.shape[0], device=dev)
                         assigned_gt = torch.full(
                             (preds.shape[0],), -1, device=dev, dtype=torch.long
                         )
                         for r, c in zip(row_ind, col_ind):
-                            labels[r] = 1.0 if iou_mat[r, c] >= 0.5 else 0.0
-                            if iou_mat[r, c] >= 0.5:
+                            labels[r] = 1.0 if iou_mat[r, c] >= THRESH_SE else 0.0
+                            if iou_mat[r, c] >= THRESH_SE:
                                 assigned_gt[r] = c
                                 matched_cnt += 1
 
@@ -619,7 +628,7 @@ def main():
                         cls_total += labels.numel()
 
                         for r, c in zip(row_ind, col_ind):
-                            if iou_mat[r, c] < 0.5:
+                            if iou_mat[r, c] < THRESH_SE:
                                 continue
                             target = gt[c]
                             logit = preds[r].unsqueeze(0).unsqueeze(0)
@@ -638,8 +647,6 @@ def main():
                     task_loss = (
                         w_bce * bce + w_focal * focal + w_dice * dice_loss + w_cls * cls_loss_val
                     )
-                    task_loss = task_loss / max(1, n_matched)
-                    iou_loss = iou_loss / max(1, n_matched)
 
                     dist_loss = torch.tensor(0.0, device=dev, requires_grad=True)
                     if use_distillation and hook_handles:
@@ -848,7 +855,8 @@ def main():
 
                     dist_loss = enc_loss_val + dec_loss_val + attn_loss_val + rkd_loss_val
 
-                    # 確保總 loss 為 fp32 Tensor 且帶 grad
+                    # 針對 single-prompt 模式需在此計算總 loss，
+                    # 否則 loss 仍保持為 0 會導致梯度為 0，也無法在 tqdm 中顯示 total
                     loss = (
                         task_loss.float()
                         + w_iou * iou_loss.float()
