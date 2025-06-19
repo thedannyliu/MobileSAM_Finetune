@@ -1011,9 +1011,9 @@ def main():
                                     # 還原到 0‥1 方便可視化
                                     img_denorm = (imgs[i] / 255.0).clamp(0, 1).cpu()
 
-                                    box = vb.get("box_prompt", [None]*len(imgs))[i]
-                                    pts = vb.get("point_coords", [None]*len(imgs))[i]
-                                    lbl = vb.get("point_labels", [None]*len(imgs))[i]
+                                    box = vb.get("box_prompt_raw", [None]*len(imgs))[i]
+                                    pts = vb.get("point_coords_raw", [None]*len(imgs))[i]
+                                    lbl = vb.get("point_labels_raw", [None]*len(imgs))[i]
                                     if box is not None:
                                         box = box.to(torch.float32)
                                     if pts is not None:
@@ -1111,7 +1111,7 @@ def main():
                                             int(original_sizes[i][0]),
                                             int(original_sizes[i][1]),
                                         ),
-                                        grid_points=vb.get("point_coords", point_coords)[i].cpu(),
+                                        grid_points=vb.get("point_coords_raw", point_coords)[i].cpu(),
                                         threshold=cfg["visual"].get("IOU_threshold", 0.5),
                                         save_dir=str(cur_path),
                                         filename_info=f"ep{ep}_id{vb['id'][i]}_b{bi}",
