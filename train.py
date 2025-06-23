@@ -17,12 +17,13 @@ import json
 import logging
 import os
 import traceback
+import yaml
 from finetune_utils.datasets import ComponentDataset
 from finetune_utils.distill_losses import (
-    attention_matching_loss,
-    decoder_matching_loss,
-    encoder_matching_loss,
-    rkd_loss,
+    decoder_mask_token_loss,
+    encoder_patch_tokens_loss,
+    mask_logits_loss,
+    prompt_conditioned_embed_loss,
 )
 from finetune_utils.feature_hooks import pop_features, register_hooks
 from finetune_utils.visualization import overlay_mask_on_image
@@ -42,9 +43,7 @@ def log_gpu_memory(step_name=""):
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1024**3
         cached = torch.cuda.memory_reserved() / 1024**3
-        log.info(
-            f"{step_name} GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB"
-        )
+        log.info(f"{step_name} GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB")
 
 
 def clear_gpu_cache():
@@ -67,8 +66,7 @@ class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
         prog = (cur - self.warmup) / max(1, (self.total - self.warmup))
         cos = 0.5 * (1 + np.cos(np.pi * prog))
         return [
-            base_lr * (self.min_ratio + (1 - self.min_ratio) * cos)
-            for base_lr in self.base_lrs
+            base_lr * (self.min_ratio + (1 - self.min_ratio) * cos) for base_lr in self.base_lrs
         ]
 
 
@@ -109,14 +107,10 @@ def load_cached_npy_features(
     for stem in stems:
         this_img = []
         for k in keys:
-            fname = (
-                f"{stem}_{k.replace('.', '_').replace('[', '_').replace(']', '')}.npy"
-            )
+            fname = f"{stem}_{k.replace('.', '_').replace('[', '_').replace(']', '')}.npy"
             this_img.append(feature_cache.get(base / teacher / split / fname))
         feats.append(torch.stack(this_img))
-    return [
-        torch.stack([feats[b][i] for b in range(len(stems))]) for i in range(len(keys))
-    ]
+    return [torch.stack([feats[b][i] for b in range(len(stems))]) for i in range(len(keys))]
 
 
 def _parse_hw(x):
@@ -200,23 +194,17 @@ def main():
     dist_cfg = cfg.get("distillation", {})
     use_distillation = dist_cfg.get("enable", False)
     hook_handles = []
-    pot = {"enc": [], "dec": [], "attn": [], "rkd": []}
+    pot = {"patch": [], "prompt": [], "token": []}
     if use_distillation:
-        stype = m_cfg.get("type", "vit_t")
-        if stype == "vit_t":
-            pot["enc"] = ["image_encoder.neck"]
-        else:
-            pot["enc"] = [f"image_encoder.blocks.{i}" for i in (9, 10, 11, 12)]
-            pot["dec"] = ["mask_decoder.pre_logits"]
-            pot["attn"] = [f"image_encoder.blocks.{i}.attn" for i in range(12)]
-        pot["rkd"] = ["image_encoder.patch_embed"]
+        pot["patch"] = ["image_encoder.neck"]
+        pot["prompt"] = ["!mask_decoder.transformer"]
+        pot["token"] = ["mask_decoder.transformer"]
 
         hook_layers = []
         for name, key in (
-            ("encoder_matching", "enc"),
-            ("decoder_matching", "dec"),
-            ("attention_matching", "attn"),
-            ("relational_KD", "rkd"),
+            ("encoder_patch_tokens", "patch"),
+            ("prompt_image_embedding", "prompt"),
+            ("decoder_mask_token", "token"),
         ):
             if dist_cfg.get(name, {}).get("enable"):
                 hook_layers += pot[key]
@@ -268,6 +256,16 @@ def main():
         for t in teacher_cfgs:
             t.setdefault("weight", 1.0 / len(teacher_cfgs))
 
+    teacher_models = {}
+    if teacher_cfgs and use_distillation and dist_cfg.get("mask_logits", {}).get("enable"):
+        for t in teacher_cfgs:
+            with open(t["cfg"], "r") as f:
+                tinfo = yaml.safe_load(f)
+            mtype = tinfo["model"]["type"]
+            model = sam_model_registry[mtype](checkpoint=t["checkpoint"]).to(dev)
+            model.eval()
+            teacher_models[t["name"]] = model
+
     try:
         global_step = 0
         for ep in range(tr_cfg["epochs"]):
@@ -309,12 +307,8 @@ def main():
                     if batch["box_prompt"][i] is not None:
                         entry["boxes"] = batch["box_prompt"][i].to(dev).unsqueeze(0)
                     if batch["point_coords"][i] is not None:
-                        entry["point_coords"] = (
-                            batch["point_coords"][i].to(dev).unsqueeze(0)
-                        )
-                        entry["point_labels"] = (
-                            batch["point_labels"][i].to(dev).unsqueeze(0)
-                        )
+                        entry["point_coords"] = batch["point_coords"][i].to(dev).unsqueeze(0)
+                        entry["point_labels"] = batch["point_labels"][i].to(dev).unsqueeze(0)
 
                     if step % 200 == 0 and i == 0:
                         boxes = entry.get("boxes", None)
@@ -330,10 +324,8 @@ def main():
                         )
 
                     batched_input.append(entry)
-                    
-                with autocast(
-                    dtype=torch.bfloat16 if tr_cfg.get("bf16", False) else torch.float16
-                ):
+
+                with autocast(dtype=torch.bfloat16 if tr_cfg.get("bf16", False) else torch.float16):
                     out = student(batched_input=batched_input, multimask_output=True)
 
                     mask_list = []
@@ -346,9 +338,7 @@ def main():
                             align_corners=False,
                         ).squeeze(0)
                         mask_list.append(mask_up)
-                        iou_list.append(
-                            o["iou_predictions"].squeeze(0).to(torch.float32)
-                        )
+                        iou_list.append(o["iou_predictions"].squeeze(0).to(torch.float32))
 
                     pred_masks = torch.stack(mask_list, dim=0)
                     pred_ious = torch.stack(iou_list, dim=0)
@@ -372,11 +362,7 @@ def main():
                         for b in range(pred_masks.shape[0]):
                             preds_bin = (torch.sigmoid(pred_masks[b]) > 0.5).float()
                             inter = (preds_bin * gt_bin[b]).sum((-2, -1))
-                            union = (
-                                preds_bin.sum((-2, -1))
-                                + gt_bin[b].sum((-2, -1))
-                                - inter
-                            )
+                            union = preds_bin.sum((-2, -1)) + gt_bin[b].sum((-2, -1)) - inter
                             ious.append(inter / (union + 1e-6))
                         gt_ious = torch.stack(ious, dim=0)
 
@@ -391,88 +377,100 @@ def main():
                             weight = t_cfg["weight"]
                             tname = t_cfg["name"]
 
-                            if dist_cfg.get("encoder_matching", {}).get("enable"):
-                                enc_keys = pot["enc"]
-                                if enc_keys:
+                            if dist_cfg.get("encoder_patch_tokens", {}).get("enable"):
+                                pk = pot["patch"][0]
+                                if pk in feat_student:
                                     try:
                                         feat_teacher = load_cached_npy_features(
-                                            base_dir, tname, "train", ids, enc_keys
-                                        )
-                                        enc_loss = encoder_matching_loss(
-                                            [feat_student[k] for k in enc_keys],
-                                            feat_teacher,
-                                            **dist_cfg["encoder_matching"],
-                                            n_layers=len(enc_keys),
+                                            base_dir, tname, "train", ids, [pk]
+                                        )[0]
+                                        enc_loss = encoder_patch_tokens_loss(
+                                            [feat_student[pk]],
+                                            [feat_teacher],
+                                            **dist_cfg["encoder_patch_tokens"],
+                                            n_layers=1,
                                         )
                                         dist_loss = dist_loss + weight * enc_loss
                                     except Exception as e:
-                                        log.debug(f"Encoder matching error: {e}")
+                                        log.debug(f"Patch token error: {e}")
 
-                            if (
-                                dist_cfg.get("decoder_matching", {}).get("enable")
-                                and pot["dec"]
-                            ):
-                                dk = pot["dec"][0]
-                                if dk in feat_student:
+                            if dist_cfg.get("prompt_image_embedding", {}).get("enable"):
+                                pk = pot["prompt"][0].lstrip("!")
+                                if pk in feat_student:
                                     try:
                                         feat_teacher = load_cached_npy_features(
-                                            base_dir, tname, "train", ids, [dk]
+                                            base_dir, tname, "train", ids, [pk]
                                         )[0]
-                                        dec_loss = decoder_matching_loss(
-                                            feat_student[dk],
+                                        p_loss = prompt_conditioned_embed_loss(
+                                            feat_student[pk],
                                             feat_teacher,
-                                            **dist_cfg["decoder_matching"],
+                                            **dist_cfg["prompt_image_embedding"],
                                         )
-                                        dist_loss = dist_loss + weight * dec_loss
+                                        dist_loss = dist_loss + weight * p_loss
                                     except Exception as e:
-                                        log.debug(f"Decoder matching error: {e}")
+                                        log.debug(f"Prompt embed error: {e}")
 
-                            if (
-                                dist_cfg.get("attention_matching", {}).get("enable")
-                                and pot["attn"]
-                            ):
+                            if dist_cfg.get("decoder_mask_token", {}).get("enable"):
+                                tk = pot["token"][0]
+                                if tk in feat_student:
+                                    try:
+                                        feat_teacher = load_cached_npy_features(
+                                            base_dir, tname, "train", ids, [tk]
+                                        )[0]
+                                        tokens_s = feat_student[tk][
+                                            :, 1 : 1 + student.mask_decoder.num_mask_tokens
+                                        ]
+                                        tokens_t = feat_teacher[
+                                            :, 1 : 1 + student.mask_decoder.num_mask_tokens
+                                        ]
+                                        t_loss = decoder_mask_token_loss(
+                                            tokens_s,
+                                            tokens_t,
+                                            **dist_cfg["decoder_mask_token"],
+                                        )
+                                        dist_loss = dist_loss + weight * t_loss
+                                    except Exception as e:
+                                        log.debug(f"Mask token error: {e}")
+
+                            if dist_cfg.get("mask_logits", {}).get("enable"):
                                 try:
-                                    attn_teacher = load_cached_npy_features(
-                                        base_dir, tname, "train", ids, pot["attn"]
-                                    )
-                                    attn_loss = attention_matching_loss(
-                                        [feat_student[k] for k in pot["attn"]],
-                                        attn_teacher,
-                                        **dist_cfg["attention_matching"],
-                                        n_layers=len(pot["attn"]),
-                                    )
-                                    dist_loss = dist_loss + weight * attn_loss
-                                except Exception as e:
-                                    log.debug(f"Attention matching error: {e}")
-
-                            if dist_cfg.get("relational_KD", {}).get("enable"):
-                                rk = pot["rkd"][0]
-                                if rk in feat_student:
-                                    try:
-                                        feat_teacher = load_cached_npy_features(
-                                            base_dir, tname, "train", ids, [rk]
-                                        )[0]
-                                        rkd_loss_val = rkd_loss(
-                                            feat_student[rk],
-                                            feat_teacher,
-                                            **dist_cfg["relational_KD"],
+                                    feat_teacher = load_cached_npy_features(
+                                        base_dir, tname, "train", ids, ["low_res_logits"]
+                                    )[0]
+                                except Exception:
+                                    if tname in teacher_models:
+                                        with torch.no_grad():
+                                            tout = teacher_models[tname](
+                                                batched_input=batched_input,
+                                                multimask_output=True,
+                                            )
+                                        feat_teacher = torch.stack(
+                                            [o["low_res_logits"] for o in tout], dim=0
                                         )
-                                        dist_loss = dist_loss + weight * rkd_loss_val
-                                    except Exception as e:
-                                        log.debug(f"RKD error: {e}")
+                                    else:
+                                        log.debug("Mask logit not found and teacher missing")
+                                        feat_teacher = None
+                                if feat_teacher is not None:
+                                    log_s = torch.stack([o["low_res_logits"] for o in out], dim=0)
+                                    m_loss = mask_logits_loss(
+                                        log_s,
+                                        feat_teacher,
+                                        **dist_cfg["mask_logits"],
+                                    )
+                                    dist_loss = dist_loss + weight * m_loss
 
-                    loss = (
-                        task_loss + iou_loss + lambda_coef * dist_loss
-                    ) / tr_cfg.get("gradient_accumulation", 1)
+                    loss = (task_loss + iou_loss + lambda_coef * dist_loss) / tr_cfg.get(
+                        "gradient_accumulation", 1
+                    )
 
                 scaler.scale(loss).backward()
                 # del low_res_logits, tmp, logit_up, prob, focal, dice_loss
                 if use_distillation and "feat_student" in locals():
                     del feat_student
 
-                if (step + 1) % tr_cfg.get("gradient_accumulation", 1) == 0 or (
-                    step + 1
-                ) == len(tr_loader):
+                if (step + 1) % tr_cfg.get("gradient_accumulation", 1) == 0 or (step + 1) == len(
+                    tr_loader
+                ):
                     scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
                     scaler.step(opt)
@@ -529,9 +527,7 @@ def main():
                                 ),
                             }
                             if vb["box_prompt"][i] is not None:
-                                entry["boxes"] = (
-                                    vb["box_prompt"][i].to(dev).unsqueeze(0)
-                                )  # (1,4)
+                                entry["boxes"] = vb["box_prompt"][i].to(dev).unsqueeze(0)  # (1,4)
                             if vb["point_coords"][i] is not None:
                                 entry["point_coords"] = (
                                     vb["point_coords"][i].to(dev).unsqueeze(0)
@@ -550,24 +546,16 @@ def main():
                                 size=masks.shape[-2:],
                                 mode="bilinear",
                                 align_corners=False,
-
                             ).squeeze(0)
                             mask_list.append(mask_up)
-                            iou_list.append(
-                                o["iou_predictions"].squeeze(0).to(torch.float32)
-                            )
-
+                            iou_list.append(o["iou_predictions"].squeeze(0).to(torch.float32))
 
                         pred_masks = torch.stack(mask_list, dim=0)
                         pred_ious = torch.stack(iou_list, dim=0)
 
                         best_indices = pred_ious.argmax(dim=1)
                         probs = torch.sigmoid(
-
-                            pred_masks[
-                                torch.arange(len(pred_masks)), best_indices
-                            ].unsqueeze(1)
-
+                            pred_masks[torch.arange(len(pred_masks)), best_indices].unsqueeze(1)
                         )
 
                         for i in range(len(imgs)):
@@ -587,8 +575,7 @@ def main():
 
                             union = pred_bin + gt_i - pred_bin * gt_i
                             bin_iou = (
-                                (pred_bin * gt_i).sum((-2, -1))
-                                / (union.sum((-2, -1)) + 1e-6)
+                                (pred_bin * gt_i).sum((-2, -1)) / (union.sum((-2, -1)) + 1e-6)
                             ).item()
 
                             dices.append(bin_dice)
@@ -600,10 +587,8 @@ def main():
                                     f"[VAL] id={vb['id'][i]}, "
                                     f"soft_dice={soft_dice:.3f}, "
                                     f"bin_dice={bin_dice:.3f}, bin_iou={bin_iou:.3f}, "
-
                                     f"gt_sum={gt_i.sum().item():.0f}, "
                                     f"pred_sum={pred_bin.sum().item():.0f}"
-
                                 )
 
                             # Visualization
@@ -611,19 +596,14 @@ def main():
                                 bi == 0
                                 and cfg["visual"].get("status", False)
                                 and (
-                                    ep % cfg["visual"].get("save_every_n_epochs", 10)
-                                    == 0
-                                    or ((np.mean(dices) + np.mean(ious)) / 2)
-                                    > best_score
+                                    ep % cfg["visual"].get("save_every_n_epochs", 10) == 0
+                                    or ((np.mean(dices) + np.mean(ious)) / 2) > best_score
                                 )
                             ):
-                                cur_path = (
-                                    Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
-                                )
+                                cur_path = Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
                                 cur_path.mkdir(parents=True, exist_ok=True)
                                 img_denorm = (
-                                    imgs[i]
-                                    * torch.tensor(STD, device=dev)[:, None, None]
+                                    imgs[i] * torch.tensor(STD, device=dev)[:, None, None]
                                     + torch.tensor(MEAN, device=dev)[:, None, None]
                                 )
                                 img_denorm = img_denorm.clamp(0, 1).cpu()
@@ -651,11 +631,7 @@ def main():
                                     original_size=None,
                                     threshold=cfg["visual"].get("IOU_threshold", 0.5),
                                     save_dir=str(cur_path),
-
-                                    filename_info=(
-                                        f"ep{ep}_id{vb['id'][i]}_b{bi}_s{i}"
-                                    ),
-
+                                    filename_info=(f"ep{ep}_id{vb['id'][i]}_b{bi}_s{i}"),
                                 )
                     except Exception as e:
                         log.error(f"Error in validation step {bi}: {e}")
@@ -668,12 +644,10 @@ def main():
                 writer.add_scalar("val/iou", v_iou, ep)
                 writer.add_scalar("val/score", v_score, ep)
                 log.info(
-
                     (
                         f"Epoch {ep}  Bin-Dice={v_dice:.4f} "
                         f"Bin-IoU={v_iou:.4f} Score={v_score:.4f}"
                     )
-
                 )
                 log_gpu_memory(f"Epoch {ep} validation completed")
 
@@ -683,19 +657,15 @@ def main():
                     if v_score > best_score + 1e-4:
                         dyn_wait = 0
                         lambda_coef = min(
-
                             lambda_coef / dist_cfg["dynamic_lambda"]["factor"],
                             1.0,
-
                         )
                     else:
                         dyn_wait += 1
                         if dyn_wait >= dist_cfg["dynamic_lambda"]["patience"]:
                             lambda_coef = max(
-
                                 lambda_coef * dist_cfg["dynamic_lambda"]["factor"],
                                 1e-3,
-
                             )
                             dyn_wait = 0
                             log.info(f"λ ↓ {lambda_coef:.3f}")
