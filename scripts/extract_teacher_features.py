@@ -44,31 +44,20 @@ from PIL import Image
 from tqdm import tqdm
 
 
-# This function is a direct copy from `train.py` to ensure consistency.
 def _build_pot(model_type: str):
-    p = {"enc": [], "dec": [], "attn": [], "rkd": ["image_encoder.patch_embed"]}
+    """Return list of layer names required for the new four-way distillation."""
+    pot = {
+        "enc_patch": [],
+        "prompt_embed": ["mask_decoder.transformer"],
+        "mask_token": ["mask_decoder.transformer"],
+    }
+
     if model_type == "vit_t":
-        p["enc"] = ["image_encoder.neck"]
-        p["dec"] = ["mask_decoder.output_upscaling"]
-        p["attn"] = [
-            "image_encoder.layers.1.blocks.0.attn",
-            "image_encoder.layers.1.blocks.1.attn",
-            "image_encoder.layers.2.blocks.0.attn",
-            "image_encoder.layers.2.blocks.1.attn",
-            "image_encoder.layers.2.blocks.2.attn",
-            "image_encoder.layers.2.blocks.3.attn",
-            "image_encoder.layers.2.blocks.4.attn",
-            "image_encoder.layers.2.blocks.5.attn",
-            "image_encoder.layers.3.blocks.0.attn",
-            "image_encoder.layers.3.blocks.1.attn",
-        ]
-    else:  # vit_b, vit_l, vit_h
-        p["enc"] = [f"image_encoder.blocks.{i}" for i in (9, 10, 11, 12)]
-        # Official SAM models do not expose `pre_logits`; reuse output_upscaling
-        # for decoder matching to avoid missing features.
-        p["dec"] = ["mask_decoder.output_upscaling"]
-        p["attn"] = [f"image_encoder.blocks.{i}.attn" for i in range(12)]
-    return p
+        pot["enc_patch"] = ["image_encoder.neck"]
+    else:
+        pot["enc_patch"] = ["image_encoder.blocks.30"]
+
+    return pot
 
 
 def process_images_in_dir(

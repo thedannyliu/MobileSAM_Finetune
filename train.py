@@ -21,16 +21,17 @@ import traceback
 import yaml
 from finetune_utils.datasets import ComponentDataset, SegmentEverythingDataset
 from finetune_utils.distill_losses import (
-    attention_matching_loss,
-    decoder_matching_loss,
-    encoder_matching_loss,
-    rkd_loss,
+    encoder_patch_loss,
+    prompt_embed_loss,
+    mask_token_loss,
+    dense_mask_logits_loss,
 )
 from finetune_utils.feature_hooks import pop_features, register_hooks
 from finetune_utils.visualization import overlay_mask_on_image, overlay_masks_on_image
 from pathlib import Path
 from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
+from contextlib import nullcontext
 
 # ─────────────────── logging ───────────────────
 logging.basicConfig(
@@ -276,29 +277,22 @@ def main():
     hook_handles = []
 
     def _build_pot(model_type: str):
-        p = {"enc": [], "dec": [], "attn": [], "rkd": ["image_encoder.patch_embed"]}
+        """Return layers to hook for each distillation component."""
+        pot = {
+            "enc_patch": [],
+            "prompt_embed": [],
+            "mask_token": [],
+        }
+
         if model_type == "vit_t":
-            p["enc"] = ["image_encoder.neck"]
-            p["dec"] = ["mask_decoder.output_upscaling"]
-            p["attn"] = [
-                "image_encoder.layers.1.blocks.0.attn",
-                "image_encoder.layers.1.blocks.1.attn",
-                "image_encoder.layers.2.blocks.0.attn",
-                "image_encoder.layers.2.blocks.1.attn",
-                "image_encoder.layers.2.blocks.2.attn",
-                "image_encoder.layers.2.blocks.3.attn",
-                "image_encoder.layers.2.blocks.4.attn",
-                "image_encoder.layers.2.blocks.5.attn",
-                "image_encoder.layers.3.blocks.0.attn",
-                "image_encoder.layers.3.blocks.1.attn",
-            ]
-        else:
-            p["enc"] = [f"image_encoder.blocks.{i}" for i in (9, 10, 11, 12)]
-            # Some official SAM models do not expose `pre_logits`. Fallback to
-            # `output_upscaling` which exists in all variants.
-            p["dec"] = ["mask_decoder.output_upscaling"]
-            p["attn"] = [f"image_encoder.blocks.{i}.attn" for i in range(12)]
-        return p
+            pot["enc_patch"] = ["image_encoder.neck"]
+        else:  # vit_h or other ViT variants
+            pot["enc_patch"] = ["image_encoder.blocks.30"]
+
+        # Both teacher & student share the same hook for prompt embed & mask token
+        pot["prompt_embed"] = ["mask_decoder.transformer"]
+        pot["mask_token"] = ["mask_decoder.transformer"]
+        return pot
 
     pot = _build_pot(m_cfg.get("type", "vit_t"))
 
@@ -308,10 +302,10 @@ def main():
         enabled_losses = [
             n
             for n in (
-                "encoder_matching",
-                "decoder_matching",
-                "attention_matching",
-                "relational_KD",
+                "encoder_patch",
+                "prompt_embed",
+                "decoder_mask_token",
+                "dense_mask_logits",
             )
             if dist_cfg.get(n, {}).get("enable")
         ]
@@ -325,10 +319,9 @@ def main():
 
         hook_layers = []
         for name, key in (
-            ("encoder_matching", "enc"),
-            ("decoder_matching", "dec"),
-            ("attention_matching", "attn"),
-            ("relational_KD", "rkd"),
+            ("encoder_patch", "enc_patch"),
+            ("prompt_embed", "prompt_embed"),
+            ("decoder_mask_token", "mask_token"),
         ):
             if dist_cfg.get(name, {}).get("enable"):
                 hook_layers += pot[key]
@@ -359,10 +352,9 @@ def main():
                 hooks_t = []
                 hook_layers_t = []
                 for name, key in (
-                    ("encoder_matching", "enc"),
-                    ("decoder_matching", "dec"),
-                    ("attention_matching", "attn"),
-                    ("relational_KD", "rkd"),
+                    ("encoder_patch", "enc_patch"),
+                    ("prompt_embed", "prompt_embed"),
+                    ("decoder_mask_token", "mask_token"),
                 ):
                     if dist_cfg.get(name, {}).get("enable"):
                         hook_layers_t += teacher_pots[t["name"]][key]
@@ -483,9 +475,9 @@ def main():
                 dice_loss = torch.tensor(0.0, device=dev, requires_grad=True)
                 dist_loss = torch.tensor(0.0, device=dev, requires_grad=True)
                 enc_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
-                dec_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
-                attn_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
-                rkd_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
+                prompt_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
+                tok_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
+                dense_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
                 cls_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
                 task_loss = torch.tensor(0.0, device=dev, requires_grad=True)
                 loss = torch.tensor(0.0, device=dev, requires_grad=True)
@@ -521,6 +513,66 @@ def main():
                         dtype=torch.bfloat16 if tr_cfg.get("bf16", False) else torch.float16
                     ):
                         out = student(batched_input=batched_input, multimask_output=True)
+
+                        # ---------------- Distillation Forward ----------------
+                        if use_distillation:
+                            # 取出 student forward 的中間特徵
+                            feat_student = pop_features()
+                            teacher_outs = []  # 儲存每位 teacher 的 forward 結果 (list of list[dict])
+                            teacher_feats = []  # 儲存 hooks 擷取的特徵 (list[dict])
+                            for t in teacher_models:
+                                with torch.no_grad():
+                                    _out_t = t["model"](batched_input=batched_input, multimask_output=True)
+                                teacher_outs.append(_out_t)
+                                teacher_feats.append(pop_features())
+
+                            # 初始化 distillation loss 累加器
+                            enc_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
+                            prompt_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
+                            tok_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
+                            dense_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
+
+                            for t_idx, t in enumerate(teacher_models):
+                                w_t = t["weight"]
+                                feat_t = teacher_feats[t_idx]
+
+                                # 1. Encoder patch tokens
+                                if dist_cfg.get("encoder_patch", {}).get("enable"):
+                                    l_s = pot["enc_patch"][0]
+                                    l_t = teacher_pots[t["name"]]["enc_patch"][0]
+                                    enc_cfg = dist_cfg["encoder_patch"]
+                                    enc_loss_val = enc_loss_val + w_t * encoder_patch_loss(
+                                        feat_student[l_s][0],
+                                        feat_t[l_t][0],
+                                        w_l2=enc_cfg.get("w_l2", 1.0),
+                                        w_cos=enc_cfg.get("w_cos", 1.0),
+                                    )
+
+                                # 2. Prompt-conditioned embeddings
+                                if dist_cfg.get("prompt_embed", {}).get("enable"):
+                                    l_s = pot["prompt_embed"][0]
+                                    l_t = teacher_pots[t["name"]]["prompt_embed"][0]
+                                    pe_cfg = dist_cfg["prompt_embed"]
+                                    prompt_loss_val = prompt_loss_val + w_t * prompt_embed_loss(
+                                        feat_student[l_s][0],
+                                        feat_t[l_t][0],
+                                        w_mse=pe_cfg.get("w_mse", 0.7),
+                                        w_cos=pe_cfg.get("w_cos", 0.3),
+                                    )
+
+                                # 3. Mask token logits
+                                if dist_cfg.get("decoder_mask_token", {}).get("enable"):
+                                    l_s = pot["mask_token"][0]
+                                    l_t = teacher_pots[t["name"]]["mask_token"][0]
+                                    tok_cfg = dist_cfg["decoder_mask_token"]
+                                    tok_s = feat_student[l_s][0][:, 1 : 1 + student.mask_decoder.num_mask_tokens, :]
+                                    tok_t = feat_t[l_t][0][:, 1 : 1 + student.mask_decoder.num_mask_tokens, :]
+                                    tok_loss_val = tok_loss_val + w_t * mask_token_loss(
+                                        tok_s,
+                                        tok_t,
+                                        w_kl=tok_cfg.get("w_kl", 1.0),
+                                        temperature=tok_cfg.get("temperature", 0.5),
+                                    )
 
                         bce = torch.tensor(0.0, device=dev, requires_grad=True)
                         focal = torch.tensor(0.0, device=dev, requires_grad=True)
@@ -559,11 +611,45 @@ def main():
                                 gt_ious = torch.stack(ious)
                             iou_loss = iou_loss + F.mse_loss(torch.sigmoid(iou_pred), gt_ious)
 
+                            # -------- distillation：dense mask logits (per-sample) --------
+                            if use_distillation and dist_cfg.get("dense_mask_logits", {}).get("enable"):
+                                dl_cfg = dist_cfg["dense_mask_logits"]
+                                for t_idx, t in enumerate(teacher_models):
+                                    t_out_i = teacher_outs[t_idx][i]
+                                    t_low_res = t_out_i["low_res_logits"].to(torch.float32).squeeze(0)
+                                    t_iou_pred = t_out_i["iou_predictions"].squeeze(0).to(torch.float32)
+                                    t_best_idx = t_iou_pred.argmax()
+                                    t_sel_logit = t_low_res[t_best_idx].unsqueeze(0)
+                                    dense_loss_val = dense_loss_val + teacher_models[t_idx]["weight"] * dense_mask_logits_loss(
+                                        sel_logit,
+                                        t_sel_logit,
+                                        w_kl=dl_cfg.get("w_kl", 0.6),
+                                        w_focal=dl_cfg.get("w_focal", 0.4),
+                                        gamma=dl_cfg.get("gamma", 2.0),
+                                    )
+
                         bce = bce / len(out)
                         focal = focal / len(out)
                         dice_loss = dice_loss / len(out)
                         cls_loss_val = cls_loss_val / len(out)
                         iou_loss = iou_loss / len(out)
+
+                        # ---------------- distillation: dense mask logits ----------------
+                        if use_distillation and dist_cfg.get("dense_mask_logits", {}).get("enable"):
+                            dl_cfg = dist_cfg["dense_mask_logits"]
+                            for t_idx, t in enumerate(teacher_models):
+                                t_out_i = teacher_outs[t_idx][i]
+                                t_low_res = t_out_i["low_res_logits"].to(torch.float32).squeeze(0)
+                                t_iou_pred = t_out_i["iou_predictions"].squeeze(0).to(torch.float32)
+                                t_best_idx = t_iou_pred.argmax()
+                                t_sel_logit = t_low_res[t_best_idx].unsqueeze(0)
+                                dense_loss_val = dense_loss_val + teacher_models[t_idx]["weight"] * dense_mask_logits_loss(
+                                    sel_logit,
+                                    t_sel_logit,
+                                    w_kl=dl_cfg.get("w_kl", 0.6),
+                                    w_focal=dl_cfg.get("w_focal", 0.4),
+                                    gamma=dl_cfg.get("gamma", 2.0),
+                                )
 
                         task_loss = (
                             w_bce * bce
@@ -573,7 +659,10 @@ def main():
                         )
 
                         # 計算總 loss（single-prompt 模式）
-                        dist_loss = torch.tensor(0.0, device=dev, requires_grad=True)
+                        dist_loss = enc_loss_val + prompt_loss_val + tok_loss_val + dense_loss_val
+
+                        # 針對 single-prompt 模式需在此計算總 loss，
+                        # 否則 loss 仍保持為 0 會導致梯度為 0，也無法在 tqdm 中顯示 total
                         loss = (
                             task_loss.float()
                             + w_iou * iou_loss.float()
@@ -729,7 +818,7 @@ def main():
                     if mask_teacher_enable and mask_teacher_method == "dual_supervision":
                         task_loss = task_loss + soft_loss_weight * soft_loss_val
 
-                    dist_loss = enc_loss_val + dec_loss_val + attn_loss_val + rkd_loss_val
+                    dist_loss = enc_loss_val + prompt_loss_val + tok_loss_val + dense_loss_val
 
                     # 針對 single-prompt 模式需在此計算總 loss，
                     # 否則 loss 仍保持為 0 會導致梯度為 0，也無法在 tqdm 中顯示 total
@@ -770,9 +859,9 @@ def main():
                 iou_c = w_iou * iou_loss.item() / ga
                 cls_c = w_cls * cls_loss_val.item() / norm / ga
                 enc_c = lambda_coef * enc_loss_val.item() / ga
-                dec_c = lambda_coef * dec_loss_val.item() / ga
-                attn_c = lambda_coef * attn_loss_val.item() / ga
-                rkd_c = lambda_coef * rkd_loss_val.item() / ga
+                pe_c = lambda_coef * prompt_loss_val.item() / ga
+                tok_c = lambda_coef * tok_loss_val.item() / ga
+                dense_c = lambda_coef * dense_loss_val.item() / ga
                 soft_c = soft_loss_weight * soft_loss_val.item() / ga if mask_teacher_enable and mask_teacher_method == "dual_supervision" else 0.0
                 dist_c = lambda_coef * dist_loss.item() / ga
 
@@ -785,9 +874,9 @@ def main():
                     iou=f"{iou_c:.3f}",
                     cls=f"{cls_c:.3f}",
                     enc=f"{enc_c:.3f}",
-                    dec=f"{dec_c:.3f}",
-                    attn=f"{attn_c:.3f}",
-                    rkd=f"{rkd_c:.3f}",
+                    pe=f"{pe_c:.3f}",
+                    tok=f"{tok_c:.3f}",
+                    dense=f"{dense_c:.3f}",
                     soft=f"{soft_c:.3f}",
                     dist=f"{dist_c:.3f}",
                     total=f"{total_c:.3f}",
