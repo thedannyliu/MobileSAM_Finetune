@@ -1,0 +1,12 @@
+model_type: vit_t
+output_csv: results/eval.csv
+viz_dir: results/visuals
+weights:
+  - name: run1
+    path: weights/mobilesam_run1.pth
+  - name: run2
+    path: weights/mobilesam_run2.pth
+datasets:
+  - name: val
+    image_dir: datasets/val/images
+    mask_dir: datasets/val/masks
