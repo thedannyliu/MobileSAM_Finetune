@@ -15,10 +15,12 @@ returning a scalar tensor on the same device / dtype as the inputs.
 """
 
 from __future__ import annotations
-from typing import List, Union
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+
+from typing import List, Union
+
 
 # ─── helper ───
 def _permute_if_channel_last(t: Tensor) -> Tensor:
@@ -27,6 +29,7 @@ def _permute_if_channel_last(t: Tensor) -> Tensor:
         if t.shape[3] > t.shape[1] and t.shape[3] > t.shape[2]:
             return t.permute(0, 3, 1, 2)
     return t
+
 
 def _interpolate_if_needed(src: Tensor, ref: Tensor) -> Tensor:
     if src.ndim == 5:
@@ -60,7 +63,11 @@ def _match_channels(src: Tensor, tgt: Tensor) -> Tensor:
         return src.view(src.size(0), Ct, k, *src.shape[2:]).mean(2)
     if Ct % Cs == 0:  # up-sample (repeat)
         k = Ct // Cs
-        return src.unsqueeze(2).repeat(1, 1, k, *([1] * (src.ndim - 2))).view(src.size(0), Ct, *src.shape[2:])
+        return (
+            src.unsqueeze(2)
+            .repeat(1, 1, k, *([1] * (src.ndim - 2)))
+            .view(src.size(0), Ct, *src.shape[2:])
+        )
     return src.mean(1, keepdim=True).repeat(1, Ct, 1, 1)
 
 
@@ -68,7 +75,9 @@ def _flat(x: Tensor) -> Tensor:
     """Flatten all dims except batch for cosine / KL computations."""
     return x.flatten(1)
 
+
 # ──────────────────── 1. Encoder patch tokens ────────────────────
+
 
 def encoder_patch_loss(
     feat_s: Union[Tensor, List[Tensor]],
@@ -85,7 +94,9 @@ def encoder_patch_loss(
     cos = 1.0 - F.cosine_similarity(_flat(fs), _flat(ft)).mean()
     return w_l2 * mse + w_cos * cos
 
+
 # ──────────────────── 2. Prompt-conditioned embedding ────────────────────
+
 
 def prompt_embed_loss(
     feat_s: Union[Tensor, List[Tensor]],
@@ -101,7 +112,9 @@ def prompt_embed_loss(
     cos = 1.0 - F.cosine_similarity(_flat(fs), _flat(ft)).mean()
     return w_mse * mse + w_cos * cos
 
+
 # ──────────────────── 3. Mask token logits ────────────────────
+
 
 def mask_token_loss(
     token_s: Tensor,  # B × T × C, usually T=4
@@ -115,9 +128,11 @@ def mask_token_loss(
 
     ps = F.log_softmax(token_s / temperature, dim=-1)
     pt = F.softmax(token_t / temperature, dim=-1)
-    return w_kl * F.kl_div(ps, pt, reduction="batchmean") * (temperature ** 2)
+    return w_kl * F.kl_div(ps, pt, reduction="batchmean") * (temperature**2)
+
 
 # ──────────────────── 4. Dense mask logits ────────────────────
+
 
 def dense_mask_logits_loss(
     logit_s: Tensor,  # B × 1 × H × W  (before sigmoid)
@@ -131,8 +146,13 @@ def dense_mask_logits_loss(
     min_b = min(logit_s.size(0), logit_t.size(0))
     logit_s, logit_t = logit_s[:min_b], logit_t[:min_b]
 
-    p_s = torch.sigmoid(logit_s)  # values in (0,1)
-    p_t = torch.sigmoid(logit_t).detach()  # teacher不用梯度
+    p_s = torch.sigmoid(logit_s)
+    p_t = torch.sigmoid(logit_t).detach()
+
+    # avoid numerical issues when taking log
+    eps = 1e-6
+    p_s = p_s.clamp(min=eps, max=1 - eps)
+    p_t = p_t.clamp(min=eps, max=1 - eps)
 
     # KL divergence for Bernoulli distributions (pixel-wise)
     kl = F.kl_div(torch.log(p_s), p_t, reduction="mean")
