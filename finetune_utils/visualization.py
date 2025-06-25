@@ -3,12 +3,25 @@
 import numpy as np
 import torch
 from torchvision.transforms.functional import to_pil_image
+import colorsys
 
 from mobile_sam.utils.transforms import ResizeLongestSide
 
 from pathlib import Path
 from PIL import Image, ImageDraw
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
+
+
+def generate_distinct_colors(n: int, alpha: int = 80) -> List[tuple[int, int, int, int]]:
+    """Generate ``n`` visually distinct RGBA colors."""
+    colors: List[tuple[int, int, int, int]] = []
+    golden_ratio = 0.618033988749895
+    h = 0.0
+    for _ in range(n):
+        h = (h + golden_ratio) % 1.0
+        r, g, b = colorsys.hsv_to_rgb(h, 1.0, 1.0)
+        colors.append((int(r * 255), int(g * 255), int(b * 255), alpha))
+    return colors
 
 
 def overlay_mask_on_image(
@@ -171,14 +184,7 @@ def overlay_masks_on_image(
 
     if masks.ndim == 4:
         masks = masks.squeeze(1)
-    colors = [
-        (255, 0, 0, 80),
-        (0, 255, 0, 80),
-        (0, 0, 255, 80),
-        (255, 255, 0, 80),
-        (255, 0, 255, 80),
-        (0, 255, 255, 80),
-    ]
+    colors = generate_distinct_colors(masks.shape[0])
 
     for idx, m in enumerate(masks):
         m_bin = (m > threshold).cpu().numpy().astype(np.uint8) * 255

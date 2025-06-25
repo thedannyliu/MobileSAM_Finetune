@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from PIL import Image, ImageDraw, ImageFont
+from finetune_utils.visualization import generate_distinct_colors
 
 import yaml  # type: ignore
 
@@ -55,20 +56,13 @@ def overlay_masks(rgb: np.ndarray, masks: torch.Tensor) -> Image.Image:
     base = Image.fromarray(rgb).convert("RGBA")
     if masks.ndim == 4:
         masks = masks.squeeze(1)
-    colors = [
-        (255, 0, 0, 80),
-        (0, 255, 0, 80),
-        (0, 0, 255, 80),
-        (255, 255, 0, 80),
-        (255, 0, 255, 80),
-        (0, 255, 255, 80),
-    ]
+    colors = generate_distinct_colors(masks.shape[0])
     for idx, m in enumerate(masks):
         m_bin = (m > 0.5).cpu().numpy().astype(np.uint8) * 255
         if m_bin.max() == 0:
             continue
         mask_pil = Image.fromarray(m_bin, mode="L")
-        layer = Image.new("RGBA", base.size, colors[idx % len(colors)])
+        layer = Image.new("RGBA", base.size, colors[idx])
         base.paste(layer, mask=mask_pil)
     return base.convert("RGB")
 
