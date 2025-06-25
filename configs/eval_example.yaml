@@ -3,10 +3,10 @@ output_csv: results/eval.csv
 viz_dir: results/visuals
 weights:
   - name: run1
-    path: weights/mobilesam_run1.pth
+    path: logs/best_student.pth
   - name: run2
-    path: weights/mobilesam_run2.pth
+    path: logs/best_student.pth
 datasets:
   - name: val
-    image_dir: datasets/val/images
-    mask_dir: datasets/val/masks
+    image_dir: datasets/val/image
+    mask_dir: datasets/val/mask

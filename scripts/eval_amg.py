@@ -99,7 +99,14 @@ def save_collage(
     for idx, (title, im) in enumerate(zip(titles, images)):
         canvas.paste(im, (idx * w, 20))
         draw = ImageDraw.Draw(canvas)
-        tw, th = draw.textsize(title, font=font)
+        # Pillow >=10.0 removed ``ImageDraw.textsize``; use ``textbbox`` instead.
+        try:
+            bbox = draw.textbbox((0, 0), title, font=font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+        except AttributeError:
+            # Fallback for very old Pillow versions where ``textbbox`` may be unavailable.
+            tw, th = draw.textsize(title, font=font)  # type: ignore[attr-defined]
         draw.text((idx * w + (w - tw) / 2, 0), title, fill="black", font=font)
     canvas.save(out_path)
 
