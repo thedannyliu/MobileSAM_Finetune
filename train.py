@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import traceback
+import resource
 import yaml
 from finetune_utils.datasets import ComponentDataset, SegmentEverythingDataset
 from finetune_utils.distill_losses import (
@@ -42,17 +43,30 @@ logging.basicConfig(
 log = logging.getLogger("train")
 
 
-def log_gpu_memory(step_name=""):
+def log_gpu_memory(step_name: str = "") -> None:
+    """Log current CPU and GPU memory usage."""
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1024**3
         cached = torch.cuda.memory_reserved() / 1024**3
-        log.info(f"{step_name} GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB")
+        log.info(
+            f"{step_name} CPU RSS: {rss:.1f} MB | GPU Allocated: {allocated:.2f} GB, Reserved: {cached:.2f} GB"
+        )
+    else:
+        log.info(f"{step_name} CPU RSS: {rss:.1f} MB")
 
 
 def clear_gpu_cache():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         gc.collect()
+
+
+def handle_oom(e: RuntimeError, ep: int, step: int) -> None:
+    """Log memory stats when a CUDA OOM error occurs."""
+    log.error(f"CUDA OOM at epoch {ep} step {step}: {e}")
+    log_gpu_memory("[OOM]")
+    clear_gpu_cache()
 
 
 class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
@@ -106,7 +120,7 @@ feature_cache = MemoryEfficientFeatureCache()
 def load_cached_npy_features(
     base: Path, teacher: str, split: str, stems: list[str], keys: list[str]
 ):
-    stacked = {k: [] for k in keys}
+    stacked: dict[str, list[torch.Tensor]] = {k: [] for k in keys}
     for stem in stems:
         for k in keys:
             fname = f"{stem}_{k.replace('.', '_').replace('[', '_').replace(']', '')}.npy"
@@ -278,7 +292,7 @@ def main():
 
     def _build_pot(model_type: str):
         """Return layers to hook for each distillation component."""
-        pot = {
+        pot: dict[str, list[str]] = {
             "enc_patch": [],
             "prompt_embed": [],
             "mask_token": [],
@@ -294,7 +308,7 @@ def main():
         pot["mask_token"] = ["mask_decoder.transformer"]
         return pot
 
-    pot = _build_pot(m_cfg.get("type", "vit_t"))
+    pot: dict[str, list[str]] = _build_pot(m_cfg.get("type", "vit_t"))
 
     teacher_models = []
     teacher_pots = {}
@@ -828,7 +842,14 @@ def main():
                         + lambda_coef * dist_loss.float()
                     ) / tr_cfg.get("gradient_accumulation", 1)
 
-                scaler.scale(loss).backward()
+                try:
+                    scaler.scale(loss).backward()
+                except RuntimeError as err:
+                    if "out of memory" in str(err).lower():
+                        handle_oom(err, ep, step)
+                        opt.zero_grad(set_to_none=True)
+                        continue
+                    raise
                 # del low_res_logits, tmp, logit_up, prob, focal, dice_loss
                 if use_distillation and "feat_student" in locals():
                     del feat_student
