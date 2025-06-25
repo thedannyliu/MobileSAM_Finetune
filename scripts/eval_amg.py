@@ -29,13 +29,32 @@ from mobile_sam import SamAutomaticMaskGenerator, sam_model_registry
 import argparse
 import csv
 import time
+import resource
 from pathlib import Path
 from typing import Any, Dict, List
 
 from PIL import Image, ImageDraw, ImageFont
 from finetune_utils.visualization import generate_distinct_colors
-
 import yaml  # type: ignore
+
+
+def mem_usage_mb() -> float:
+    """Return the current process RSS in megabytes."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+
+def build_model(model_type: str, checkpoint: str, device: str):
+    """Load a SAM checkpoint with debug output and move to ``device``."""
+    print(f"\n[build_model] loading {checkpoint} as {model_type}")
+    start = time.perf_counter()
+    sam = sam_model_registry[model_type](checkpoint=checkpoint)
+    print(
+        f"[build_model] checkpoint loaded in {time.perf_counter() - start:.2f}s; RSS {mem_usage_mb():.1f} MB"
+    )
+    sam.to(device=device)
+    print(f"[build_model] moved model to {device}; RSS {mem_usage_mb():.1f} MB")
+    sam.eval()
+    return sam
 
 
 def load_gt_masks(mask_dir: Path) -> torch.Tensor:
@@ -175,9 +194,7 @@ def main() -> None:
     rows = []
     for w in weights:
         name = w.get("name") or Path(w["path"]).stem
-        sam = sam_model_registry[model_type](checkpoint=w["path"])
-        sam.to(device=device)
-        sam.eval()
+        sam = build_model(model_type, w["path"], device)
         amg = SamAutomaticMaskGenerator(sam)
 
         result = {"name": name}
