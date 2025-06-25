@@ -13,3 +13,4 @@ weights/sam_vit_h_4b8939.pth
 mobile_sam.egg-info
 coco
 val2017
+results
