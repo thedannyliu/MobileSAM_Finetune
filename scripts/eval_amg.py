@@ -129,6 +129,7 @@ def evaluate_image(
     if bgr is None:
         raise FileNotFoundError(img_path)
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    del bgr
 
     start = time.perf_counter()
     gpu_before = gpu_mem_usage_mb(device)
@@ -154,6 +155,7 @@ def evaluate_image(
     iou_mat = inter / (union + 1e-6)
 
     overlay = overlay_masks(rgb, pred_masks)
+    del rgb
 
     max_iou, _ = iou_mat.max(dim=1)
     torch.cuda.empty_cache()
@@ -172,6 +174,7 @@ def evaluate_dataset(
     overlay_dir: Optional[Path] = None,
 ) -> tuple[float, float]:
     """Return mean IoU and average inference time over all images in a dataset."""
+    print(f"[dataset] evaluating {image_dir} with {weight_name}")
     all_ious: List[float] = []
     times: List[float] = []
     for img_file in sorted(image_dir.iterdir()):
@@ -187,6 +190,8 @@ def evaluate_dataset(
             overlay.save(out_path)
         overlay.close()
         del overlay
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
         print(
             f"[eval] {img_file.name} - RSS {mem_usage_mb():.1f} MB, GPU {gpu_mem_usage_mb(device):.1f} MB"
         )
@@ -197,6 +202,10 @@ def evaluate_dataset(
     if not all_ious:
         return 0.0, float("nan")
     torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+    print(
+        f"[dataset] done {image_dir} - RSS {mem_usage_mb():.1f} MB, GPU {gpu_mem_usage_mb(device):.1f} MB"
+    )
     gc.collect()
     return float(np.mean(all_ious)), float(np.mean(times))
 
@@ -249,6 +258,7 @@ def main() -> None:
                 device,
                 out_dir,
             )
+            print(f"[result] {name} {ds_name} mIoU={miou:.4f} time={avg_t:.4f}s")
             result[f"{ds_name}_mIoU"] = f"{miou:.4f}"
             result[f"{ds_name}_time"] = f"{avg_t:.4f}"
         rows.append(result)

@@ -10,3 +10,5 @@ datasets:
   - name: val
     image_dir: datasets/val/image
     mask_dir: datasets/val/mask
+
+device: cpu
