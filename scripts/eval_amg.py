@@ -28,19 +28,25 @@ from mobile_sam import SamAutomaticMaskGenerator, sam_model_registry
 
 import argparse
 import csv
-import time
 import resource
-from pathlib import Path
-from typing import Any, Dict, List
-
-from PIL import Image, ImageDraw, ImageFont
-from finetune_utils.visualization import generate_distinct_colors
+import time
 import yaml  # type: ignore
+from finetune_utils.visualization import generate_distinct_colors
+from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont
+from typing import Any, Dict, List, Optional
 
 
 def mem_usage_mb() -> float:
     """Return the current process RSS in megabytes."""
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+
+def gpu_mem_usage_mb(device: str) -> float:
+    """Return the current reserved GPU memory in megabytes."""
+    if torch.cuda.is_available() and device.startswith("cuda"):
+        return torch.cuda.memory_reserved(device) / (1024 * 1024)
+    return 0.0
 
 
 def build_model(model_type: str, checkpoint: str, device: str):
@@ -111,9 +117,7 @@ def save_collage(
     canvas.save(out_path)
 
 
-def evaluate_image(
-    amg, img_path: Path, mask_dir: Path
-) -> tuple[List[float], float, Image.Image]:
+def evaluate_image(amg, img_path: Path, mask_dir: Path) -> tuple[List[float], float, Image.Image]:
     """Return IoU scores, inference time, and overlay for ``img_path``."""
     bgr = cv2.imread(str(img_path))
     if bgr is None:
@@ -149,7 +153,9 @@ def evaluate_dataset(
     image_dir: Path,
     mask_dir: Path,
     weight_name: str,
-    overlay_store: Dict[str, Dict[str, Image.Image]],
+    overlay_store: Dict[str, Dict[str, Any]],
+    device: str,
+    overlay_dir: Optional[Path] = None,
 ) -> tuple[float, float]:
     """Return mean IoU and average inference time over all images in a dataset."""
     all_ious: List[float] = []
@@ -162,6 +168,14 @@ def evaluate_dataset(
             continue
         ious, t, overlay = evaluate_image(amg, img_file, gt_dir)
         overlay_store.setdefault(img_file.stem, {})[weight_name] = overlay
+        if overlay_dir is not None:
+            overlay_dir.mkdir(parents=True, exist_ok=True)
+            out_path = overlay_dir / f"{img_file.stem}_{weight_name}.jpg"
+            overlay.save(out_path)
+            overlay_store[img_file.stem][weight_name] = str(out_path)
+        print(
+            f"[eval] {img_file.name} - RSS {mem_usage_mb():.1f} MB, GPU {gpu_mem_usage_mb(device):.1f} MB"
+        )
         all_ious.extend(ious)
         times.append(t)
     if not all_ious:
@@ -185,7 +199,7 @@ def main() -> None:
     viz_dir = cfg.get("viz_dir")
 
     ds_info: Dict[str, Dict[str, Any]] = {}
-    overlay_cache: Dict[str, Dict[str, Dict[str, Image.Image]]] = {}
+    overlay_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for ds in datasets:
         name = ds["name"]
         img_dir = Path(ds["image_dir"])
@@ -208,12 +222,17 @@ def main() -> None:
         for ds in datasets:
             ds_name = ds["name"]
             info = ds_info[ds_name]
+            tmp_dir = None
+            if viz_dir:
+                tmp_dir = Path(viz_dir) / "tmp" / ds_name / name
             miou, avg_t = evaluate_dataset(
                 amg,
                 info["image_dir"],
                 info["mask_dir"],
                 name,
                 overlay_cache[ds_name],
+                device,
+                tmp_dir,
             )
             result[f"{ds_name}_mIoU"] = f"{miou:.4f}"
             result[f"{ds_name}_time"] = f"{avg_t:.4f}"
@@ -244,6 +263,11 @@ def main() -> None:
                 for w in weights:
                     w_name = w.get("name") or Path(w["path"]).stem
                     ov = overlay_cache[ds_name].get(stem, {}).get(w_name)
+                    if isinstance(ov, str):
+                        try:
+                            ov = Image.open(ov)
+                        except FileNotFoundError:
+                            ov = None
                     if ov is not None:
                         overlays.append((w_name, ov))
                 if not overlays:
