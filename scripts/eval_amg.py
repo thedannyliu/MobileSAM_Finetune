@@ -15,8 +15,8 @@ The script reads a YAML config specifying checkpoints and datasets::
 Each mask directory contains subfolders named after the corresponding image
 file (without extension) and stores binary PNG masks.  For every checkpoint the
 script reports the mean IoU and average inference time for each dataset in the
-CSV file.  If ``viz_dir`` is provided, the script also saves a side-by-side
-visualisation of ``SamAutomaticMaskGenerator`` results for every image.
+CSV file.  If ``viz_dir`` is provided, the script saves predicted-mask overlays
+under ``viz_dir/<dataset>/<model>/`` for debugging.
 """
 
 from __future__ import annotations
@@ -153,7 +153,6 @@ def evaluate_dataset(
     image_dir: Path,
     mask_dir: Path,
     weight_name: str,
-    overlay_store: Dict[str, Dict[str, Any]],
     device: str,
     overlay_dir: Optional[Path] = None,
 ) -> tuple[float, float]:
@@ -167,12 +166,10 @@ def evaluate_dataset(
         if not gt_dir.is_dir():
             continue
         ious, t, overlay = evaluate_image(amg, img_file, gt_dir)
-        overlay_store.setdefault(img_file.stem, {})[weight_name] = overlay
         if overlay_dir is not None:
             overlay_dir.mkdir(parents=True, exist_ok=True)
-            out_path = overlay_dir / f"{img_file.stem}_{weight_name}.jpg"
+            out_path = overlay_dir / f"{img_file.stem}.jpg"
             overlay.save(out_path)
-            overlay_store[img_file.stem][weight_name] = str(out_path)
         print(
             f"[eval] {img_file.name} - RSS {mem_usage_mb():.1f} MB, GPU {gpu_mem_usage_mb(device):.1f} MB"
         )
@@ -199,7 +196,6 @@ def main() -> None:
     viz_dir = cfg.get("viz_dir")
 
     ds_info: Dict[str, Dict[str, Any]] = {}
-    overlay_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for ds in datasets:
         name = ds["name"]
         img_dir = Path(ds["image_dir"])
@@ -210,7 +206,6 @@ def main() -> None:
             if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
         }
         ds_info[name] = {"image_dir": img_dir, "mask_dir": mask_dir, "images": images}
-        overlay_cache[name] = {k: {} for k in images.keys()}
 
     rows = []
     for w in weights:
@@ -222,17 +217,16 @@ def main() -> None:
         for ds in datasets:
             ds_name = ds["name"]
             info = ds_info[ds_name]
-            tmp_dir = None
+            out_dir = None
             if viz_dir:
-                tmp_dir = Path(viz_dir) / "tmp" / ds_name / name
+                out_dir = Path(viz_dir) / ds_name / name
             miou, avg_t = evaluate_dataset(
                 amg,
                 info["image_dir"],
                 info["mask_dir"],
                 name,
-                overlay_cache[ds_name],
                 device,
-                tmp_dir,
+                out_dir,
             )
             result[f"{ds_name}_mIoU"] = f"{miou:.4f}"
             result[f"{ds_name}_time"] = f"{avg_t:.4f}"
@@ -250,34 +244,6 @@ def main() -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
-
-    if viz_dir:
-        viz_root = Path(viz_dir)
-        for ds in datasets:
-            ds_name = ds["name"]
-            ds_viz = viz_root / ds_name
-            ds_viz.mkdir(parents=True, exist_ok=True)
-            info = ds_info[ds_name]
-            for stem, img_path in info["images"].items():
-                overlays = []
-                for w in weights:
-                    w_name = w.get("name") or Path(w["path"]).stem
-                    ov = overlay_cache[ds_name].get(stem, {}).get(w_name)
-                    if isinstance(ov, str):
-                        try:
-                            ov = Image.open(ov)
-                        except FileNotFoundError:
-                            ov = None
-                    if ov is not None:
-                        overlays.append((w_name, ov))
-                if not overlays:
-                    continue
-                bgr = cv2.imread(str(img_path))
-                if bgr is None:
-                    continue
-                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                out_path = ds_viz / f"{stem}_seg_every.jpg"
-                save_collage(rgb, overlays, out_path)
 
 
 if __name__ == "__main__":
