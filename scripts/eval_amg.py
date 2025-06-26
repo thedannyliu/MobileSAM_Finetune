@@ -15,8 +15,8 @@ The script reads a YAML config specifying checkpoints and datasets::
 Each mask directory contains subfolders named after the corresponding image
 file (without extension) and stores binary PNG masks.  For every checkpoint the
 script reports the mean IoU and average inference time for each dataset in the
-CSV file.  If ``viz_dir`` is provided, the script also saves a side-by-side
-visualisation of ``SamAutomaticMaskGenerator`` results for every image.
+CSV file.  If ``viz_dir`` is provided, the script saves predicted-mask overlays
+under ``viz_dir/<dataset>/<model>/`` for debugging.
 """
 
 from __future__ import annotations
@@ -28,19 +28,28 @@ from mobile_sam import SamAutomaticMaskGenerator, sam_model_registry
 
 import argparse
 import csv
+import os
+import psutil
+import sys
 import time
-import resource
-from pathlib import Path
-from typing import Any, Dict, List
-
-from PIL import Image, ImageDraw, ImageFont
-from finetune_utils.visualization import generate_distinct_colors
 import yaml  # type: ignore
+from finetune_utils.visualization import generate_distinct_colors
+from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont
+from typing import Any, Dict, List, Optional
 
 
 def mem_usage_mb() -> float:
     """Return the current process RSS in megabytes."""
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    proc = psutil.Process(os.getpid())
+    return proc.memory_info().rss / (1024 * 1024)
+
+
+def gpu_mem_usage_mb(device: str) -> float:
+    """Return the current reserved GPU memory in megabytes."""
+    if torch.cuda.is_available() and device.startswith("cuda"):
+        return torch.cuda.memory_reserved(device) / (1024 * 1024)
+    return 0.0
 
 
 def build_model(model_type: str, checkpoint: str, device: str):
@@ -112,7 +121,7 @@ def save_collage(
 
 
 def evaluate_image(
-    amg, img_path: Path, mask_dir: Path
+    amg, img_path: Path, mask_dir: Path, device: str
 ) -> tuple[List[float], float, Image.Image]:
     """Return IoU scores, inference time, and overlay for ``img_path``."""
     bgr = cv2.imread(str(img_path))
@@ -121,9 +130,14 @@ def evaluate_image(
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     start = time.perf_counter()
+    gpu_before = gpu_mem_usage_mb(device)
     preds = amg.generate(rgb)
     elapsed = time.perf_counter() - start
+    print(
+        f"[generate] {img_path.name} - GPU before {gpu_before:.1f} MB, after {gpu_mem_usage_mb(device):.1f} MB"
+    )
     if not preds:
+        torch.cuda.empty_cache()
         return [], elapsed, Image.fromarray(rgb)
     pred_masks = torch.stack(
         [torch.from_numpy(p["segmentation"]).float() for p in preds]
@@ -141,6 +155,7 @@ def evaluate_image(
     overlay = overlay_masks(rgb, pred_masks)
 
     max_iou, _ = iou_mat.max(dim=1)
+    torch.cuda.empty_cache()
     return max_iou.cpu().tolist(), elapsed, overlay
 
 
@@ -149,7 +164,8 @@ def evaluate_dataset(
     image_dir: Path,
     mask_dir: Path,
     weight_name: str,
-    overlay_store: Dict[str, Dict[str, Image.Image]],
+    device: str,
+    overlay_dir: Optional[Path] = None,
 ) -> tuple[float, float]:
     """Return mean IoU and average inference time over all images in a dataset."""
     all_ious: List[float] = []
@@ -160,8 +176,15 @@ def evaluate_dataset(
         gt_dir = mask_dir / img_file.stem
         if not gt_dir.is_dir():
             continue
-        ious, t, overlay = evaluate_image(amg, img_file, gt_dir)
-        overlay_store.setdefault(img_file.stem, {})[weight_name] = overlay
+        ious, t, overlay = evaluate_image(amg, img_file, gt_dir, device)
+        if overlay_dir is not None:
+            overlay_dir.mkdir(parents=True, exist_ok=True)
+            out_path = overlay_dir / f"{img_file.stem}.jpg"
+            overlay.save(out_path)
+        print(
+            f"[eval] {img_file.name} - RSS {mem_usage_mb():.1f} MB, GPU {gpu_mem_usage_mb(device):.1f} MB"
+        )
+        sys.stdout.flush()
         all_ious.extend(ious)
         times.append(t)
     if not all_ious:
@@ -185,7 +208,6 @@ def main() -> None:
     viz_dir = cfg.get("viz_dir")
 
     ds_info: Dict[str, Dict[str, Any]] = {}
-    overlay_cache: Dict[str, Dict[str, Dict[str, Image.Image]]] = {}
     for ds in datasets:
         name = ds["name"]
         img_dir = Path(ds["image_dir"])
@@ -196,7 +218,6 @@ def main() -> None:
             if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
         }
         ds_info[name] = {"image_dir": img_dir, "mask_dir": mask_dir, "images": images}
-        overlay_cache[name] = {k: {} for k in images.keys()}
 
     rows = []
     for w in weights:
@@ -208,12 +229,16 @@ def main() -> None:
         for ds in datasets:
             ds_name = ds["name"]
             info = ds_info[ds_name]
+            out_dir = None
+            if viz_dir:
+                out_dir = Path(viz_dir) / ds_name / name
             miou, avg_t = evaluate_dataset(
                 amg,
                 info["image_dir"],
                 info["mask_dir"],
                 name,
-                overlay_cache[ds_name],
+                device,
+                out_dir,
             )
             result[f"{ds_name}_mIoU"] = f"{miou:.4f}"
             result[f"{ds_name}_time"] = f"{avg_t:.4f}"
@@ -231,29 +256,6 @@ def main() -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
-
-    if viz_dir:
-        viz_root = Path(viz_dir)
-        for ds in datasets:
-            ds_name = ds["name"]
-            ds_viz = viz_root / ds_name
-            ds_viz.mkdir(parents=True, exist_ok=True)
-            info = ds_info[ds_name]
-            for stem, img_path in info["images"].items():
-                overlays = []
-                for w in weights:
-                    w_name = w.get("name") or Path(w["path"]).stem
-                    ov = overlay_cache[ds_name].get(stem, {}).get(w_name)
-                    if ov is not None:
-                        overlays.append((w_name, ov))
-                if not overlays:
-                    continue
-                bgr = cv2.imread(str(img_path))
-                if bgr is None:
-                    continue
-                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                out_path = ds_viz / f"{stem}_seg_every.jpg"
-                save_collage(rgb, overlays, out_path)
 
 
 if __name__ == "__main__":
