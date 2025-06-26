@@ -28,6 +28,7 @@ from mobile_sam import SamAutomaticMaskGenerator, sam_model_registry
 
 import argparse
 import csv
+import gc
 import os
 import psutil
 import sys
@@ -156,6 +157,9 @@ def evaluate_image(
 
     max_iou, _ = iou_mat.max(dim=1)
     torch.cuda.empty_cache()
+    # Explicitly drop intermediate tensors to release memory
+    del preds, pred_masks, gt_masks, gt_bin, pred_bin, inter, union, iou_mat
+    gc.collect()
     return max_iou.cpu().tolist(), elapsed, overlay
 
 
@@ -181,14 +185,19 @@ def evaluate_dataset(
             overlay_dir.mkdir(parents=True, exist_ok=True)
             out_path = overlay_dir / f"{img_file.stem}.jpg"
             overlay.save(out_path)
+        overlay.close()
+        del overlay
         print(
             f"[eval] {img_file.name} - RSS {mem_usage_mb():.1f} MB, GPU {gpu_mem_usage_mb(device):.1f} MB"
         )
         sys.stdout.flush()
+        gc.collect()
         all_ious.extend(ious)
         times.append(t)
     if not all_ious:
         return 0.0, float("nan")
+    torch.cuda.empty_cache()
+    gc.collect()
     return float(np.mean(all_ious)), float(np.mean(times))
 
 
