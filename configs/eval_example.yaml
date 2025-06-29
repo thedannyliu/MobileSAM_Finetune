@@ -8,5 +8,5 @@ weights:
     path: logs/best_student.pth
 datasets:
   - name: val
-    image_dir: datasets/val/image
-    mask_dir: datasets/val/mask
+    image_dir: dataset-1/val/image
+    mask_dir: dataset-1/val/mask

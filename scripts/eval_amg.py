@@ -20,6 +20,7 @@ visualisation of ``SamAutomaticMaskGenerator`` results for every image.
 """
 
 from __future__ import annotations
+import gc
 import numpy as np
 import cv2  # type: ignore
 import torch
@@ -31,11 +32,13 @@ import csv
 import time
 import resource
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from PIL import Image, ImageDraw, ImageFont
 from finetune_utils.visualization import generate_distinct_colors
 import yaml  # type: ignore
+
+torch.backends.cudnn.benchmark = False  # 避免 cudnn 大量快取佔用
 
 
 def mem_usage_mb() -> float:
@@ -112,8 +115,11 @@ def save_collage(
 
 
 def evaluate_image(
-    amg, img_path: Path, mask_dir: Path
-) -> tuple[List[float], float, Image.Image]:
+    amg,
+    img_path: Path,
+    mask_dir: Path,
+    want_overlay: bool = True,
+) -> tuple[List[float], float, Optional[Image.Image]]:
     """Return IoU scores, inference time, and overlay for ``img_path``."""
     bgr = cv2.imread(str(img_path))
     if bgr is None:
@@ -124,24 +130,30 @@ def evaluate_image(
     preds = amg.generate(rgb)
     elapsed = time.perf_counter() - start
     if not preds:
-        return [], elapsed, Image.fromarray(rgb)
+        return [], elapsed, None
     pred_masks = torch.stack(
         [torch.from_numpy(p["segmentation"]).float() for p in preds]
     )  # [N, H, W]
 
     gt_masks = load_gt_masks(mask_dir)  # [K, H, W]
 
-    gt_bin = gt_masks.unsqueeze(1)
-    pred_bin = pred_masks.unsqueeze(1)
+    # 記憶體友善版 IoU：逐一匹配，避免 KxNxHxW 廣播
+    ious: List[float] = []
+    for gt in gt_masks:  # K
+        best = 0.0
+        for pred in pred_masks:  # N
+            inter = torch.logical_and(gt, pred).sum().item()
+            union = torch.logical_or(gt, pred).sum().item()
+            iou = inter / (union + 1e-6)
+            if iou > best:
+                best = iou
+        ious.append(best)
 
-    inter = (gt_bin.unsqueeze(1) * pred_bin.unsqueeze(0)).sum((-2, -1))
-    union = gt_bin.unsqueeze(1).sum((-2, -1)) + pred_bin.unsqueeze(0).sum((-2, -1)) - inter
-    iou_mat = inter / (union + 1e-6)
+    overlay: Optional[Image.Image] = None
+    if want_overlay:
+        overlay = overlay_masks(rgb, pred_masks)
 
-    overlay = overlay_masks(rgb, pred_masks)
-
-    max_iou, _ = iou_mat.max(dim=1)
-    return max_iou.cpu().tolist(), elapsed, overlay
+    return ious, elapsed, overlay
 
 
 def evaluate_dataset(
@@ -149,7 +161,8 @@ def evaluate_dataset(
     image_dir: Path,
     mask_dir: Path,
     weight_name: str,
-    overlay_store: Dict[str, Dict[str, Image.Image]],
+    overlay_store: Optional[Dict[str, Dict[str, Image.Image]]],
+    viz_set: Optional[set[str]],
 ) -> tuple[float, float]:
     """Return mean IoU and average inference time over all images in a dataset."""
     all_ious: List[float] = []
@@ -160,8 +173,10 @@ def evaluate_dataset(
         gt_dir = mask_dir / img_file.stem
         if not gt_dir.is_dir():
             continue
-        ious, t, overlay = evaluate_image(amg, img_file, gt_dir)
-        overlay_store.setdefault(img_file.stem, {})[weight_name] = overlay
+        want_overlay = overlay_store is not None and viz_set is not None and img_file.stem in viz_set
+        ious, t, overlay = evaluate_image(amg, img_file, gt_dir, want_overlay=want_overlay)
+        if want_overlay and overlay is not None:
+            overlay_store.setdefault(img_file.stem, {})[weight_name] = overlay
         all_ious.extend(ious)
         times.append(t)
     if not all_ious:
@@ -183,9 +198,11 @@ def main() -> None:
     datasets = cfg.get("datasets", [])
     csv_path = Path(cfg.get("output_csv", "eval_results.csv"))
     viz_dir = cfg.get("viz_dir")
+    max_viz: int = int(cfg.get("max_viz", 20)) if viz_dir else 0  # 若無視覺化則不快取
 
     ds_info: Dict[str, Dict[str, Any]] = {}
     overlay_cache: Dict[str, Dict[str, Dict[str, Image.Image]]] = {}
+    viz_sets: Dict[str, set[str]] = {}
     for ds in datasets:
         name = ds["name"]
         img_dir = Path(ds["image_dir"])
@@ -196,7 +213,10 @@ def main() -> None:
             if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
         }
         ds_info[name] = {"image_dir": img_dir, "mask_dir": mask_dir, "images": images}
-        overlay_cache[name] = {k: {} for k in images.keys()}
+        # 決定要保留可視化的影像 id
+        chosen_stems = list(images.keys())[:max_viz]
+        viz_sets[name] = set(chosen_stems)
+        overlay_cache[name] = {k: {} for k in chosen_stems}
 
     rows = []
     for w in weights:
@@ -213,11 +233,17 @@ def main() -> None:
                 info["image_dir"],
                 info["mask_dir"],
                 name,
-                overlay_cache[ds_name],
+                overlay_cache.get(ds_name) if max_viz > 0 else None,
+                viz_sets.get(ds_name) if max_viz > 0 else None,
             )
             result[f"{ds_name}_mIoU"] = f"{miou:.4f}"
             result[f"{ds_name}_time"] = f"{avg_t:.4f}"
         rows.append(result)
+
+        # 釋放 GPU／RAM
+        del amg, sam
+        torch.cuda.empty_cache()
+        gc.collect()
 
     fieldnames = ["name"]
     for ds in datasets:

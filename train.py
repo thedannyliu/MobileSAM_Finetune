@@ -384,6 +384,7 @@ def main():
     soft_loss_type = (mask_teacher_cfg.get("soft_loss", {}) or {}).get("type", "l2").lower()
     soft_loss_weight = (mask_teacher_cfg.get("soft_loss", {}) or {}).get("weight", 1.0)
     mask_teacher_iou_thr = mask_teacher_cfg.get("iou_threshold", 0.3)
+    gt_override_enable = mask_teacher_cfg.get("gt_override", False)
     if dataset_mode == "everything" and mask_teacher_enable and mask_teacher_method in ("replace_gt", "dual_supervision"):
         t_type = mask_teacher_cfg.get("teacher_type", "vit_h").lower()
         t_ckpt = mask_teacher_cfg.get("checkpoint_path")
@@ -725,11 +726,58 @@ def main():
                         preds = pred_lowres_all[bi].reshape(-1, original_gt.shape[-2], original_gt.shape[-1])
                         ious_pred = pred_ious_all[bi].reshape(-1)
 
-                        if mask_teacher_enable and mask_teacher_method == "replace_gt" and teacher_lowres_all[bi] is not None:
+                        if (
+                            mask_teacher_enable
+                            and mask_teacher_method == "replace_gt"
+                            and teacher_lowres_all[bi] is not None
+                            and gt_override_enable
+                        ):
+                            # ─────────────────── Hybrid teacher / GT supervision ───────────────────
+                            # 1) 以 teacher soft mask 為預設目標。
+                            # 2) 若某一個 teacher mask 與任一個 GT mask IoU 超過門檻，則以該 GT mask 取代。
+                            #    這同時確保該點確實落在對應 GT 物件，並保持 teacher 與 GT 一致。
                             teacher_pred_flat = teacher_lowres_all[bi].reshape(-1, original_gt.shape[-2], original_gt.shape[-1]).detach()
-                            teacher_soft = torch.sigmoid(teacher_pred_flat)  # values in [0,1]
-                            gt = teacher_soft.unsqueeze(1)  # [K,1,S,S]
-                            gt_flat = teacher_soft  # [K,S,S]
+
+                            teacher_soft = torch.sigmoid(teacher_pred_flat)  # [K,S,S] in [0,1]
+
+                            # 將 ground-truth 轉成 binary，準備計算 IoU
+                            gt_bin_all = original_gt.squeeze(1)  # [G,S,S]
+
+                            # 預先將 teacher_soft 二值化供 IoU 計算
+                            teacher_bin = (teacher_soft > 0.5).float()
+
+                            # 建立最終參考 masks（先複製 teacher，之後條件式覆寫）
+                            ref_masks = teacher_soft.clone()  # float in [0,1], [K,S,S]
+
+                            # 計算 IoU matrix  (K x G)
+                            inter_tg = (teacher_bin.unsqueeze(1) * gt_bin_all.unsqueeze(0)).sum((-2, -1))
+                            union_tg = (
+                                teacher_bin.unsqueeze(1).sum((-2, -1))
+                                + gt_bin_all.unsqueeze(0).sum((-2, -1))
+                                - inter_tg
+                            )
+                            iou_mat_tg = inter_tg / (union_tg + 1e-6)  # [K,G]
+
+                            # 逐個 teacher mask 檢查最佳 IoU，若超過門檻則用對應 GT 取代
+                            for t_idx in range(iou_mat_tg.shape[0]):
+                                best_iou_val, best_gt_idx = torch.max(iou_mat_tg[t_idx], dim=0)
+                                if best_iou_val.item() >= mask_teacher_iou_thr:
+                                    ref_masks[t_idx] = gt_bin_all[best_gt_idx]
+
+                            # 使用 ref_masks 作為 supervision 目標
+                            gt = ref_masks.unsqueeze(1)  # [K,1,S,S]
+                            gt_flat = ref_masks  # [K,S,S]
+                        elif (
+                            mask_teacher_enable
+                            and mask_teacher_method == "replace_gt"
+                            and teacher_lowres_all[bi] is not None
+                            and not gt_override_enable
+                        ):
+                            # 原始 replace_gt：完全採用 Teacher 之遮罩 (soft label)
+                            teacher_pred_flat = teacher_lowres_all[bi].reshape(-1, original_gt.shape[-2], original_gt.shape[-1]).detach()
+                            teacher_soft = torch.sigmoid(teacher_pred_flat)
+                            gt = teacher_soft.unsqueeze(1)
+                            gt_flat = teacher_soft
                         else:
                             gt = original_gt
                             gt_flat = gt.squeeze(1)

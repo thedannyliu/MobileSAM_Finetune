@@ -105,6 +105,7 @@
     "method": "dual_supervision",
     "teacher_type": "vit_h",
     "checkpoint_path": "weights/sam_vit_h_4b8939.pth",
-    "iou_threshold": 0.3
+    "iou_threshold": 0.5,
+    "gt_override": true
   }
 }
