@@ -35,9 +35,10 @@ objects within an image simultaneously.
   - For unmatched ground truth masks the candidate with highest IoU is also used
     for supervision.  Hungarian assignment is used in both training and validation
     to pair predictions and ground truths one-to-one.
-  - Knowledge distillation is supported.  Teacher features must be extracted
-    with the same grid prompts using `scripts/extract_teacher_features.py --mode everything --grid_points <step>`.
-    Encoder, decoder, attention and RKD losses can all be enabled.
+  - 支援與單物件模式相同的 **蒸餾 (distillation)**。
+    * 預設啟用 `encoder_patch`、`prompt_embed`、`decoder_mask_token` 三項；
+    * `dense_mask_logits` 預設關閉，若啟用則會在訓練列印 `dense=` 損失值，否則維持 0。
+    * 修改 `configs/mobileSAM_se.json → distillation` 可自由開關。
   - Validation visualisations show the matched masks and the grid points for reference.
 
 ## Usage

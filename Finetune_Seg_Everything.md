@@ -59,3 +59,33 @@ All model components are trained from the beginning (no frozen layers).  The con
 
 Training requires substantial GPU memory because thousands of candidate masks may be generated per image.  Increase `grid_points`, reduce the image size, or lower the prediction batch size in `predict_from_grid` if out-of-memory errors occur.
 
+## Distillation (Optional)
+
+The segment-everything pipeline現在與一般 MobileSAM 訓練共用相同蒸餾框架，支援四種子模組：
+
+| 子模組 | config key | 說明 |
+| ------- | ---------- | ---- |
+| Encoder patch tokens | `encoder_patch` | 比對 image encoder 之 patch embeddings |
+| Prompt-conditioned embeddings | `prompt_embed` | 比對 decoder transformer 中 prompt-aware features |
+| Mask token logits | `decoder_mask_token` | 比對 decoder mask token 的 logits (KL) |
+| Dense mask logits | `dense_mask_logits` | 於 **單遮罩** 與 **segment-everything** 皆可用，將學生選出之最佳 low-res logits 與教師對應 logits 作 KL+Focal 對齊 |
+
+預設我們已在 `configs/mobileSAM_se.json` 開啟前三項，並將 `dense_mask_logits.enable` 設為 `false`，因此訓練日誌中的 `dense=0.000` 代表此蒸餾項目被關閉。欲啟用時，將 JSON 改為：
+```json
+"dense_mask_logits": { "enable": true, "w_kl": 0.6, "w_focal": 0.4, "gamma": 2.0 }
+```
+
+完整範例：
+```json
+"distillation": {
+  "enable": true,
+  "lambda_coef": 1.0,
+  "encoder_patch":      { "enable": true,  "w_l2": 1.0, "w_cos": 1.0 },
+  "prompt_embed":       { "enable": true,  "w_mse": 0.7, "w_cos": 0.3 },
+  "decoder_mask_token": { "enable": true,  "w_kl": 1.0, "temperature": 0.5 },
+  "dense_mask_logits":  { "enable": true,  "w_kl": 0.6, "w_focal": 0.4, "gamma": 2.0 }
+}
+```
+
+> `dense_mask_logits` 會略增記憶體與運算，若 GPU 緊張可關閉 (保持 0)。
+

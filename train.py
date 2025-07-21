@@ -701,6 +701,70 @@ def main():
                             in_sz_tuple,
                             multimask_output=multimask_output_cfg,
                         )
+                        # ---------------- Distillation (segment-everything) ----------------
+                        if use_distillation:
+                            feat_student = pop_features()
+
+                            # Lazily initialise per-step distillation loss if first time here
+                            # (they were set to 0 earlier already)
+
+                            teacher_lowres_per_teacher = []  # store low-res logits
+                            teacher_iou_per_teacher = []
+
+                            for t_idx, t in enumerate(teacher_models):
+                                # Teacher forward with hooks
+                                with torch.no_grad():
+                                    _pm_t, _pi_t, _lo_t = predict_from_grid(
+                                        t["model"],
+                                        imgs[bi],
+                                        point_coords[bi].to(dev),
+                                        raw_sz_tuple,
+                                        in_sz_tuple,
+                                        multimask_output=multimask_output_cfg,
+                                    )
+                                feat_t = pop_features()
+                                teacher_lowres_per_teacher.append(_lo_t.detach())
+                                teacher_iou_per_teacher.append(_pi_t.detach())
+
+                                w_t = t["weight"]
+
+                                # 1. Encoder patch tokens
+                                if dist_cfg.get("encoder_patch", {}).get("enable"):
+                                    l_s = pot["enc_patch"][0]
+                                    l_t = teacher_pots[t["name"]]["enc_patch"][0]
+                                    enc_cfg = dist_cfg["encoder_patch"]
+                                    enc_loss_val = enc_loss_val + w_t * encoder_patch_loss(
+                                        feat_student[l_s][0],
+                                        feat_t[l_t][0],
+                                        w_l2=enc_cfg.get("w_l2", 1.0),
+                                        w_cos=enc_cfg.get("w_cos", 1.0),
+                                    )
+
+                                # 2. Prompt-conditioned embeddings
+                                if dist_cfg.get("prompt_embed", {}).get("enable"):
+                                    l_s = pot["prompt_embed"][0]
+                                    l_t = teacher_pots[t["name"]]["prompt_embed"][0]
+                                    pe_cfg = dist_cfg["prompt_embed"]
+                                    prompt_loss_val = prompt_loss_val + w_t * prompt_embed_loss(
+                                        feat_student[l_s][0],
+                                        feat_t[l_t][0],
+                                        w_mse=pe_cfg.get("w_mse", 0.7),
+                                        w_cos=pe_cfg.get("w_cos", 0.3),
+                                    )
+
+                                # 3. Mask token logits
+                                if dist_cfg.get("decoder_mask_token", {}).get("enable"):
+                                    l_s = pot["mask_token"][0]
+                                    l_t = teacher_pots[t["name"]]["mask_token"][0]
+                                    tok_cfg = dist_cfg["decoder_mask_token"]
+                                    tok_s = feat_student[l_s][0][:, 1 : 1 + student.mask_decoder.num_mask_tokens, :]
+                                    tok_t = feat_t[l_t][0][:, 1 : 1 + student.mask_decoder.num_mask_tokens, :]
+                                    tok_loss_val = tok_loss_val + w_t * mask_token_loss(
+                                        tok_s,
+                                        tok_t,
+                                        w_kl=tok_cfg.get("w_kl", 1.0),
+                                        temperature=tok_cfg.get("temperature", 0.5),
+                                    )
                         pred_lowres_all.append(lo)
                         pred_ious_all.append(pi)
 
@@ -837,6 +901,24 @@ def main():
                             dice_loss = dice_loss + (1 - (num / (den + 1e-6)).mean())
                             iou_loss = iou_loss + F.mse_loss(torch.sigmoid(ious_pred[r]), iou_mat[r, c])
 
+                            # -------- dense mask logits distillation (segment-everything) --------
+                            if dist_cfg.get("dense_mask_logits", {}).get("enable"):
+                                dl_cfg = dist_cfg["dense_mask_logits"]
+                                stu_logit = preds[r].unsqueeze(0)  # 1xHlowxWlow
+
+                                for t_idx_iter, t_iter in enumerate(teacher_models):
+                                    t_lo_tensor = teacher_lowres_per_teacher[t_idx_iter][r].unsqueeze(0)
+                                    w_tt = t_iter["weight"]
+                                    _d_loss = dense_mask_logits_loss(
+                                        stu_logit,
+                                        t_lo_tensor,
+                                        w_kl=dl_cfg.get("w_kl", 0.6),
+                                        w_focal=dl_cfg.get("w_focal", 0.4),
+                                        gamma=dl_cfg.get("gamma", 2.0),
+                                    )
+                                    spatial_norm = stu_logit.shape[-2] * stu_logit.shape[-1]
+                                    dense_loss_val = dense_loss_val + w_tt * (_d_loss / spatial_norm)
+
                         # ---------- soft label supervision (teacher vs student logits) ----------
                         if mask_teacher_enable and mask_teacher_method == "dual_supervision" and teacher_lowres_all[bi] is not None:
                             teacher_pred_flat = teacher_lowres_all[bi].reshape(-1, preds.shape[-2], preds.shape[-1]).detach()
@@ -874,6 +956,11 @@ def main():
                     if mask_teacher_enable and mask_teacher_method == "dual_supervision":
                         task_loss = task_loss + soft_loss_weight * soft_loss_val
 
+                    dist_loss = enc_loss_val + prompt_loss_val + tok_loss_val + dense_loss_val
+
+                    # Normalize dense logits loss by matched mask count to avoid explosion
+                    if dist_cfg.get("dense_mask_logits", {}).get("enable") and n_matched > 0:
+                        dense_loss_val = dense_loss_val / n_matched
                     dist_loss = enc_loss_val + prompt_loss_val + tok_loss_val + dense_loss_val
 
                     # 針對 single-prompt 模式需在此計算總 loss，
@@ -915,27 +1002,28 @@ def main():
                 iou_c = w_iou * iou_loss.item() / ga
                 cls_c = w_cls * cls_loss_val.item() / norm / ga
                 enc_c = lambda_coef * enc_loss_val.item() / ga
-                pe_c = lambda_coef * prompt_loss_val.item() / ga
+                pe_c  = lambda_coef * prompt_loss_val.item() / ga
                 tok_c = lambda_coef * tok_loss_val.item() / ga
                 dense_c = lambda_coef * dense_loss_val.item() / ga
-                soft_c = soft_loss_weight * soft_loss_val.item() / ga if mask_teacher_enable and mask_teacher_method == "dual_supervision" else 0.0
+
+                soft_c = (
+                    soft_loss_weight * soft_loss_val.item() / ga
+                    if mask_teacher_enable and mask_teacher_method == "dual_supervision"
+                    else 0.0
+                )
+
+                # dist_c 直接採用 lambda_coef·dist_loss，供檢查；不再重複加 sub-components
                 dist_c = lambda_coef * dist_loss.item() / ga
 
-                total_c = bce_c + focal_c + dice_c + cls_c + iou_c + dist_c + soft_c
+                total_c = (
+                    bce_c + focal_c + dice_c + cls_c + iou_c + enc_c + pe_c + tok_c + dense_c + soft_c
+                )
 
                 pbar.set_postfix(
-                    bce=f"{bce_c:.3f}",
-                    focal=f"{focal_c:.3f}",
-                    dice=f"{dice_c:.3f}",
-                    iou=f"{iou_c:.3f}",
-                    cls=f"{cls_c:.3f}",
-                    enc=f"{enc_c:.3f}",
-                    pe=f"{pe_c:.3f}",
-                    tok=f"{tok_c:.3f}",
-                    dense=f"{dense_c:.3f}",
-                    soft=f"{soft_c:.3f}",
-                    dist=f"{dist_c:.3f}",
-                    total=f"{total_c:.3f}",
+                    bce=f"{bce_c:.3f}", focal=f"{focal_c:.3f}", dice=f"{dice_c:.3f}",
+                    iou=f"{iou_c:.3f}", cls=f"{cls_c:.3f}",
+                    enc=f"{enc_c:.3f}", pe=f"{pe_c:.3f}", tok=f"{tok_c:.3f}", dense=f"{dense_c:.3f}",
+                    soft=f"{soft_c:.3f}", dist=f"{dist_c:.3f}", total=f"{total_c:.3f}",
                     lr=f"{scheduler.get_last_lr()[0]:.2e}",
                 )
 

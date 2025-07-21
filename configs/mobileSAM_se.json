@@ -49,43 +49,14 @@
     "unfreeze_epoch": 0
   },
   "distillation": {
-    "enable": false,
-    "lambda_coef": 1.0,
+    "enable": true,
     "use_precomputed_features": false,
     "precomputed_root": "precomputed",
-    "encoder_matching": {
-      "enable": true,
-      "lambda_mse": 1.0,
-      "lambda_kl": 1.0,
-      "weight": 1.0,
-      "temperature": 2.0
-    },
-    "decoder_matching": {
-      "enable": true,
-      "lambda_mse": 1.0,
-      "lambda_cos": 1.0,
-      "lambda_kl": 1.0,
-      "weight": 1.0,
-      "temperature": 2.0
-    },
-    "attention_matching": {
-      "enable": true,
-      "lambda": 1.0,
-      "weight": 1.0,
-      "temperature": 0.5
-    },
-    "relational_KD": {
-      "enable": true,
-      "lambda": 1.0,
-      "weight": 1.0,
-      "dist_factor": 1.0,
-      "angle_factor": 2.0
-    },
-    "dynamic_lambda": {
-      "enable_plateau_scheduler": true,
-      "patience": 5,
-      "factor": 0.5
-    }
+    "lambda_coef": 1.0,
+    "encoder_patch":      { "enable": true,  "w_l2": 1.0, "w_cos": 1.0 },
+    "prompt_embed":       { "enable": true,  "w_mse": 0.7, "w_cos": 0.3 },
+    "decoder_mask_token": { "enable": true,  "w_kl": 1.0, "temperature": 0.5 },
+    "dense_mask_logits":  { "enable": true,  "w_kl": 0.6, "w_focal": 0.4, "gamma": 2.0 }
   },
   "teachers": [
     {
