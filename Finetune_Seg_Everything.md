@@ -21,7 +21,13 @@ dataset/
 ## Training Strategy
 
 1. **SegmentEverythingDataset** — loads all masks of an image and the grid prompts.
-2. **Prediction** — for every grid point the model predicts three candidate masks (`multimask_output=True`).
+2. **Prediction** — for every grid point the model predicts masks from the decoder.  
+   • 預設會產生 **3 個候選遮罩** (`model.multimask_output: true`)；  
+   • 若在 `configs/*.json` 的 `model` 區段加入
+     ```json
+     "multimask_output": false
+     ```
+     就會改為 **僅輸出 1 個遮罩** (最左側的 mask token)，可減少記憶體與運算量。
 3. **Matching** — the IoU of each candidate against every ground-truth mask is computed and a Hungarian assignment selects the best one-to-one pairs.  Assigned pairs with IoU ≥ `0.5` are treated as foreground while the rest are background.
 4. **Loss**
    - Masks are downsampled to 256×256 so that loss is computed directly on the decoder's low resolution logits.

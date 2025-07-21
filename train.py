@@ -118,7 +118,7 @@ def _parse_hw(x):
     return (int(x[0]), int(x[1])) if isinstance(x, torch.Tensor) else tuple(map(int, x))
 
 
-def predict_from_grid(model, image, points, orig_size, input_size, batch_size=64):
+def predict_from_grid(model, image, points, orig_size, input_size, batch_size=64, multimask_output=True):
     """Run the SAM model on a grid of points and return masks and IoU preds.
     input_size: (H_resized, W_resized) before padding, used to correctly crop padding.
     """
@@ -143,7 +143,7 @@ def predict_from_grid(model, image, points, orig_size, input_size, batch_size=64
             image_pe=dense_pe,
             sparse_prompt_embeddings=sparse,
             dense_prompt_embeddings=dense,
-            multimask_output=True,
+            multimask_output=multimask_output,
         )
         masks = model.postprocess_masks(low_res, input_size, orig_size).squeeze(0)
         all_masks.append(masks)
@@ -159,6 +159,12 @@ def main():
 
     cfg = json.load(open(args.config))
     dev = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # ─────────────────── Multimask setting ───────────────────
+    # Allow users to control whether the mask decoder returns multiple masks
+    # via `model.multimask_output` in the JSON config. Defaults to True for
+    # backward-compatibility.
+    multimask_output_cfg = cfg.get("model", {}).get("multimask_output", True)
 
     if "lr" not in cfg["train"]:
         cfg["train"]["lr"] = 5e-5
@@ -513,7 +519,7 @@ def main():
                     with autocast(
                         dtype=torch.bfloat16 if tr_cfg.get("bf16", False) else torch.float16
                     ):
-                        out = student(batched_input=batched_input, multimask_output=True)
+                        out = student(batched_input=batched_input, multimask_output=multimask_output_cfg)
 
                         # ---------------- Distillation Forward ----------------
                         if use_distillation:
@@ -523,7 +529,7 @@ def main():
                             teacher_feats = []  # 儲存 hooks 擷取的特徵 (list[dict])
                             for t in teacher_models:
                                 with torch.no_grad():
-                                    _out_t = t["model"](batched_input=batched_input, multimask_output=True)
+                                    _out_t = t["model"](batched_input=batched_input, multimask_output=multimask_output_cfg)
                                 teacher_outs.append(_out_t)
                                 teacher_feats.append(pop_features())
 
@@ -693,6 +699,7 @@ def main():
                             point_coords[bi].to(dev),
                             raw_sz_tuple,
                             in_sz_tuple,
+                            multimask_output=multimask_output_cfg,
                         )
                         pred_lowres_all.append(lo)
                         pred_ious_all.append(pi)
@@ -706,6 +713,7 @@ def main():
                                     point_coords[bi].to(dev),
                                     raw_sz_tuple,
                                     in_sz_tuple,
+                                    multimask_output=multimask_output_cfg,
                                 )
                             teacher_lowres_all.append(lo_t)
                         else:
@@ -986,7 +994,7 @@ def main():
                                         int(vb["input_size"][i][1]),
                                     )
                                 vinp.append(entry)
-                            vo = student(batched_input=vinp, multimask_output=True)
+                            vo = student(batched_input=vinp, multimask_output=multimask_output_cfg)
 
                             for i in range(len(imgs)):
                                 out_i = vo[i]
@@ -1083,6 +1091,7 @@ def main():
                                     point_coords[i].to(dev),
                                     raw_sz_tuple,
                                     in_sz_tuple,
+                                    multimask_output=multimask_output_cfg,
                                 )
 
                                 preds = pm  # already BxHxW, where B = num prompts * 3

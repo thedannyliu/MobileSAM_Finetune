@@ -25,7 +25,7 @@ objects within an image simultaneously.
 - When `dataset.mode` in the config is set to `"everything"` the training script
   switches to this dataset and calls a custom prediction routine that evaluates a
   batch of grid prompts for every image.
-  - Each grid point produces three candidate masks (`multimask_output=True`).  For
+  - Each grid point produces candidate masks. 預設會輸出 **3 個遮罩** (`model.multimask_output: true`)；如需單一遮罩可在 `config` 的 `model` 區段加入 `"multimask_output": false`。  For
     every candidate the IoU with each ground truth mask is computed.  A Hungarian
     assignment selects the best pairs and those with IoU ≥ 0.5 are considered foreground,
     the rest are background.  This ensures every ground truth is matched to at most one
