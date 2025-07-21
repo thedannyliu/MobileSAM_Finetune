@@ -1015,9 +1015,8 @@ def main():
                 # dist_c 直接採用 lambda_coef·dist_loss，供檢查；不再重複加 sub-components
                 dist_c = lambda_coef * dist_loss.item() / ga
 
-                total_c = (
-                    bce_c + focal_c + dice_c + cls_c + iou_c + enc_c + pe_c + tok_c + dense_c + soft_c
-                )
+                # 直接顯示實際 backward 的 loss，避免顯示與真實梯度不一致
+                total_c = loss.item()
 
                 pbar.set_postfix(
                     bce=f"{bce_c:.3f}", focal=f"{focal_c:.3f}", dice=f"{dice_c:.3f}",
