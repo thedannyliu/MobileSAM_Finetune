@@ -36,6 +36,7 @@ T.Compose([
     * [Training Script](#training-script)
     * [Loss Functions](#loss-functions)
     * [Optimizer and Scheduler](#optimizer-and-scheduler)
+    * [Multi-Stage Training (stage_schedule)](#multi-stage-training-stage_schedule)
 5.  [Installation](#installation)
 6.  [Usage](#usage)
     * [Finetuning](#finetuning-1)
@@ -205,6 +206,19 @@ If knowledge distillation is enabled (`use_distill: true` in config):
     * This loss aims to make the student model's intermediate features mimic those of a larger, more powerful teacher model.
     * It typically uses Mean Squared Error (MSE) or L1 loss between the student's and teacher's feature maps at specified layers of their respective image encoders.
     * The teacher model's features for the training dataset are pre-extracted using `scripts/extract_teacher_features.py` and saved to disk. These are then loaded by the `SAMDataset` during finetuning.
+
+### Multi-Stage Training (`stage_schedule`)
+
+> **New in v2025-07-21** — You can now define an arbitrary sequence of training stages (e.g. **distill-only → finetune-only**, or the reverse) **in a single run**.  Add a top-level array `"stage_schedule"` to your JSON config where each item specifies:
+
+* `start_epoch`, `end_epoch` — epoch range (inclusive / exclusive)
+* `distillation` — whether teacher-student objectives are active
+* `lambda_coef` — global weighting for the sum of distill losses
+* `loss_weights` — per-stage overrides for BCE / Focal / Dice / IoU / cls
+
+At the beginning of every epoch `train.py` checks the current stage and **dynamically overrides** the above flags and weights — no need to restart training.
+
+Quick examples and full schema are in **[`docs/stage_schedule.md`](docs/stage_schedule.md)**.
 
 ### Optimizer and Scheduler
 

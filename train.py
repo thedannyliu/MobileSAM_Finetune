@@ -278,7 +278,14 @@ def main():
         student.mask_decoder.requires_grad_(False)
 
     dist_cfg = cfg.get("distillation", {})
-    use_distillation = dist_cfg.get("enable", False)
+    # The base flag from config decides default behaviour. However, if any
+    # stage in `stage_schedule` explicitly enables distillation, we must still
+    # prepare teacher models & hooks even when the base flag is False.
+    any_stage_distill = any(
+        st.get("distillation", False)
+        for st in cfg.get("stage_schedule", [])
+    )
+    use_distillation = dist_cfg.get("enable", False) or any_stage_distill
     lambda_coef = dist_cfg.get("lambda_coef", 1.0)
     hook_handles = []
 
@@ -434,12 +441,71 @@ def main():
         min_ratio=tr_cfg.get("min_lr_ratio", 0.0),
     )
 
-    loss_weights = tr_cfg.get("loss_weights", {})
-    w_bce = loss_weights.get("bce", 1.0)
-    w_focal = loss_weights.get("focal", 0.5)
-    w_dice = loss_weights.get("dice", 1.0)
-    w_iou = loss_weights.get("iou", 1.0)
-    w_cls = loss_weights.get("cls", 1.0)
+    # ─────────────────── Loss weights & stage scheduling ───────────────────
+    # Users can optionally define a `stage_schedule` in the root of the JSON
+    # config. Each stage is a dict containing:
+    #   {
+    #       "name": "distill_only",        # optional, just for logging
+    #       "start_epoch": 0,               # inclusive
+    #       "end_epoch": 100,               # exclusive
+    #       "loss_weights": {               # same schema as train.loss_weights
+    #           "bce": 0, "focal": 0, "dice": 0, "iou": 0, "cls": 0
+    #       },
+    #       "lambda_coef": 1.0,             # overrides distillation.lambda_coef
+    #       "distillation": true            # toggles distillation in this stage
+    #   }
+    #
+    # If no schedule is provided, the original single-stage behaviour is kept.
+    stage_schedule = cfg.get("stage_schedule", [])
+
+    base_loss_weights = tr_cfg.get("loss_weights", {})
+    base_w_bce = base_loss_weights.get("bce", 1.0)
+    base_w_focal = base_loss_weights.get("focal", 0.5)
+    base_w_dice = base_loss_weights.get("dice", 1.0)
+    base_w_iou = base_loss_weights.get("iou", 1.0)
+    base_w_cls = base_loss_weights.get("cls", 1.0)
+
+    # Initial (may be overridden each epoch)
+    w_bce, w_focal, w_dice, w_iou, w_cls = (
+        base_w_bce,
+        base_w_focal,
+        base_w_dice,
+        base_w_iou,
+        base_w_cls,
+    )
+
+    # Helper to fetch stage-specific settings at runtime
+    def _apply_stage_overrides(epoch: int):
+        nonlocal w_bce, w_focal, w_dice, w_iou, w_cls, lambda_coef, use_distillation
+
+        # Reset to base values before applying overrides
+        w_bce, w_focal, w_dice, w_iou, w_cls = (
+            base_w_bce,
+            base_w_focal,
+            base_w_dice,
+            base_w_iou,
+            base_w_cls,
+        )
+        lambda_coef_stage = lambda_coef  # default keep previous value
+        distill_stage_enable = use_distillation
+
+        for st in stage_schedule:
+            if st.get("start_epoch", 0) <= epoch < st.get("end_epoch", tr_cfg["epochs"]):
+                lw = st.get("loss_weights", {})
+                w_bce = lw.get("bce", w_bce)
+                w_focal = lw.get("focal", w_focal)
+                w_dice = lw.get("dice", w_dice)
+                w_iou = lw.get("iou", w_iou)
+                w_cls = lw.get("cls", w_cls)
+                lambda_coef_stage = st.get("lambda_coef", lambda_coef_stage)
+                distill_stage_enable = st.get("distillation", distill_stage_enable)
+                break  # Assume at most one active stage per epoch
+
+        lambda_coef = lambda_coef_stage
+        use_distillation = distill_stage_enable
+
+    # Apply once for epoch 0 before entering the loop
+    _apply_stage_overrides(0)
 
     scaler = GradScaler(enabled=not tr_cfg.get("bf16", False))
     writer = SummaryWriter(Path(m_cfg.get("save_path", "logs")) / "tb")
@@ -457,6 +523,9 @@ def main():
     try:
         global_step = 0
         for ep in range(tr_cfg["epochs"]):
+            # Apply stage-specific overrides (loss weights, distillation toggle, lambda)
+            _apply_stage_overrides(ep)
+
             if ep == unfreeze_epoch:
                 log.info(f"Unfreeze all modules at epoch {ep}")
                 student.image_encoder.requires_grad_(True)
