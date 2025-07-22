@@ -75,7 +75,7 @@
   "mask_teacher": {
     "enable": true,
     "method": "replace_gt",
-    "teacher_type": "vit_h",
+    "teacher_type": "vit_t",
     "checkpoint_path": "weights/mobile_sam.pt",
     "iou_threshold": 0.5,
     "gt_override": true
