@@ -2,25 +2,22 @@
   "dataset": {
     "train_dataset": "./datasets/train",
     "val_dataset": "./datasets/val",
-    "max_bbox_shift": 20,
+    "max_bbox_shift": 0,
     "num_workers": 4,
     "prompt_mode": "mixed",
     "min_points": 1,
-    "max_points": 3,
-    "mode": "everything",
-    "grid_points": 16
+    "max_points": 3
   },
   "model": {
     "checkpoint_path": "./weights/mobile_sam.pt",
     "type": "vit_t",
     "image_size": 1024,
-    "multimask_output": false,
-    "save_path": "./logs"
+    "save_path": "./logs_distill_then_finetune"
   },
   "train": {
     "epochs": 300,
-    "lr": 0.00001,
-    "batch_size": 1,
+    "lr": 1e-5,
+    "batch_size": 2,
     "val_freq": 1,
     "gradient_accumulation": 1,
     "bf16": true,
@@ -38,7 +35,7 @@
   },
   "visual": {
     "status": true,
-    "save_path": "./images",
+    "save_path": "./images_distill_then_finetune",
     "IOU_threshold": 0.5,
     "save_every_n_epochs": 1
   },
@@ -63,21 +60,31 @@
       "name": "SAM-H",
       "cfg": "configs/sam_h.yaml",
       "checkpoint": "weights/sam_vit_h_4b8939.pth",
-      "weight": 0.5
+      "weight": 0.7
     },
     {
       "name": "MobileSAM_orig",
       "cfg": "configs/mobile_sam_orig.yaml",
       "checkpoint": "weights/mobile_sam.pt",
-      "weight": 0.5
+      "weight": 0.3
     }
   ],
-  "mask_teacher": {
-    "enable": true,
-    "method": "replace_gt",
-    "teacher_type": "vit_h",
-    "checkpoint_path": "weights/mobile_sam.pt",
-    "iou_threshold": 0.5,
-    "gt_override": true
-  }
-}
+  "stage_schedule": [
+    {
+      "name": "distill_only",
+      "start_epoch": 0,
+      "end_epoch": 100,
+      "distillation": true,
+      "lambda_coef": 1.0,
+      "loss_weights": { "bce": 0, "focal": 0, "dice": 0, "iou": 0, "cls": 0 }
+    },
+    {
+      "name": "finetune_only",
+      "start_epoch": 100,
+      "end_epoch": 300,
+      "distillation": false,
+      "lambda_coef": 0.0,
+      "loss_weights": { "bce": 1.0, "focal": 15, "dice": 1.0, "iou": 1.0, "cls": 1.0 }
+    }
+  ]
+} 
