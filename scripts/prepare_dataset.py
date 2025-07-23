@@ -8,30 +8,31 @@ from tqdm import tqdm
 
 """prepare_dataset.py
 
-這支腳本會將 COCO 2017 (YOLO segmentation label 版本) 的影像與標註整理成以下階層：
+This script organizes COCO 2017 (YOLO segmentation label version) images and annotations
+into the following hierarchy:
 
 <root>/dataset/
     ├── train/
-    │   ├── image/  # 原始影像 (jpg)
-    │   └── mask/   # 每張影像對應一個資料夾，內含各物件的二值遮罩 (png)
+    │   ├── image/  # Original images (jpg)
+    │   └── mask/   # A directory for each image, containing binary masks for each object (png)
     └── val/
         ├── image/
         └── mask/
 
-mask 目錄說明：
+Mask directory structure:
     dataset/<split>/mask/<image_id>/<object_idx>.png
-    - 背景為黑色 (0)
-    - 物件像素為白色 (255)
+    - Background is black (0)
+    - Object pixels are white (255)
 
-假設原始檔案結構為：
+Assuming the original file structure is:
     <root>/train2017/*.jpg
     <root>/val2017/*.jpg
-    <root>/coco/labels/train2017/*.txt  (YOLO seg 標註)
+    <root>/coco/labels/train2017/*.txt  (YOLO seg annotations)
     <root>/coco/labels/val2017/*.txt
 
-用法：
-    python prepare_dataset.py  # 預設 root 為腳本所在目錄
-    python prepare_dataset.py --root /path/to/MobileSAM-fast-finetuning
+Usage:
+    python scripts/prepare_dataset.py  # Default root is the script's parent directory
+    python scripts/prepare_dataset.py --root /path/to/MobileSAM-fast-finetuning
 """
 
 import argparse
@@ -43,24 +44,24 @@ def parse_args():
         "--root",
         type=str,
         default=str(Path(__file__).resolve().parent.parent),
-        help="專案根目錄 (包含 train2017, val2017, coco/labels 等資料夾)"
+        help="Project root directory (containing train2017, val2017, coco/labels, etc.)"
     )
-    parser.add_argument("--verbose", action="store_true", help="顯示詳細跳過訊息")
-    parser.add_argument("--train-count", type=int, default=100, help="train 影像-遮罩 pair 數量 (預設100)")
-    parser.add_argument("--val-count", type=int, default=50, help="val 影像-遮罩 pair 數量 (預設50)")
-    parser.add_argument("--seed", type=int, default=42, help="隨機抽樣 seed")
+    parser.add_argument("--verbose", action="store_true", help="Display detailed skip messages")
+    parser.add_argument("--train-count", type=int, default=100, help="Number of train image-mask pairs (default: 100)")
+    parser.add_argument("--val-count", type=int, default=50, help="Number of val image-mask pairs (default: 50)")
+    parser.add_argument("--seed", type=int, default=42, help="Random sampling seed")
     return parser.parse_args()
 
 
 def yolo_to_binary_masks(img_path: Path, label_path: Path, mask_out_dir: Path):
-    """根據 YOLO segmentation label 產生每個物件的二值遮罩，並存成 png。"""
+    """Generate a binary mask for each object from a YOLO segmentation label and save as PNG."""
     if not label_path.exists():
-        return False  # 無標註
+        return False  # No annotation
 
-    # 讀取影像尺寸
+    # Read image dimensions
     img = cv2.imread(str(img_path))
     if img is None:
-        raise RuntimeError(f"無法讀取影像: {img_path}")
+        raise RuntimeError(f"Could not read image: {img_path}")
 
     h, w = img.shape[:2]
 
@@ -68,17 +69,17 @@ def yolo_to_binary_masks(img_path: Path, label_path: Path, mask_out_dir: Path):
         lines = [ln.strip() for ln in f.readlines() if ln.strip()]
 
     if not lines:
-        return False  # 空標註
+        return False  # Empty annotation
 
-    # 建立輸出目錄
+    # Create output directory
     mask_out_dir.mkdir(parents=True, exist_ok=True)
 
     for idx, line in enumerate(lines):
         parts = line.split()
         if len(parts) < 7:
-            # 至少需要 class_id + 3 個點的 xy (6) 才能形成多邊形
+            # A polygon requires at least 3 points (6 coordinates) + class_id
             continue
-        # parts[0] 是 class_id
+        # parts[0] is the class_id
         coords = list(map(float, parts[1:]))
         pts = np.array([
             [coords[i * 2] * w, coords[i * 2 + 1] * h] for i in range(len(coords) // 2)
@@ -94,11 +95,11 @@ def yolo_to_binary_masks(img_path: Path, label_path: Path, mask_out_dir: Path):
 
 
 def copy_and_generate(img_paths, images_dir, labels_dir, out_image_dir, out_mask_root, verbose=False):
-    """將指定 img_paths 影像複製並產生遮罩。"""
+    """Copy specified images and generate their corresponding masks."""
     out_image_dir.mkdir(parents=True, exist_ok=True)
     out_mask_root.mkdir(parents=True, exist_ok=True)
 
-    for img_path in tqdm(img_paths, desc=f"寫入 {out_image_dir.parent.name}"):
+    for img_path in tqdm(img_paths, desc=f"Writing to {out_image_dir.parent.name}"):
         stem = img_path.stem
         label_path = labels_dir / f"{stem}.txt"
 
@@ -109,22 +110,22 @@ def copy_and_generate(img_paths, images_dir, labels_dir, out_image_dir, out_mask
 
         if not success:
             if verbose:
-                print(f"[無標註] {label_path}，將移除對應影像。")
+                print(f"[No annotation] for {label_path}, removing corresponding image.")
             (out_image_dir / img_path.name).unlink(missing_ok=True)
             shutil.rmtree(mask_sub_dir, ignore_errors=True)
 
 
 def split_from_val(root: Path, train_count: int, val_count: int, seed: int = 42, verbose: bool = False):
-    """從 val2017 中抽樣 train/val 影像。"""
+    """Sample train/val images from val2017."""
     images_dir = root / "val2017"
     labels_dir = root / "coco" / "labels" / "val2017"
 
     if not images_dir.exists():
-        raise FileNotFoundError(f"找不到 {images_dir}")
+        raise FileNotFoundError(f"Directory not found: {images_dir}")
 
-    # 收集所有具有有效遮罩的影像
+    # Collect all images that have valid annotations
     valid_images = []
-    for img_path in tqdm(sorted(images_dir.glob("*.jpg")), desc="掃描有效標註"):
+    for img_path in tqdm(sorted(images_dir.glob("*.jpg")), desc="Scanning for valid annotations"):
         stem = img_path.stem
         label_path = labels_dir / f"{stem}.txt"
         if not label_path.exists():
@@ -136,7 +137,7 @@ def split_from_val(root: Path, train_count: int, val_count: int, seed: int = 42,
 
     total_needed = train_count + val_count
     if len(valid_images) < total_needed:
-        raise RuntimeError(f"有效標註影像不足: 需要 {total_needed}，僅有 {len(valid_images)}")
+        raise RuntimeError(f"Not enough images with valid annotations: needed {total_needed}, found {len(valid_images)}")
 
     import random
     rng = random.Random(seed)
@@ -145,7 +146,7 @@ def split_from_val(root: Path, train_count: int, val_count: int, seed: int = 42,
     train_imgs = valid_images[:train_count]
     val_imgs = valid_images[train_count:train_count + val_count]
 
-    # 複製與產生遮罩
+    # Copy images and generate masks
     copy_and_generate(
         train_imgs,
         images_dir,
