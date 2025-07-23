@@ -1,25 +1,26 @@
 # finetune_utils/feature_hooks.py
 import torch
 
-_FEATURE_STORE = {} # 全域變數用於儲存提取的特徵
+_FEATURE_STORE = {} # Global variable to store extracted features
 
 def _get_hook(key: str):
     """
-    為指定的鍵創建一個 hook 函數。
+    Creates a hook function for the specified key.
     """
-    def fn(module, input, output): # PyTorch hook 的標準簽名
+    def fn(module, input, output): # Standard signature for a PyTorch hook
         global _FEATURE_STORE
         feature_to_store = None
         
         if isinstance(output, torch.Tensor):
             feature_to_store = output.detach().clone() # Detach and clone
         elif isinstance(output, tuple) and len(output) > 0:
-            # 如果輸出是元組，我們主要關心第一個元素（通常是主要的特徵張量，例如 hs）
+            # If the output is a tuple, we are mainly interested in the first element
+            # (usually the main feature tensor, e.g., hs).
             if isinstance(output[0], torch.Tensor):
                 feature_to_store = output[0].detach().clone() # Detach and clone the first tensor
             else:
                 print(f"Warning: Hook for '{key}': Output was a tuple, but its first element is not a Tensor. Type: {type(output[0])}. Storing as is if other elements are tensors, or skipping.")
-                # 可選：如果希望儲存元組中所有的張量，或者將它們分別儲存
+                # Optional: If you want to store all tensors in the tuple, or store them separately
                 # Example: Store all tensors in the tuple under the same key as a list of tensors
                 # temp_list = []
                 # for item in output:
@@ -35,27 +36,28 @@ def _get_hook(key: str):
             else:
                 print(f"Warning: Hook for '{key}': Output was a list, but its first element is not a Tensor. Type: {type(output[0])}.")
         else:
-            if output is not None: # 避免 NoneType 錯誤
+            if output is not None: # Avoid NoneType error
                 print(f"Warning: Hook for '{key}': Output type {type(output)} is not explicitly handled for detach. Storing as is if possible or skipping.")
-            # 对于未处理的类型或 None，feature_to_store 保持 None
+            # For unhandled types or None, feature_to_store remains None
 
         if feature_to_store is not None:
-            # 如果_FEATURE_STORE[key]不存在，setdefault會創建一個空列表並返回它，然後append。
-            # 如果已存在，直接append。
+            # If _FEATURE_STORE[key] does not exist, setdefault creates an empty list and returns it, then appends.
+            # If it already exists, it just appends.
             _FEATURE_STORE.setdefault(key, []).append(feature_to_store)
         elif output is not None and not isinstance(output, (torch.Tensor, tuple, list)):
-             # 如果是一些其他類型的單一物件，且不是None，也許可以直接儲存（如果下游客戶端能處理）
-             # 但通常我們只關心 Tensor。為安全起見，只儲存已知的可分離張量。
+             # If it's some other type of single object and not None, maybe it can be stored directly
+             # (if the downstream client can handle it). But usually we only care about Tensors.
+             # To be safe, only store known detachable tensors.
             print(f"Info: Hook for '{key}', output type {type(output)} was not a tensor or handled tuple/list, not stored.")
             
     return fn
 
 def register_hooks(model: torch.nn.Module, layer_names: list[str]):
     """
-    為模型中指定的層註冊前向傳播的 hook。
+    Registers forward hooks for the specified layers in the model.
     """
     global _FEATURE_STORE
-    _FEATURE_STORE.clear() # 每次註冊新 hooks 時清空之前的特徵，確保每個 split 或模型獨立
+    _FEATURE_STORE.clear() # Clear previous features each time new hooks are registered to ensure each split or model is independent
 
     handles = []
     for name in layer_names:
@@ -72,11 +74,12 @@ def register_hooks(model: torch.nn.Module, layer_names: list[str]):
 
 def pop_features() -> dict:
     """
-    獲取並清除儲存的特徵。
-    返回一個字典，其中鍵是層名稱，值是包含捕獲到的特徵張量的列表。
-    由於我們通常在每次 forward pass 後調用 pop_features，所以這個列表預期只包含一個元素。
+    Retrieves and clears the stored features.
+    Returns a dictionary where keys are layer names and values are lists
+    containing the captured feature tensors. Since we typically call pop_features
+    after each forward pass, this list is expected to contain only one element.
     """
     global _FEATURE_STORE
-    feats = dict(_FEATURE_STORE) # 創建副本
-    _FEATURE_STORE.clear()       # 清空全域儲存，為下一次 forward pass 做準備
+    feats = dict(_FEATURE_STORE) # Create a copy
+    _FEATURE_STORE.clear()       # Clear the global store to prepare for the next forward pass
     return feats

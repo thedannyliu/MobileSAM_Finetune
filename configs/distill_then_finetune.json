@@ -12,7 +12,7 @@
     "checkpoint_path": "./weights/mobile_sam.pt",
     "type": "vit_t",
     "image_size": 1024,
-    "save_path": "./logs_distill_then_finetune"
+    "save_path": "./logs/distill_then_finetune"
   },
   "train": {
     "epochs": 300,
@@ -35,7 +35,7 @@
   },
   "visual": {
     "status": true,
-    "save_path": "./images_distill_then_finetune",
+    "save_path": "./images/distill_then_finetune",
     "IOU_threshold": 0.5,
     "save_every_n_epochs": 1
   },

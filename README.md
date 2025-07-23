@@ -1,287 +1,113 @@
 # Finetuning MobileSAM
 
-This repository provides a comprehensive framework for finetuning the MobileSAM model, a lightweight version of the Segment Anything Model (SAM) designed for efficient execution on resource-constrained devices. The original MobileSAM leverages a TinyViT backbone, and this project enables further specialization of the model on custom datasets. It includes utilities for data loading, training, loss computation, and a Gradio-based demonstration application.
-
-# 影像前處理注意事項
-
-本專案自 2025-06 更新後，**訓練與推論流程全面改為「資料載入端僅將影像轉換成 Tensor 後乘上 `255`，不再做任何 Normalize」**。
-
-理由如下：
-
-* `mobile_sam.modeling.sam.Sam.preprocess()` 內部已會按 ImageNet 統計值 (mean=[123.675,116.28,103.53]，std=[58.395,57.12,57.375]) 進行標準化；若資料集先行 Normalize 會導致數值錯誤，模型難以收斂。
-* 保留 0‥255 範圍可與官方 **SamPredictor / SamAutomaticMaskGenerator** 流程 1:1 對齊，確保 prompt 與 mask 的對位以及後續 `postprocess_masks` 邏輯正確。
-
-因此，`train.py` 中的 `tf_img` 轉換已改為：
-
-```python
-T.Compose([
-    T.ToTensor(),          # 0‥1
-    T.Lambda(lambda x: x*255.0)   # → 0‥255
-])
-```
-
-若你自行撰寫 Dataset，請務必保持相同邏輯。
-
-## Table of Contents
-
-1.  [Project Overview](#project-overview)
-2.  [Key Features](#key-features)
-3.  [Model Architecture](#model-architecture)
-    * [Image Encoder (TinyViT)](#image-encoder-tinyvit)
-    * [Prompt Encoder](#prompt-encoder)
-    * [Mask Decoder](#mask-decoder)
-4.  [Finetuning Pipeline](#finetuning-pipeline)
-    * [Configuration](#configuration)
-    * [Dataset Preparation](#dataset-preparation)
-    * [Training Script](#training-script)
-    * [Loss Functions](#loss-functions)
-    * [Optimizer and Scheduler](#optimizer-and-scheduler)
-    * [Multi-Stage Training (stage_schedule)](#multi-stage-training-stage_schedule)
-5.  [Installation](#installation)
-6.  [Usage](#usage)
-    * [Finetuning](#finetuning-1)
-    * [Inference with Gradio App](#inference-with-gradio-app)
-    * [Using the Predictor](#using-the-predictor)
-    * [Automatic Mask Generation](#automatic-mask-generation)
-    * [ONNX Export and Usage](#onnx-export-and-usage)
-7.  [Directory Structure](#directory-structure)
-8.  [Technical Deep Dive](#technical-deep-dive)
-    * [Core Model Components](#core-model-components)
-    * [Finetuning Utilities](#finetuning-utilities)
-    * [Distillation (Optional)](#distillation-optional)
-9.  [Contributing](#contributing)
-10. [License](#license)
-
-## Project Overview
-
-The Segment Anything Model (SAM) has demonstrated remarkable zero-shot performance in image segmentation. MobileSAM adapts this power into a more compact architecture, primarily by replacing the original ViT image encoder with a TinyViT. This project focuses on enabling users to finetune MobileSAM on specific downstream tasks or custom datasets to potentially improve performance and tailor the model to particular domains.
-
-The core idea is to update the weights of the MobileSAM model, particularly the image encoder and/or the mask decoder, using a custom dataset with corresponding ground truth masks. The finetuning process supports various configurations, loss functions (including focal and dice loss), and learning rate scheduling.
+This repository provides a comprehensive framework for finetuning the MobileSAM model, a lightweight version of the Segment Anything Model (SAM) optimized for performance on resource-constrained devices. It includes a complete suite for data processing, training, inference, and interactive demonstration.
 
 ## Key Features
 
-* **MobileSAM Implementation:** Core MobileSAM model architecture including TinyViT image encoder, prompt encoder, and mask decoder.
-* **Finetuning Script:** A flexible `train.py` script for finetuning MobileSAM on custom datasets.
-* **Customizable Configurations:** Training parameters, model paths, and dataset details can be managed via JSON configuration files.
-* **Multiple Loss Functions:** Supports common segmentation losses like Focal Loss and Dice Loss, and their combination.
-* **Knowledge Distillation (Implied):** Utilities like `extract_teacher_features.py` and `distill_losses.py` suggest capabilities for knowledge distillation from a larger teacher model (e.g., original SAM) to the MobileSAM student model, although direct implementation in `train.py` needs verification.
-* **Learning Rate Scheduler:** Implements a polynomial learning rate scheduler.
-* **Checkpointing:** Saves model checkpoints during training for later resumption or evaluation.
-* **Gradio Web UI:** An interactive `app.py` for easy testing and visualization of the (finetuned) MobileSAM model.
-* **ONNX Export:** Functionality to export the model to ONNX format for optimized inference.
-* **Utility Scripts:** Includes scripts for automatic mask generation and ONNX export.
-* **Modular Design:** Code is organized into modules for model components, finetuning utilities, and application logic.
+*   **MobileSAM Architecture:** Full implementation of the MobileSAM model, including the TinyViT image encoder, prompt encoder, and mask decoder.
+*   **Flexible Finetuning:** A robust `train.py` script for finetuning MobileSAM on custom datasets.
+*   **Configuration-Driven:** Manage all training parameters, model paths, and dataset details via JSON configuration files.
+*   **Multi-Stage Training:** Define complex training schedules with different phases (e.g., distillation followed by finetuning) in a single run.
+*   **Advanced Loss Functions:** Supports a combination of Focal Loss and Dice Loss for segmentation, with an MSE loss for the IoU head.
+*   **Knowledge Distillation:** Utilities to distill knowledge from a larger teacher model (like the original SAM) to improve MobileSAM's performance.
+*   **Optimizers and Schedulers:** Integrated with AdamW optimizer and a Polynomial Learning Rate Scheduler for stable convergence.
+*   **Checkpoint Management:** Automatically saves the best-performing model checkpoints based on validation metrics.
+*   **Gradio Web UI:** An interactive `app.py` for easy testing and visualization of segmentation results.
+*   **ONNX Export:** Functionality to export the model to ONNX format for optimized, cross-platform inference.
+*   **Comprehensive Utilities:** Includes scripts for automatic mask generation, programmatic prediction, and feature extraction.
 
-## Model Architecture
+## ❗️ Important: Image Preprocessing
 
-MobileSAM, like the original SAM, consists of three main components: an image encoder, a prompt encoder, and a mask decoder.
+As of the June 2025 update, the training and inference pipelines have been standardized to simplify data handling.
 
-### Image Encoder (TinyViT)
+> **Your data loading pipeline should ONLY convert images to a PyTorch Tensor and scale them to the `0-255` range.** Do not apply any other normalization (e.g., subtracting mean or dividing by standard deviation).
 
-The primary modification in MobileSAM is the use of a Tiny Vision Transformer (TinyViT) as the image encoder. This significantly reduces the number of parameters and computational cost compared to the standard ViT used in SAM.
-* **Implementation:** `mobile_sam.modeling.tiny_vit_sam.TinyViT`
-* **Function:** Takes an input image (e.g., $1024 \times 1024 \times 3$) and processes it through several stages of transformer blocks and patch merging layers to produce image embeddings.
-* **Key Aspects:**
-    * `img_size`: Typically 1024.
-    * `patch_size`: Defines the size of image patches (e.g., 16x16).
-    * `in_chans`: Input channels (usually 3 for RGB).
-    * `embed_dims`: A list specifying the embedding dimension at each of the 4 stages.
-    * `depths`: A list specifying the number of transformer blocks in each stage.
-    * `num_heads`: A list specifying the number of attention heads in each stage.
-    * `window_sizes`: A list specifying the window sizes for windowed attention in each stage.
-    * `mlp_ratio`: Ratio for MLP hidden dimension.
-    * `out_indices`: Indices of stages from which to output features.
-    * The image encoder outputs feature maps that are typically downsampled by a factor of 16 (e.g., $64 \times 64$ for a $1024 \times 1024$ input).
+**Reasoning:**
+1.  **Internal Normalization:** The `Sam.preprocess()` method within the model already normalizes the input using ImageNet statistics (`mean=[123.675, 116.28, 103.53]`, `std=[58.395, 57.12, 57.375]`). Applying normalization twice will corrupt the input data and prevent the model from converging.
+2.  **Workflow Alignment:** Keeping the `0-255` range ensures 1:1 compatibility with the official `SamPredictor` and `SamAutomaticMaskGenerator` workflows, which is critical for correct prompt-to-image alignment and mask post-processing.
 
-### Prompt Encoder
+A correct `torchvision.transforms` pipeline should look like this:
 
-The prompt encoder processes various types of prompts (points, boxes, masks) and converts them into embeddings that can be combined with the image embeddings.
-* **Implementation:** `mobile_sam.modeling.prompt_encoder.PromptEncoder`
-* **Function:**
-    * **Point Prompts:** Encodes sparse point coordinates (and associated labels indicating foreground/background) into positional encodings and learned embeddings.
-    * **Box Prompts:** Encodes bounding box coordinates similarly, using positional encodings for the top-left corner and learned embeddings for "top-left" and "bottom-right" roles.
-    * **Mask Prompts (Not explicitly finetuned here but part of SAM):** Can take a low-resolution mask and embed it using convolutions.
-* **Key Aspects:**
-    * `embed_dim`: The dimension of the output embeddings.
-    * `image_embedding_size`: The spatial size of the image embeddings (e.g., $64 \times 64$).
-    * `input_image_size`: The original input image size (e.g., $1024 \times 1024$).
-    * Uses positional encodings for spatial information.
-    * Produces a dense embedding (mask features) and sparse embeddings (point/box features).
+```python
+T.Compose([
+    T.ToTensor(),             # Converts image to a [0, 1] float tensor
+    T.Lambda(lambda x: x*255.0) # Scales tensor to the [0, 255] range
+])
+```
 
-### Mask Decoder
-
-The mask decoder takes the image embeddings (from the image encoder) and prompt embeddings (from the prompt encoder) to predict segmentation masks.
-* **Implementation:** `mobile_sam.modeling.mask_decoder.MaskDecoder`
-* **Function:**
-    * Combines image features and prompt embeddings using a two-way transformer architecture.
-    * Upscales the features to produce mask predictions at a higher resolution (typically 1/4th of the input image size, e.g., $256 \times 256$).
-    * Predicts multiple masks (usually 3) to handle ambiguity and an IoU score for each mask.
-* **Key Aspects:**
-    * `transformer_dim`: The feature dimension within the transformer.
-    * `transformer`: The core two-way transformer module.
-    * `num_multimask_outputs`: Number of ambiguous masks to output.
-    * `iou_head`: A small MLP to predict the IoU of the generated masks.
-    * The output masks are low-resolution and are typically upscaled to the original image size during post-processing.
-
-## Finetuning Pipeline
-
-### Configuration
-
-Finetuning is primarily controlled by `train.py` and configured using a JSON file (e.g., `configs/mobileSAM.json`). Key configuration parameters include:
-
-* `model_type`: Specifies the SAM model variant (e.g., "vit_t" for TinyViT based MobileSAM).
-* `checkpoint`: Path to the pre-trained MobileSAM checkpoint (`.pth` file).
-* `project_name`: Name for logging and output directories.
-* `run_name`: Specific name for the training run.
-* `train_img_dir`, `train_mask_dir`: Paths to training images and their corresponding masks.
-* `val_img_dir`, `val_mask_dir`: Paths to validation images and masks.
-* `output_dir`: Directory to save checkpoints and logs.
-* `num_epochs`: Total number of training epochs.
-* `batch_size`: Training batch size.
-* `num_workers`: Number of data loading workers.
-* `learning_rate`: Initial learning rate for the optimizer.
-* `weight_decay`: Weight decay for regularization.
-* `img_size`: Image size for training (e.g., 1024).
-* `mask_threshold`: Threshold for binarizing predicted masks during evaluation.
-* `iou_head_depth`, `iou_head_hidden_dim`: Parameters for the IoU prediction head in the mask decoder.
-* `vit_dim`, `vit_depth`, `vit_mlp_dim`, `vit_num_heads`, `vit_patch_size`: Parameters defining the TinyViT architecture (can be overridden if not using a standard pre-configured TinyViT).
-* `freeze`: A dictionary specifying which parts of the model to freeze (e.g., `image_encoder`, `prompt_encoder`, `mask_decoder`). This is crucial for controlling the extent of finetuning.
-* `use_distill`: Boolean, if true, enables feature distillation (requires `teacher_checkpoint` and `distill_feature_level`).
-* `teacher_checkpoint`: Path to the teacher model checkpoint (e.g., original SAM ViT-H).
-* `distill_feature_level`: Specifies which layer's features from the teacher's image encoder to use for distillation (e.g., 8 or 11 for ViT-H).
-
-### Dataset Preparation
-
-The finetuning script expects datasets in a simple image-mask pair format:
-* **Images:** Standard image files (e.g., JPG, PNG).
-* **Masks:** Grayscale or binary image files where each pixel value represents a class or a binary segmentation. The `SAMDataset` in `finetune_utils/datasets.py` loads these masks and converts them to binary format if necessary (values > 0 become 1).
-* The `SAMDataset` class handles loading images and masks, applying transformations (resizing, normalization), and generating bounding box or point prompts from the ground truth masks.
-* Masks are first resized using `ResizeLongestSide` and padded to a square matching the model's input size (1024×1024 by default). For training the mask decoder directly, the ground truth masks are further downsampled to 1/4 of this resolution (256×256) so the loss can be computed on the decoder's low resolution logits.
-* During validation and visualization all predicted masks are upsampled back to the original image size using the model's built‑in `postprocess_masks` to ensure proper pixel alignment.
-
-### Training Script
-
-The main training logic resides in `train.py`.
-1.  **Setup:** Parses arguments, loads the configuration JSON.
-2.  **Model Loading:**
-    * Initializes the MobileSAM model using `build_sam_vit_t` (or other variants based on config) from `mobile_sam.build_sam.py`.
-    * Loads pre-trained weights from the specified checkpoint.
-    * Applies freezing to specified model components (e.g., `model.image_encoder.eval()` and `param.requires_grad = False`).
-3.  **Data Loading:**
-    * Creates `SAMDataset` instances for training and validation.
-    * Uses `torch.utils.data.DataLoader` for batching and shuffling.
-4.  **Optimizer & Scheduler:**
-    * Uses AdamW optimizer (`torch.optim.AdamW`).
-    * Implements a polynomial learning rate decay scheduler (`PolynomialLR` from `finetune_utils.schedular`).
-5.  **Training Loop:**
-    * Iterates over epochs and batches.
-    * For each batch:
-        * Moves data to the GPU.
-        * Generates bounding box prompts from ground truth masks (`get_boxes_from_masks`).
-        * Performs a forward pass through the model:
-            * `model(batched_input, multimask_output=True)` where `batched_input` contains images, ground truth masks (for loss calculation if needed directly by model or for other purposes), and bounding box prompts.
-        * Calculates loss (see [Loss Functions](#loss-functions)).
-        * If using distillation, calculates distillation loss using `FeatureDistillationLoss` from `finetune_utils.distill_losses.py`. This loss compares intermediate features from the student (MobileSAM) and a pre-trained teacher model.
-        * Performs backpropagation and optimizer step.
-        * Updates learning rate.
-    * Logs training metrics (loss, learning rate).
-    * Performs validation at the end of each epoch:
-        * Calculates validation loss and Mean IoU.
-        * Saves the best model checkpoint based on validation IoU.
-6.  **Logging:** Uses a custom logger (`load_logger` from `finetune_utils.load_logger`) to print and save logs.
-
-### Loss Functions
-
-The primary loss function used for segmentation is a combination of Focal Loss and Dice Loss.
-* **Implementation:** `SegLoss` class in `finetune_utils.loss.py`.
-* **Focal Loss:** Addresses class imbalance by down-weighting well-classified examples. It's a modification of cross-entropy loss.
-    * $FL(p_t) = -\alpha_t (1 - p_t)^\gamma \log(p_t)$
-* **Dice Loss:** Directly optimizes the Dice Coefficient (a measure of overlap).
-    * $DL = 1 - \frac{2|X \cap Y|}{|X| + |Y|}$
-* The combined loss is typically a weighted sum: $L_{total} = L_{focal} + L_{dice}$.
-* **IoU Loss (for IoU head):** The mask decoder also predicts IoU scores for its mask outputs. The training involves a Smooth L1 loss or MSE loss between the predicted IoU and the actual IoU of the predicted mask with the ground truth. This is handled within the `Sam` model's forward pass if ground truth masks are provided.
-
-If knowledge distillation is enabled (`use_distill: true` in config):
-* **Feature Distillation Loss:** `FeatureDistillationLoss` in `finetune_utils.distill_losses.py`.
-    * This loss aims to make the student model's intermediate features mimic those of a larger, more powerful teacher model.
-    * It typically uses Mean Squared Error (MSE) or L1 loss between the student's and teacher's feature maps at specified layers of their respective image encoders.
-    * The teacher model's features for the training dataset are pre-extracted using `scripts/extract_teacher_features.py` and saved to disk. These are then loaded by the `SAMDataset` during finetuning.
-
-### Multi-Stage Training (`stage_schedule`)
-
-> **New in v2025-07-21** — You can now define an arbitrary sequence of training stages (e.g. **distill-only → finetune-only**, or the reverse) **in a single run**.  Add a top-level array `"stage_schedule"` to your JSON config where each item specifies:
-
-* `start_epoch`, `end_epoch` — epoch range (inclusive / exclusive)
-* `distillation` — whether teacher-student objectives are active
-* `lambda_coef` — global weighting for the sum of distill losses
-* `loss_weights` — per-stage overrides for BCE / Focal / Dice / IoU / cls
-
-At the beginning of every epoch `train.py` checks the current stage and **dynamically overrides** the above flags and weights — no need to restart training.
-
-Quick examples and full schema are in **[`docs/stage_schedule.md`](docs/stage_schedule.md)**.
-
-### Optimizer and Scheduler
-
-* **Optimizer:** AdamW (`torch.optim.AdamW`) is used, which is Adam with decoupled weight decay. This often leads to better generalization.
-    * Parameters: `lr` (learning rate), `weight_decay`.
-* **Scheduler:** `PolynomialLR` (from `finetune_utils.schedular`) is used.
-    * This scheduler decays the learning rate polynomially from the initial LR to a minimum LR over a specified number of steps or epochs.
-    * Formula: $lr = (initial\_lr - end\_lr) \times (1 - \frac{current\_iter}{total\_iters})^{power} + end\_lr$
-    * This helps in fine-tuning by starting with larger updates and gradually reducing them as training progresses.
+Please ensure any custom `Dataset` you write follows this logic.
 
 ## Installation
 
 1.  **Clone the repository:**
     ```bash
-    git clone [https://github.com/thedannyliu/mobilesam_finetune.git](https://github.com/thedannyliu/mobilesam_finetune.git)
-    cd mobilesam_finetune
+    git clone https://github.com/thedannyliu/MobileSAM-fast-finetuning.git
+    cd MobileSAM-fast-finetuning
     ```
 
 2.  **Create a Python virtual environment (recommended):**
     ```bash
     python -m venv sam_env
-    source sam_env/bin/activate  # On Windows: sam_env\Scripts\activate
+    source sam_env/bin/activate  # On Windows use: sam_env\Scripts\activate
     ```
 
 3.  **Install dependencies:**
-    The project uses PyTorch. Install it first, matching your CUDA version if GPU support is needed. Visit [pytorch.org](https://pytorch.org/) for specific instructions.
-    Example (CUDA 11.8):
+    First, install PyTorch, ensuring it matches your system's CUDA version for GPU support. Visit [pytorch.org](https://pytorch.org/) for specific instructions.
+    
+    Example for CUDA 11.8:
     ```bash
-    pip install torch torchvision torchaudio --index-url [https://download.pytorch.org/whl/cu118](https://download.pytorch.org/whl/cu118)
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
     ```
-    Then install other requirements:
+    
+    Then, install the remaining project requirements:
     ```bash
     pip install -r requirements.txt
     ```
-    The `requirements.txt` includes:
-    * `torch`, `torchvision`, `torchaudio`
-    * `numpy`
-    * `opencv-python`
-    * `pycocotools`
-    * `matplotlib`
-    * `onnx`, `onnxruntime`
-    * `gradio`
-    * `timm` (likely for TinyViT or general vision model utilities)
-    * `segment_anything` (if using components directly from the original SAM package or for comparison)
 
 4.  **Download Pre-trained Checkpoint:**
-    You will need a pre-trained MobileSAM checkpoint (`.pth` file). The original MobileSAM authors provide one. Place it in a known location (e.g., `checkpoints/` directory, not included in the repo by default) and update the `checkpoint` path in your configuration file (e.g., `configs/mobileSAM.json`).
-    * Original MobileSAM checkpoint (from their repository): `mobile_sam.pt`
+    You need a pre-trained MobileSAM checkpoint to start finetuning. You can download the official `mobile_sam.pt` from the original authors' repository. Place it in a convenient location (e.g., a `checkpoints/` directory) and update the `checkpoint` path in your JSON configuration file.
+
+## Directory Structure
+
+```
+mobilesam_finetune/
+├── app/                      # Gradio application
+│   └── app.py                # Main Gradio app script
+├── configs/                  # Configuration files (e.g., mobileSAM.json)
+├── docs/                     # Documentation (e.g., stage_schedule.md)
+├── finetune_utils/           # Utilities for finetuning
+│   ├── datasets.py           # Custom PyTorch Dataset for SAM
+│   ├── distill_losses.py     # Feature distillation loss
+│   ├── loss.py               # Segmentation loss (Focal + Dice)
+│   └── schedular.py          # Learning rate schedulers
+├── mobile_sam/               # Core MobileSAM model code
+│   ├── build_sam.py          # Model registry
+│   ├── modeling/             # Model architecture components
+│   │   ├── sam.py            # Main Sam class
+│   │   └── tiny_vit_sam.py   # TinyViT image encoder
+│   ├── predictor.py          # SamPredictor for programmatic inference
+│   └── automatic_mask_generator.py # SamAutomaticMaskGenerator
+├── notebooks/                # Jupyter notebooks with examples
+├── scripts/                  # Helper scripts
+│   ├── export_onnx_model.py  # Script to export model to ONNX
+│   └── extract_teacher_features.py # Script for knowledge distillation
+└── train.py                  # Main script for finetuning
+```
 
 ## Usage
 
-### Finetuning
+### 1. Finetuning
 
-1.  **Prepare your dataset:**
-    * Organize your images and corresponding masks into separate directories (e.g., `dataset/train/images`, `dataset/train/masks`).
-    * Ensure masks are single-channel images where non-zero pixels represent the object of interest.
+1.  **Prepare Your Dataset:**
+    *   Organize your images and masks into separate directories (e.g., `data/train/images`, `data/train/masks`).
+    *   Masks should be single-channel images (e.g., grayscale PNG) where non-zero pixels represent the object of interest.
 
-2.  **Configure `configs/mobileSAM.json` (or create a new one):**
-    * Set `train_img_dir` and `train_mask_dir` to your training data paths.
-    * Set `val_img_dir` and `val_mask_dir` if you have a validation set.
-    * Specify the `checkpoint` path to your pre-trained MobileSAM model.
-    * Adjust `num_epochs`, `batch_size`, `learning_rate`, etc., as needed.
-    * Configure the `freeze` dictionary to specify which parts of the model should not be updated. For example, to finetune only the mask decoder:
+2.  **Create a Configuration File:**
+    *   Copy `configs/mobileSAM.json` and customize it for your project.
+    *   Set `train_img_dir`, `train_mask_dir`, `val_img_dir`, and `val_mask_dir` to your dataset paths.
+    *   Set `checkpoint` to the path of your pre-trained MobileSAM model.
+    *   Adjust hyperparameters like `num_epochs`, `batch_size`, and `learning_rate`.
+    *   Use the `freeze` dictionary to control which parts of the model are trained. For example, to finetune only the mask decoder:
         ```json
         "freeze": {
             "image_encoder": true,
@@ -289,275 +115,176 @@ Quick examples and full schema are in **[`docs/stage_schedule.md`](docs/stage_sc
             "mask_decoder": false
         }
         ```
-    * If using feature distillation:
-        * Set `use_distill: true`.
-        * Provide `teacher_checkpoint` (e.g., path to SAM ViT-H checkpoint).
-        * Run `scripts/extract_teacher_features.py` first (see below).
-        * Set `train_img_dir_teacher_features` in the dataset config within `mobileSAM.json`.
 
-3.  **(Optional) Extract Teacher Features for Distillation:**
-    If `use_distill` is true, you need to pre-extract features from the teacher model:
+3.  **(Optional) Prepare for Knowledge Distillation:**
+    *   If you want to use knowledge distillation (`use_distill: true`), you must first pre-extract features from a teacher model (e.g., the original SAM ViT-H).
+    *   Run the extraction script:
     ```bash
     python scripts/extract_teacher_features.py \
-        --config_file configs/mobileSAM.json \
-        --image_dir path/to/your/train_images \
-        --output_dir path/to/save/teacher_features
+            --config_file configs/your_config.json \
+            --image_dir /path/to/your/train_images \
+            --output_dir /path/to/save/teacher_features
     ```
-    Update `train_img_dir_teacher_features` in `configs/mobileSAM.json` to point to `path/to/save/teacher_features`.
+    *   Update your config to point `train_img_dir_teacher_features` to the output directory.
 
-4.  **Run the training script:**
+4.  **Run Training:**
     ```bash
-    python train.py --config_file configs/mobileSAM.json
+    python train.py --config_file configs/your_config.json
     ```
-    Logs and checkpoints will be saved to the directory specified by `output_dir` in the config, under a subfolder named `project_name/run_name`.
+    Logs and checkpoints will be saved under the `output_dir` specified in your configuration.
 
-### Inference with Gradio App
+### 2. Multi-Stage Training
 
-The project includes a Gradio application for interactive segmentation.
-1.  **Ensure you have a trained (or pre-trained) MobileSAM checkpoint.**
-2.  **Run the Gradio app:**
+This repository supports defining a sequence of training stages within a single run. This is useful for complex training regimes, such as starting with distillation and then switching to pure finetuning.
+
+To enable this, add a `stage_schedule` array to your JSON config. `train.py` will dynamically adjust training parameters at the beginning of each epoch based on this schedule.
+
+*   `start_epoch`, `end_epoch`: The epoch range for the stage.
+*   `distillation`: A boolean to enable or disable the distillation loss.
+*   `lambda_coef`: A global weight for the distillation loss component.
+*   `loss_weights`: Per-stage overrides for other loss components.
+
+**Example `stage_schedule` in `config.json`:**
+```json
+"stage_schedule": [
+    {
+        "start_epoch": 0,
+        "end_epoch": 10,
+        "distillation": true,
+        "lambda_coef": 1.0,
+        "loss_weights": { "focal": 0.0, "dice": 0.0, "iou": 0.0 }
+    },
+    {
+        "start_epoch": 10,
+        "end_epoch": 20,
+        "distillation": false,
+        "lambda_coef": 0.0,
+        "loss_weights": { "focal": 1.0, "dice": 1.0, "iou": 1.0 }
+    }
+]
+```
+For a detailed schema, see **[`docs/stage_schedule.md`](docs/stage_schedule.md)**.
+
+### 3. Inference with the Gradio App
+
+The interactive Gradio app is the easiest way to test your model.
+
+1.  **Launch the app:**
     ```bash
-    python app/app.py --checkpoint path/to/your/mobilesam_checkpoint.pth
+    python app/app.py --checkpoint /path/to/your/finetuned_checkpoint.pth
     ```
-    Optional arguments for `app/app.py`:
-    * `--model-type`: `vit_t` (default) or other SAM model types.
-    * `--sam_checkpoint`: Path to the SAM model checkpoint.
-    * `--port`: Port number for the Gradio app.
-    * `--host`: Host address for the Gradio app.
-    * `--img_path`: Optional path to an image to load by default.
+2.  **Use the UI:**
+    *   Upload an image.
+    *   Add foreground/background points by clicking on the image.
+    *   Draw bounding boxes to specify the object of interest.
+    *   The model will generate and display the segmentation mask in real-time.
 
-    The app allows you to upload an image, click points (positive/negative), or draw bounding boxes to get segmentation masks.
+### 4. Programmatic Inference
 
-### Using the Predictor
+For integration into other applications, use the `SamPredictor` class. See `notebooks/predictor_example.ipynb` for a complete example.
 
-The `mobile_sam.predictor.SamPredictor` class provides a way to use the model programmatically.
-See `notebooks/predictor_example.ipynb` for an example.
-Key steps:
-1.  Initialize the predictor:
+**Key Steps:**
     ```python
+import cv2
+import numpy as np
     from mobile_sam import sam_model_registry, SamPredictor
+
+# 1. Initialize the model and predictor
+sam_checkpoint = "/path/to/your/checkpoint.pth"
     model_type = "vit_t"
-    sam_checkpoint = "path/to/checkpoint.pth"
+device = "cuda"
+
     sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
-    sam.to(device='cuda') # or 'cpu'
+sam.to(device=device)
     predictor = SamPredictor(sam)
-    ```
-2.  Set the image:
-    ```python
-    image = cv2.imread("path/to/image.jpg")
+
+# 2. Set the image
+image = cv2.imread("image.jpg")
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     predictor.set_image(image)
-    ```
-3.  Provide prompts (points, boxes):
-    ```python
-    input_point = np.array([[x, y]]) # e.g., [[500, 375]]
-    input_label = np.array([1])      # 1 for foreground, 0 for background
-    input_box = np.array([x1, y1, x2, y2]) # e.g., [425, 600, 700, 875]
 
+# 3. Provide prompts
+input_point = np.array([[500, 375]])  # [[x, y]]
+input_label = np.array([1])           # 1 for foreground, 0 for background
+input_box = np.array([425, 600, 700, 875]) # [x1, y1, x2, y2]
+
+# 4. Predict
     masks, scores, logits = predictor.predict(
         point_coords=input_point,
         point_labels=input_label,
-        box=input_box, # Optional
+    box=input_box,
         multimask_output=True,
     )
     ```
-    The `predict` method returns masks, their quality scores (predicted IoU), and raw logits.
 
-### Automatic Mask Generation
+### 5. Automatic Mask Generation
 
-The `mobile_sam.automatic_mask_generator.SamAutomaticMaskGenerator` can be used to segment all objects in an image.
-See `notebooks/automatic_mask_generator_example.ipynb`.
-Key steps:
-1.  Initialize the generator:
+To segment all objects in an image automatically, use the `SamAutomaticMaskGenerator`. See `notebooks/automatic_mask_generator_example.ipynb`.
+
     ```python
     from mobile_sam import sam_model_registry, SamAutomaticMaskGenerator
-    model_type = "vit_t"
-    sam_checkpoint = "path/to/checkpoint.pth"
-    sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
-    sam.to(device='cuda')
-    mask_generator = SamAutomaticMaskGenerator(sam)
-    # Or, to use specific hyperparameters:
-    # mask_generator = SamAutomaticMaskGenerator(
-    #     model=sam,
-    #     points_per_side=32,
-    #     pred_iou_thresh=0.88,
-    #     stability_score_thresh=0.95,
-    #     crop_n_layers=0,
-    #     crop_n_points_downscale_factor=1,
-    #     min_mask_region_area=100, # Requires open-cv to run post-processing
-    # )
-    ```
-2.  Generate masks:
-    ```python
-    image = cv2.imread("path/to/image.jpg")
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    masks = mask_generator.generate(image)
-    # `masks` is a list of dictionaries, each containing segmentation info.
+
+# 1. Initialize the generator
+mask_generator = SamAutomaticMaskGenerator(sam) # Use the 'sam' model from the previous example
+
+# 2. Generate masks
+masks = mask_generator.generate(image) # 'masks' is a list of dicts, each with segmentation info
     ```
 
-### ONNX Export and Usage
+### 6. ONNX Export and Usage
 
-The project supports exporting the MobileSAM model to ONNX for optimized inference.
+Export the model to ONNX for faster inference and deployment.
 
-1.  **Export the model:**
+1.  **Export the decoder and prompt encoder:**
     ```bash
     python scripts/export_onnx_model.py \
-        --checkpoint path/to/your/mobilesam_checkpoint.pth \
-        --output path/to/save/mobilesam.onnx \
+        --checkpoint /path/to/your/checkpoint.pth \
+        --output models/mobilesam_decoder.onnx \
         --model-type vit_t \
-        --quantize-out path/to/save/mobilesam_quantized.onnx # Optional: for int8 quantization
+        --quantize-out models/mobilesam_decoder_quant.onnx  # Optional: for int8 quantization
     ```
-    Key arguments:
-    * `--checkpoint`: Path to the PyTorch MobileSAM model.
-    * `--output`: Path to save the ONNX model.
-    * `--model-type`: Type of SAM model (e.g., `vit_t`).
-    * `--quantize-out`: If provided, exports a quantized int8 ONNX model to this path. This can further speed up inference and reduce model size, but might require calibration data for optimal performance (not explicitly handled by this script, uses dynamic quantization).
-    * `--return-single-mask`: If set, the ONNX model will only return the best mask.
-    * `--opset`: ONNX opset version (default 13).
 
-2.  **Use the ONNX model:**
-    See `notebooks/onnx_model_example.ipynb`.
-    This involves using `onnxruntime.InferenceSession`. The notebook demonstrates how to prepare inputs (image embeddings, point/box prompts) and run inference. The image encoder and the main SAM model (prompt/mask decoders) might be exported as separate ONNX models or a combined one depending on the export script's capabilities. The script `export_onnx_model.py` exports the prompt encoder and mask decoder part, assuming the image embeddings are pre-computed.
-    The script also exports the image encoder separately:
+2.  **Export the image encoder separately:**
     ```bash
     python scripts/export_onnx_model.py \
-        --checkpoint path/to/your/mobilesam_checkpoint.pth \
-        --output path/to/save/image_encoder.onnx \
+        --checkpoint /path/to/your/checkpoint.pth \
+        --output models/mobilesam_encoder.onnx \
         --model-type vit_t \
-        --export-encoder # Add this flag
+        --export-encoder
     ```
 
-## Directory Structure
-mobilesam_finetune/
-├── app/                      # Gradio application
-│   ├── README.md
-│   ├── app.py                # Main Gradio app script
-│   ├── requirements.txt      # App-specific requirements
-│   └── utils/                # Utility functions for the app
-│       ├── tools.py
-│       └── tools_gradio.py
-├── configs/                  # Configuration files
-│   ├── mobileSAM.json        # Example finetuning configuration
-│   ├── mobile_sam_orig.yaml  # Original MobileSAM config (reference)
-│   └── sam_vith.yaml         # SAM ViT-H config (reference for teacher)
-├── finetune_utils/           # Utilities for finetuning
-│   ├── datasets.py           # Custom PyTorch Dataset for SAM
-│   ├── distill_losses.py     # Feature distillation loss
-│   ├── feature_hooks.py      # Hooks for extracting intermediate features
-│   ├── load_checkpoint.py    # Functions for loading model checkpoints
-│   ├── load_config.py        # Function for loading JSON configs
-│   ├── load_logger.py        # Logging setup
-│   ├── loss.py               # Segmentation loss (Focal + Dice)
-│   ├── save_checkpoint.py    # Functions for saving model checkpoints
-│   ├── schedular.py          # Learning rate schedulers (PolynomialLR)
-│   └── visualization.py      # Visualization utilities (not extensively used in train.py)
-├── mobile_sam/               # Core MobileSAM model code (adapted from official SAM)
-│   ├── init.py
-│   ├── automatic_mask_generator.py
-│   ├── build_sam.py          # Functions to build SAM models (e.g., sam_model_registry)
-│   ├── modeling/             # Model architecture components
-│   │   ├── init.py
-│   │   ├── common.py         # Common layers (MLP, LayerNorm2d)
-│   │   ├── image_encoder.py  # Original SAM ViT image encoder (reference)
-│   │   ├── mask_decoder.py   # Mask decoder module
-│   │   ├── prompt_encoder.py # Prompt encoder module
-│   │   ├── sam.py            # Main Sam class orchestrating encoders and decoder
-│   │   ├── tiny_vit_sam.py   # TinyViT image encoder implementation
-│   │   └── transformer.py    # Transformer and Attention blocks
-│   ├── predictor.py          # SamPredictor class for inference
-│   └── utils/                # Utility functions for SAM
-│       ├── init.py
-│       ├── amg.py            # Utilities for automatic mask generation
-│       ├── onnx.py           # ONNX conversion helper (SamOnnxModel)
-│       └── transforms.py     # Image transformation utilities
-├── notebooks/                # Jupyter notebooks with examples
-│   ├── automatic_mask_generator_example.ipynb
-│   ├── onnx_model_example.ipynb
-│   └── predictor_example.ipynb
-├── scripts/                  # Helper scripts
-│   ├── amg.py                # Script for running automatic mask generation
-│   ├── export_onnx_model.py  # Script to export model to ONNX format
-│   └── extract_teacher_features.py # Script to pre-compute teacher model features for distillation
-├── .gitignore
-├── CODE_OF_CONDUCT.md
-├── CONTRIBUTING.md
-├── LICENSE                   # (Assumed Apache 2.0 based on original SAM)
-├── README.md                 # This file
-├── requirements.txt          # Project-level Python dependencies
-├── setup.cfg
-├── setup.py                  # For package installation (if developed as a library)
-└── train.py                  # Main script for finetuning MobileSAM
+For an example of how to run inference with the exported ONNX models, refer to `notebooks/onnx_model_example.ipynb`.
 
 ## Technical Deep Dive
 
-### Core Model Components (Recap from Model Architecture)
+### Model Architecture
 
-* **`mobile_sam.modeling.tiny_vit_sam.TinyViT`**: The heart of MobileSAM's efficiency. It's a compact Vision Transformer. Key parameters like `embed_dims`, `depths`, `num_heads`, `window_sizes` define its architecture across its multiple stages. It outputs image embeddings, typically of shape `(B, C, H_emb, W_emb)` (e.g., `B, 256, 64, 64`).
-* **`mobile_sam.modeling.prompt_encoder.PromptEncoder`**: Converts sparse (points, boxes) and potentially dense (masks) prompts into embeddings. Uses learnable embeddings for prompt types and positional encodings for spatial locations. Outputs `sparse_embeddings` and `dense_embeddings`.
-* **`mobile_sam.modeling.mask_decoder.MaskDecoder`**: A transformer-based decoder that attends to both image embeddings and prompt embeddings to produce multiple output masks and their predicted IoU scores. The core is a `TwoWayTransformer` which allows bidirectional attention flow between tokens representing image features and tokens representing prompt queries.
-* **`mobile_sam.modeling.sam.Sam`**: The main model class that integrates the image encoder, prompt encoder, and mask decoder. Its `forward` method orchestrates the flow:
-    1.  Processes the input image with `image_encoder` to get image embeddings.
-    2.  Processes prompts (points, boxes, masks) with `prompt_encoder` to get prompt embeddings.
-    3.  Feeds image embeddings and prompt embeddings to `mask_decoder` to get low-resolution masks and IoU predictions.
-    4.  Upscales masks to the original image resolution if required.
+*   **`TinyViT` Image Encoder:** The core of MobileSAM's efficiency. It's a compact Vision Transformer that generates image embeddings (e.g., `B, 256, 64, 64`) from a 1024x1024 input.
+*   **`PromptEncoder`:** Converts sparse (points, boxes) and dense (masks) prompts into embeddings that the decoder can understand.
+*   **`MaskDecoder`:** A transformer-based decoder that uses two-way attention to combine image embeddings and prompt embeddings, predicting segmentation masks and their quality (IoU scores).
+*   **`Sam` Class:** The main model that integrates the three components and orchestrates the forward pass.
 
-### Finetuning Utilities (`finetune_utils/`)
+### Finetuning Internals
 
-* **`datasets.py:SAMDataset`**:
-    * Loads images and masks from specified directories.
-    * Handles image resizing to `img_size` (e.g., 1024x1024) and normalization using `transforms.ResizeLongestSide` and pixel mean/std deviation.
-    * Crucially, for training with box prompts, it extracts bounding boxes from the ground truth masks using `get_boxes_from_masks`. These boxes then serve as prompts to the model during training.
-    * If distillation is used, it also loads pre-computed teacher features and aligns them with the student's input.
-* **`loss.py:SegLoss`**: Combines Focal Loss and Dice Loss. This is standard for segmentation tasks where pixel-wise classification can be imbalanced and direct optimization of overlap is beneficial.
-* **`distill_losses.py:FeatureDistillationLoss`**:
-    * Calculates MSE (or other L_p norm) loss between student and teacher feature maps.
-    * Requires `feature_hooks.py:FeatureHookManager` to register hooks on the student and teacher image encoders to extract intermediate layer activations during their forward passes.
-    * The teacher's features are pre-computed and loaded by the dataset to avoid repeated forward passes of the heavy teacher model during student training.
-* **`load_checkpoint.py`**: Contains `load_mobile_sam_checkpoint` which carefully loads weights from a pre-trained checkpoint, potentially ignoring mismatched keys or freezing parts of the model as per the configuration.
-* **`schedular.py:PolynomialLR`**: A learning rate scheduler that decays the LR polynomially. Helps in stabilizing training in later stages.
-* **`feature_hooks.py:FeatureHookManager`**: A utility to attach forward hooks to specific modules (layers) within a PyTorch model. This is used by `FeatureDistillationLoss` to grab the intermediate activations from the image encoders of both the student (MobileSAM) and the teacher model (e.g., SAM ViT-H) at specified layers. The `extract_teacher_features.py` script also uses this to save these teacher activations.
+*   **`SAMDataset` (`finetune_utils/datasets.py`):**
+    *   Loads images and masks.
+    *   **Coordinate System:** This is a critical detail. The dataset is responsible for transforming prompt coordinates (points and boxes) to match the model's input space. For a 1024x1024 model input, all prompts are scaled and padded to align with the resized image. **Raw, original image coordinates are NOT passed to the model during training or validation**; they are only used for visualization purposes.
+    *   Extracts bounding box prompts from ground truth masks on the fly.
+    *   If distillation is used, it loads the corresponding pre-computed teacher features for each image.
 
-### Distillation (Optional)
+*   **Loss Functions (`finetune_utils/loss.py`):**
+    *   **`SegLoss`:** A combination of Focal Loss (to handle class imbalance) and Dice Loss (to directly optimize mask overlap). The total segmentation loss is a weighted sum of the two.
+    *   **IoU Loss:** The model's IoU head is trained with an MSE loss between its predicted IoU and the actual IoU of the predicted mask vs. the ground truth.
 
-Knowledge Distillation (KD) is a technique where a smaller "student" model learns from a larger, more performant "teacher" model. In this project, it appears to be implemented as feature-map distillation:
-1.  **Teacher Feature Extraction (`scripts/extract_teacher_features.py`):**
-    * A powerful teacher model (e.g., original SAM with ViT-H encoder) processes the training images.
-    * `FeatureHookManager` is used to capture the output of a specific intermediate layer (e.g., the 8th or 11th block) of the teacher's image encoder.
-    * These feature maps are saved to disk (e.g., as `.pt` or `.npy` files) for each training image.
-2.  **Student Training (`train.py` with `use_distill: true`):**
-    * The `SAMDataset` loads the pre-computed teacher features corresponding to each training image.
-    * During the student's (MobileSAM) forward pass, `FeatureHookManager` captures the features from the equivalent (or chosen) layer of MobileSAM's TinyViT encoder.
-    * The `FeatureDistillationLoss` calculates a loss (e.g., MSE) between the student's features and the loaded teacher's features. This loss term is added to the primary segmentation loss.
-    * The intuition is that the student learns to produce intermediate representations similar to those of the more powerful teacher, which can guide the student to better solutions, especially when the student model has much lower capacity.
-
-This distillation approach can be particularly useful for transferring the rich representations learned by large vision transformers into smaller, more efficient models like MobileSAM.
+*   **Knowledge Distillation (`finetune_utils/distill_losses.py`):**
+    *   The `FeatureDistillationLoss` computes an MSE loss between intermediate feature maps from the student's TinyViT encoder and a powerful teacher's encoder (e.g., ViT-H from the original SAM).
+    *   This encourages the smaller student model to learn the richer feature representations of the larger teacher, often improving performance.
+    *   This process relies on `FeatureHookManager` to extract activations from specific model layers without altering the model definitions.
 
 ## Contributing
 
-Please refer to `CONTRIBUTING.md` for guidelines on contributing to this project. Ensure that any contributions align with the `CODE_OF_CONDUCT.md`.
+Please refer to `CONTRIBUTING.md` for guidelines on contributing to this project. All contributions should adhere to the `CODE_OF_CONDUCT.md`.
 
 ## License
 
-The original Segment Anything Model (SAM) and MobileSAM are typically released under the Apache 2.0 License. This finetuning repository, if it builds upon that work, would likely also fall under a compatible open-source license. Please check the `LICENSE` file for specific details. (Note: A `LICENSE` file was not explicitly provided in the uploaded project structure, but it's standard practice).
-
-## 2025-06-18 更新
-
-### 🐞 Bug Fix – Prompt 座標在驗證階段錯置
-
-過去版本於 *validation* pipeline 內，誤將 **raw (原圖座標)** 的 `box_prompt_raw` / `point_coords_raw` 直接餵給 `Sam` 模型，導致
-
-* 模型接收到與 `batched_input[\"image\"]` 不同座標系統的 prompt。
-* 驗證 Dice / IoU 表現異常低落，容易誤判「訓練無法收斂」。
-
-此版本已統一：
-
-* **訓練與驗證** 一律使用 `box_prompt` / `point_coords` — 亦即 **經過 `ResizeLongestSide` 縮放後、再對應 padding** 的座標。
-* 視覺化 (`overlay_*`) 仍保留 raw prompt，以便能在原圖解析度下直接疊加顯示。
-
-主要修改檔：
-
-* `train.py`
-  * `Single-object` 訓練迴圈 (`batched_input` 構建) → 換用 `box_prompt` / `point_coords`。
-  * 驗證階段 `vinp` 同步改用縮放後座標。
-
-重新執行 `train.py --config configs/mobileSAM.json` 後，即可觀察到驗證指標的合理提升。
+This project is built upon the original MobileSAM and Segment Anything models, which are released under the Apache 2.0 License. This finetuning repository is likely also covered by a compatible open-source license. Please check the `LICENSE` file for specific details.

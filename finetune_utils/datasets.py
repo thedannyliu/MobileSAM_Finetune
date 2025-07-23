@@ -14,10 +14,12 @@ from PIL import Image
 
 class ComponentDataset(Dataset):
     """
-    SAM Fine-tune 多物件資料集 (Option B)
-    • 保留原始尺寸，先在原圖上計算 prompt (box / point)，
-      再將圖片等比縮放到長邊 ``image_size``，並回傳原始尺寸給 SAM。
-    • 縮放後若寬高不足 ``image_size``，會補零填成正方形以方便 batch。
+    Dataset for SAM Fine-tuning with multiple objects (Option B).
+    - It preserves the original image size, first computing prompts (box/point)
+      on the raw image, then resizing the image proportionally to a longest
+      side of `image_size` and returning the original size to SAM.
+    - After resizing, if the height or width is less than `image_size`, it is
+      padded with zeros to form a square, facilitating batching.
     """
 
     def __init__(
@@ -35,7 +37,7 @@ class ComponentDataset(Dataset):
         self.mask_dir = self.root_dir / "mask"
 
         if not self.image_dir.is_dir() or not self.mask_dir.is_dir():
-            raise FileNotFoundError(f"{root_dir} 缺少 image/ 或 mask/")
+            raise FileNotFoundError(f"Missing image/ or mask/ directory in {root_dir}")
 
         # transform: (transform_image, transform_mask) for AFTER resize
         self.transform_image = transform[0] if transform else transforms.ToTensor()
@@ -62,11 +64,11 @@ class ComponentDataset(Dataset):
                     self.samples.append({"image": img_path, "mask": mask_path, "id": img_stem})
 
         if not self.samples:
-            raise ValueError(f"{root_dir} 找不到任何樣本")
+            raise ValueError(f"No samples found in {root_dir}")
 
         print(f"ComponentDataset: {len(self.samples)} samples, prompt={self.prompt_mode}")
 
-        # 用於後續 Resize - match SamPredictor behaviour
+        # Used for subsequent resizing - to match SamPredictor behavior
         self.resizer = ResizeLongestSide(image_size)
 
     @staticmethod
@@ -83,8 +85,8 @@ class ComponentDataset(Dataset):
 
     def compute_bbox_raw(self, mask_tensor: torch.Tensor):
         """
-        在原始尺寸 mask_tensor ([1, H_raw, W_raw]) 上計算 tight bbox。
-        回傳 [xmin, ymin, xmax, ymax] (raw scale)。
+        Computes a tight bounding box on the original size mask_tensor ([1, H_raw, W_raw]).
+        Returns [xmin, ymin, xmax, ymax] at the raw scale.
         """
         m = mask_tensor.squeeze(0)
         m_close = self._morph_close(m)
@@ -126,8 +128,9 @@ class ComponentDataset(Dataset):
 
     def compute_point_prompts_raw(self, mask_tensor: torch.Tensor):
         """
-        在原始尺寸 mask_tensor ([1, H_raw, W_raw]) 隨機挑 k 個正點 (mask>0.5)，
-        其餘填 (-1,-1)，label 填 -1(忽略)。
+        Randomly selects k positive points from the original size mask_tensor
+        ([1, H_raw, W_raw]) where mask > 0.5. The rest are filled with (-1,-1)
+        and label -1 (ignore).
         """
         m = mask_tensor.squeeze(0)
         fg = torch.argwhere(m > 0.5)  # [[y,x], ...]
@@ -138,7 +141,7 @@ class ComponentDataset(Dataset):
         k = random.randint(self.min_points, self.max_points)
         idx = torch.randperm(fg.shape[0])[:k]
         samp = fg[idx].float()  # yx
-        samp = torch.flip(samp, dims=[1])  # 轉成 (x,y)
+        samp = torch.flip(samp, dims=[1])  # convert to (x,y)
         point_coords[:k] = samp
         point_labels[:k] = 1
         return point_coords, point_labels
@@ -154,11 +157,11 @@ class ComponentDataset(Dataset):
         orig_w, orig_h = img_pil.size
         raw_size = torch.tensor([orig_h, orig_w], dtype=torch.int)
 
-        # 1. 先把 raw mask 轉成 tensor 做 prompt
+        # 1. First, convert the raw mask to a tensor to create prompts
         msk_raw = transforms.ToTensor()(msk_pil)  # [1, H_raw, W_raw]
         msk_raw = (msk_raw > 0.5).float()
 
-        # 計算 raw prompt
+        # Compute raw prompts
         box_prompt_raw = torch.zeros(4, dtype=torch.float)
         point_coords_raw = torch.full((self.max_points, 2), -1.0, dtype=torch.float)
         point_labels_raw = torch.full((self.max_points,), -1, dtype=torch.long)
@@ -194,7 +197,7 @@ class ComponentDataset(Dataset):
             mode="nearest",
         ).squeeze(0)
 
-        # 3. 把 raw prompt 縮放到 resize 後的尺寸，使用 SAM 的 transforms
+        # 3. Scale the raw prompts to the resized dimensions using SAM's transforms
         if cur_type == "box":
             if box_prompt_raw.sum() != 0:
                 box_prompt = self.resizer.apply_boxes_torch(
@@ -212,7 +215,7 @@ class ComponentDataset(Dataset):
                 point_labels = torch.full((self.max_points,), -1, dtype=torch.long)
             box_prompt = None
 
-        # 4. DEBUG: 隨機小機率印一次 prompt 原始 & 縮放值
+        # 4. DEBUG: Randomly print original & scaled prompts with a small probability
         if random.random() < 0.002:
             print(
                 f"[DBG] idx={idx}, id={meta['id']}, raw_size={(orig_h,orig_w)}, "
@@ -223,7 +226,7 @@ class ComponentDataset(Dataset):
                 f"pt_scaled={(point_coords[:1].tolist() if cur_type=='point' else None)}"
             )
 
-        # 將 raw prompt 儲存以便可視化（避免因縮放後座標導致偏移）
+        # Store raw prompts for visualization to avoid offset issues due to scaling
         box_prompt_vis = box_prompt_raw if cur_type == "box" else None
         point_coords_vis = point_coords_raw if cur_type == "point" else None
         point_labels_vis = point_labels_raw if cur_type == "point" else None
@@ -235,7 +238,7 @@ class ComponentDataset(Dataset):
             "box_prompt": box_prompt if cur_type == "box" else None,
             "point_coords": point_coords if cur_type == "point" else None,
             "point_labels": point_labels if cur_type == "point" else None,
-            # 原始尺寸 prompt（for visualization）
+            # Raw prompts for visualization
             "box_prompt_raw": box_prompt_vis,
             "point_coords_raw": point_coords_vis,
             "point_labels_raw": point_labels_vis,
@@ -267,7 +270,7 @@ class SegmentEverythingDataset(Dataset):
         self.mask_dir = self.root_dir / "mask"
 
         if not self.image_dir.is_dir() or not self.mask_dir.is_dir():
-            raise FileNotFoundError(f"{root_dir} 缺少 image/ 或 mask/")
+            raise FileNotFoundError(f"Missing image/ or mask/ directory in {root_dir}")
 
         self.transform_image = transform[0] if transform else transforms.ToTensor()
         self.transform_mask = transform[1] if transform else transforms.ToTensor()
@@ -291,7 +294,7 @@ class SegmentEverythingDataset(Dataset):
                     self.samples.append({"image": img_path, "masks": masks, "id": img_stem})
 
         if not self.samples:
-            raise ValueError(f"{root_dir} 找不到任何樣本")
+            raise ValueError(f"No samples found in {root_dir}")
 
         print(f"SegmentEverythingDataset: {len(self.samples)} images, grid={self.grid_points}")
 

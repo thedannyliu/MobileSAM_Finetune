@@ -169,13 +169,14 @@ def main():
     if "lr" not in cfg["train"]:
         cfg["train"]["lr"] = 5e-5
 
-    # ─────────────────── 影像前處理 ───────────────────
-    # SAM 的 `preprocess` 期望輸入像素範圍為 [0,255]，並且會自行減去
-    # ImageNet 平均值後再除以標準差。因此 DataLoader 端**不要**事先做
-    # Normalize；改成：
-    #   1. 將 PIL Image → tensor (0‥1)
-    #   2. 直接放大到 0‥255
-    # 以確保與 `preprocess` 對齊。
+    # ─────────────────── Image Preprocessing ───────────────────
+    # SAM's `preprocess` expects input pixels in the [0, 255] range and handles
+    # normalization (subtracting ImageNet mean, dividing by std) internally.
+    # Therefore, the DataLoader should **not** normalize the images beforehand.
+    # Instead, the pipeline should be:
+    #   1. Convert PIL Image to a tensor (0-1 range).
+    #   2. Scale it directly to the 0-255 range.
+    # This ensures alignment with the `preprocess` method.
     tf_img = T.Compose([T.ToTensor(), T.Lambda(lambda x: x * 255.0)])
     tf_msk = T.Compose([T.ToTensor()])
 
@@ -263,11 +264,12 @@ def main():
     )
     log.addHandler(file_handler)
 
-    # ─────────────────── 建立 student 並確保參數可訓練 ───────────────────
+    # ─────────────────── Build student and ensure parameters are trainable ───────────────────
     student = sam_model_registry[m_cfg.get("type", "vit_t")](
         checkpoint=m_cfg.get("checkpoint_path")
     ).to(dev)
-    # builder 內部會呼叫 .eval()，此舉不會改變 requires_grad，但保險起見先通通開啟
+    # The builder internally calls .eval(), which doesn't change requires_grad,
+    # but we enable gradients for all parameters just in case.
     student.requires_grad_(True)
 
     if cfg["freeze"].get("freeze_image_encoder", True):
@@ -545,7 +547,7 @@ def main():
             opt.zero_grad()
 
             for step, batch in enumerate(pbar):
-                # ─────────── 先初始化所有可能 later 會被用到的 loss 變數 ───────────
+                # ─────────── Initialize all potential loss variables that might be used later ───────────
                 bce = torch.tensor(0.0, device=dev, requires_grad=True)
                 focal = torch.tensor(0.0, device=dev, requires_grad=True)
                 dice_loss = torch.tensor(0.0, device=dev, requires_grad=True)
@@ -592,17 +594,17 @@ def main():
 
                         # ---------------- Distillation Forward ----------------
                         if use_distillation:
-                            # 取出 student forward 的中間特徵
+                            # Pop intermediate features from the student's forward pass
                             feat_student = pop_features()
-                            teacher_outs = []  # 儲存每位 teacher 的 forward 結果 (list of list[dict])
-                            teacher_feats = []  # 儲存 hooks 擷取的特徵 (list[dict])
+                            teacher_outs = []  # Store forward results for each teacher (list of list[dict])
+                            teacher_feats = []  # Store features captured by hooks (list[dict])
                             for t in teacher_models:
                                 with torch.no_grad():
                                     _out_t = t["model"](batched_input=batched_input, multimask_output=multimask_output_cfg)
                                 teacher_outs.append(_out_t)
                                 teacher_feats.append(pop_features())
 
-                            # 初始化 distillation loss 累加器
+                            # Initialize distillation loss accumulators
                             enc_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
                             prompt_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
                             tok_loss_val = torch.tensor(0.0, device=dev, requires_grad=True)
@@ -687,7 +689,7 @@ def main():
                                 gt_ious = torch.stack(ious)
                             iou_loss = iou_loss + F.mse_loss(torch.sigmoid(iou_pred), gt_ious)
 
-                            # -------- distillation：dense mask logits (per-sample) --------
+                            # -------- distillation: dense mask logits (per-sample) --------
                             if use_distillation and dist_cfg.get("dense_mask_logits", {}).get("enable"):
                                 dl_cfg = dist_cfg["dense_mask_logits"]
                                 for t_idx, t in enumerate(teacher_models):
@@ -734,11 +736,12 @@ def main():
                             + w_cls * cls_loss_val
                         )
 
-                        # 計算總 loss（single-prompt 模式）
+                        # Calculate total loss (for single-prompt mode)
                         dist_loss = enc_loss_val + prompt_loss_val + tok_loss_val + dense_loss_val
 
-                        # 針對 single-prompt 模式需在此計算總 loss，
-                        # 否則 loss 仍保持為 0 會導致梯度為 0，也無法在 tqdm 中顯示 total
+                        # The total loss must be calculated here for single-prompt mode.
+                        # Otherwise, if the loss remains 0, gradients will be zero, and
+                        # it won't display correctly in the tqdm progress bar.
                         loss = (
                             task_loss.float()
                             + w_iou * iou_loss.float()
@@ -874,23 +877,23 @@ def main():
                             and gt_override_enable
                         ):
                             # ─────────────────── Hybrid teacher / GT supervision ───────────────────
-                            # 1) 以 teacher soft mask 為預設目標。
-                            # 2) 若某一個 teacher mask 與任一個 GT mask IoU 超過門檻，則以該 GT mask 取代。
-                            #    這同時確保該點確實落在對應 GT 物件，並保持 teacher 與 GT 一致。
+                            # 1) Use the teacher's soft mask as the default target.
+                            # 2) If a teacher mask's IoU with any GT mask exceeds a threshold, replace it with that GT mask.
+                            #    This ensures the corresponding point is on a GT object and maintains consistency.
                             teacher_pred_flat = teacher_lowres_all[bi].reshape(-1, original_gt.shape[-2], original_gt.shape[-1]).detach()
 
                             teacher_soft = torch.sigmoid(teacher_pred_flat)  # [K,S,S] in [0,1]
 
-                            # 將 ground-truth 轉成 binary，準備計算 IoU
+                            # Convert ground-truth to binary for IoU calculation
                             gt_bin_all = original_gt.squeeze(1)  # [G,S,S]
 
-                            # 預先將 teacher_soft 二值化供 IoU 計算
+                            # Binarize teacher_soft in advance for IoU calculation
                             teacher_bin = (teacher_soft > 0.5).float()
 
-                            # 建立最終參考 masks（先複製 teacher，之後條件式覆寫）
+                            # Create final reference masks (copy teacher, then conditionally overwrite)
                             ref_masks = teacher_soft.clone()  # float in [0,1], [K,S,S]
 
-                            # 計算 IoU matrix  (K x G)
+                            # Calculate IoU matrix (K x G)
                             inter_tg = (teacher_bin.unsqueeze(1) * gt_bin_all.unsqueeze(0)).sum((-2, -1))
                             union_tg = (
                                 teacher_bin.unsqueeze(1).sum((-2, -1))
@@ -899,13 +902,13 @@ def main():
                             )
                             iou_mat_tg = inter_tg / (union_tg + 1e-6)  # [K,G]
 
-                            # 逐個 teacher mask 檢查最佳 IoU，若超過門檻則用對應 GT 取代
+                            # For each teacher mask, check the best IoU; if it exceeds the threshold, replace with the corresponding GT.
                             for t_idx in range(iou_mat_tg.shape[0]):
                                 best_iou_val, best_gt_idx = torch.max(iou_mat_tg[t_idx], dim=0)
                                 if best_iou_val.item() >= mask_teacher_iou_thr:
                                     ref_masks[t_idx] = gt_bin_all[best_gt_idx]
 
-                            # 使用 ref_masks 作為 supervision 目標
+                            # Use ref_masks as the supervision target
                             gt = ref_masks.unsqueeze(1)  # [K,1,S,S]
                             gt_flat = ref_masks  # [K,S,S]
                         elif (
@@ -914,7 +917,7 @@ def main():
                             and teacher_lowres_all[bi] is not None
                             and not gt_override_enable
                         ):
-                            # 原始 replace_gt：完全採用 Teacher 之遮罩 (soft label)
+                            # Original replace_gt: use the teacher's mask completely (soft label)
                             teacher_pred_flat = teacher_lowres_all[bi].reshape(-1, original_gt.shape[-2], original_gt.shape[-1]).detach()
                             teacher_soft = torch.sigmoid(teacher_pred_flat)
                             gt = teacher_soft.unsqueeze(1)
@@ -1032,8 +1035,9 @@ def main():
                         dense_loss_val = dense_loss_val / n_matched
                     dist_loss = enc_loss_val + prompt_loss_val + tok_loss_val + dense_loss_val
 
-                    # 針對 single-prompt 模式需在此計算總 loss，
-                    # 否則 loss 仍保持為 0 會導致梯度為 0，也無法在 tqdm 中顯示 total
+                    # The total loss must be calculated here for single-prompt mode.
+                    # Otherwise, if the loss remains 0, gradients will be zero, and
+                    # it won't display correctly in the tqdm progress bar.
                     loss = (
                         task_loss.float()
                         + w_iou * iou_loss.float()
@@ -1081,10 +1085,10 @@ def main():
                     else 0.0
                 )
 
-                # dist_c 直接採用 lambda_coef·dist_loss，供檢查；不再重複加 sub-components
+                # dist_c directly uses lambda_coef * dist_loss for checking; sub-components are not added again.
                 dist_c = lambda_coef * dist_loss.item() / ga
 
-                # 直接顯示實際 backward 的 loss，避免顯示與真實梯度不一致
+                # Directly display the actual loss that was backpropagated to avoid inconsistency with gradients.
                 total_c = loss.item()
 
                 pbar.set_postfix(
@@ -1177,7 +1181,7 @@ def main():
                                 dices.append(bin_dice)
                                 ious.append(bin_iou)
 
-                                # 印 debug: 第一張
+                                # Print debug info for the first image
                                 if bi == 0 and i == 0:
                                     log.info(
                                         f"[VAL] id={vb['id'][i]}, "
@@ -1198,7 +1202,7 @@ def main():
                                 ):
                                     cur_path = Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
                                     cur_path.mkdir(parents=True, exist_ok=True)
-                                    # 還原到 0‥1 方便可視化
+                                    # Denormalize to 0-1 range for visualization
                                     img_denorm = (imgs[i] / 255.0).clamp(0, 1).cpu()
 
                                     box = vb.get("box_prompt_raw", [None]*len(imgs))[i]
@@ -1292,7 +1296,7 @@ def main():
                                 ):
                                     cur_path = Path(cfg["visual"]["save_path"]) / f"epoch_{ep}"
                                     cur_path.mkdir(parents=True, exist_ok=True)
-                                    # 還原到 0‥1 方便可視化
+                                    # Denormalize to 0-1 range for visualization
                                     img_denorm = (imgs[i] / 255.0).clamp(0, 1).cpu()
                                     best_masks = probs[row_ind].cpu()
                                     overlay_masks_on_image(

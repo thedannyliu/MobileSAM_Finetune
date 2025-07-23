@@ -128,7 +128,7 @@ def overlay_mask_on_image(
         for (x, y), lbl in zip(pts.tolist(), point_labels.tolist()):
             if lbl == -1:
                 continue
-            r = 6  # 增大點半徑以方便肉眼辨識
+            r = 6  # Increase point radius for better visibility
             if lbl == 1:  # positive
                 draw.ellipse([(x - r, y - r), (x + r, y + r)], fill="green", outline="black")
             elif lbl == 0:  # negative
