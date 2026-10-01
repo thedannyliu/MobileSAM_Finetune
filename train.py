@@ -10,15 +10,16 @@ from torchvision import transforms as T
 from torchvision.ops import sigmoid_focal_loss
 
 from mobile_sam import sam_model_registry
-from mobile_sam.utils.amg import batch_iterator
 
 import argparse
-import gc
 import json
 import logging
 import os
 import traceback
 import yaml
+from finetune_utils.scheduler import WarmupCosineLR
+from finetune_utils.feature_cache import clear_gpu_cache, feature_cache, load_cached_npy_features
+from finetune_utils.grid_inference import predict_from_grid
 from finetune_utils.datasets import ComponentDataset, SegmentEverythingDataset
 from finetune_utils.distill_losses import (
     encoder_patch_loss,
@@ -47,109 +48,6 @@ def log_gpu_memory(step_name=""):
         allocated = torch.cuda.memory_allocated() / 1024**3
         cached = torch.cuda.memory_reserved() / 1024**3
         log.info(f"{step_name} GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB")
-
-
-def clear_gpu_cache():
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        gc.collect()
-
-
-class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
-    def __init__(self, optimizer, warmup, total, min_ratio=0.0, last_epoch=-1):
-        self.warmup = warmup
-        self.total = total
-        self.min_ratio = min_ratio
-        super().__init__(optimizer, last_epoch)
-
-    def get_lr(self):
-        cur = self.last_epoch + 1
-        if cur < self.warmup:
-            return [base_lr * cur / self.warmup for base_lr in self.base_lrs]
-        prog = (cur - self.warmup) / max(1, (self.total - self.warmup))
-        cos = 0.5 * (1 + np.cos(np.pi * prog))
-        return [
-            base_lr * (self.min_ratio + (1 - self.min_ratio) * cos) for base_lr in self.base_lrs
-        ]
-
-
-class MemoryEfficientFeatureCache:
-    def __init__(self, maxsize=64):
-        self.cache = {}
-        self.maxsize = maxsize
-        self.access_order = []
-
-    def get(self, path: Path):
-        key = str(path)
-        if key in self.cache:
-            self.access_order.remove(key)
-            self.access_order.append(key)
-            return self.cache[key]
-        arr = np.load(key)
-        tensor = torch.from_numpy(arr).cuda(non_blocking=True)
-        if len(self.cache) >= self.maxsize:
-            oldest = self.access_order.pop(0)
-            del self.cache[oldest]
-        self.cache[key] = tensor
-        self.access_order.append(key)
-        return tensor
-
-    def clear(self):
-        self.cache.clear()
-        self.access_order.clear()
-        clear_gpu_cache()
-
-
-feature_cache = MemoryEfficientFeatureCache()
-
-
-def load_cached_npy_features(
-    base: Path, teacher: str, split: str, stems: list[str], keys: list[str]
-):
-    stacked = {k: [] for k in keys}
-    for stem in stems:
-        for k in keys:
-            fname = f"{stem}_{k.replace('.', '_').replace('[', '_').replace(']', '')}.npy"
-            stacked[k].append(feature_cache.get(base / teacher / split / fname))
-    return [torch.stack(stacked[k]) for k in keys]
-
-
-def _parse_hw(x):
-    return (int(x[0]), int(x[1])) if isinstance(x, torch.Tensor) else tuple(map(int, x))
-
-
-def predict_from_grid(model, image, points, orig_size, input_size, batch_size=64, multimask_output=True):
-    """Run the SAM model on a grid of points and return masks and IoU preds.
-    input_size: (H_resized, W_resized) before padding, used to correctly crop padding.
-    """
-    device = image.device
-    inp = model.preprocess(image.unsqueeze(0))
-    embedding = model.image_encoder(inp)
-    dense_pe = model.prompt_encoder.get_dense_pe()
-
-    all_masks = []
-    all_ious = []
-    all_lowres = []
-    for (pts,) in batch_iterator(batch_size, points):
-        coords = torch.as_tensor(pts, dtype=torch.float, device=device)
-        labels = torch.ones(coords.shape[0], dtype=torch.int, device=device)
-        sparse, dense = model.prompt_encoder(
-            points=(coords.unsqueeze(0), labels.unsqueeze(0)),
-            boxes=None,
-            masks=None,
-        )
-        low_res, iou_pred = model.mask_decoder(
-            image_embeddings=embedding,
-            image_pe=dense_pe,
-            sparse_prompt_embeddings=sparse,
-            dense_prompt_embeddings=dense,
-            multimask_output=multimask_output,
-        )
-        masks = model.postprocess_masks(low_res, input_size, orig_size).squeeze(0)
-        all_masks.append(masks)
-        all_lowres.append(low_res.squeeze(0))
-        all_ious.append(iou_pred.squeeze(0))
-    return torch.cat(all_masks, dim=0), torch.cat(all_ious, dim=0), torch.cat(all_lowres, dim=0)
 
 
 def main():
