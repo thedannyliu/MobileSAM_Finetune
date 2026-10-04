@@ -1,31 +1,21 @@
-# Contributing to segment-anything
-We want to make contributing to this project as easy and transparent as
-possible.
+# Contributing
 
-## Pull Requests
-We actively welcome your pull requests.
+Keep changes focused and explain the dataset/prompt behavior they affect.
+Open a GitHub issue for reproducible bugs or a pull request with the fix.
 
-1. Fork the repo and create your branch from `main`.
-2. If you've added code that should be tested, add tests.
-3. If you've changed APIs, update the documentation.
-4. Ensure the test suite passes.
-5. Make sure your code lints, using the `linter.sh` script in the project's root directory. Linting requires `black==23.*`, `isort==5.12.0`, `flake8`, and `mypy`.
-6. If you haven't already, complete the Contributor License Agreement ("CLA").
+Install development tools with `python -m pip install -r requirements-dev.txt`.
+For training changes, record the config, dataset split, checkpoint, seed,
+hardware and a small before/after run. Never commit datasets, credentials,
+teacher caches or generated checkpoints.
 
-## Contributor License Agreement ("CLA")
-In order to accept your pull request, we need you to submit a CLA. You only need
-to do this once to work on any of Facebook's open source projects.
+Keep model code under `mobile_sam`, training helpers under `finetune_utils`,
+and command-line utilities under `scripts`. Prefer the existing config-driven
+training entry point over a new shell wrapper for each experiment.
 
-Complete your CLA here: <https://code.facebook.com/cla>
+Preserve upstream copyright notices and license terms.
 
-## Issues
-We use GitHub issues to track public bugs. Please ensure your description is
-clear and has sufficient instructions to be able to reproduce the issue.
-
-Facebook has a [bounty program](https://www.facebook.com/whitehat/) for the safe
-disclosure of security bugs. In those cases, please go through the process
-outlined on that page and do not file a public issue.
-
-## License
-By contributing to segment-anything, you agree that your contributions will be licensed
-under the LICENSE file in the root directory of this source tree.
+The old config/logger/checkpoint/loss helpers and `schedular.py` had no
+in-repository callers and were removed. The actual training path remains in
+`train.py` with shared helpers in `finetune_utils`; use the model registry in
+`mobile_sam` rather than the removed duplicate model loader. Old implementations
+remain available in git history.
